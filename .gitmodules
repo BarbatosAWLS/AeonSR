@@ -1,0 +1,20 @@
+[submodule "external/reshade"]
+	path = external/reshade
+	url = https://github.com/crosire/reshade.git
+	shallow = true
+[submodule "external/DLSS"]
+	path = external/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
+	shallow = true
+[submodule "external/xess"]
+	path = external/xess
+	url = https://github.com/intel/xess.git
+	shallow = true
+[submodule "external/FidelityFX-SDK"]
+	path = external/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+	shallow = true
+[submodule "external/Vulkan-Headers"]
+	path = external/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+	shallow = true

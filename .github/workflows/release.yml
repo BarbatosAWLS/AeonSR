@@ -1,0 +1,53 @@
+name: Build and release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - name: ReShade submodules
+        run: git -C external/reshade submodule update --init --depth 1 deps/imgui deps/minhook deps/spirv
+
+      - name: Build x64
+        run: |
+          cmake -S . -B build/x64 -A x64
+          cmake --build build/x64 --config Release -- /m
+          cmake --install build/x64 --config Release --prefix package
+
+      - name: Build Win32
+        run: |
+          cmake -S . -B build/x86 -A Win32
+          cmake --build build/x86 --config Release -- /m
+          cmake --install build/x86 --config Release --prefix package
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "AeonSR-$env:GITHUB_REF_NAME" } else { "AeonSR-$($env:GITHUB_SHA.Substring(0, 7))" }
+          Compress-Archive -Path package/* -DestinationPath "$name.zip"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          Get-ChildItem package -Recurse -File | ForEach-Object { $_.FullName.Substring((Resolve-Path package).Path.Length + 1) }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.zip
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" "${{ steps.pkg.outputs.name }}.zip" --title "Aeon SR ${{ github.ref_name }}" --generate-notes
