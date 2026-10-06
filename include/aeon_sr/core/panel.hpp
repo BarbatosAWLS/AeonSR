@@ -128,7 +128,10 @@ struct PanelState {
 	DepthProvider depth_provider = DepthProvider::None;
 	bool depth_reversed = false;
 	bool depth_logarithmic = false;
+	bool depth_upside_down = false;
+	bool depth_mirrored = false;
 	float depth_far_plane = 0.0f;
+	std::string depth_overridden;
 	bool have_global_flow = false;
 	bool have_motion_confidence = false;
 	TextureInfo color_info;

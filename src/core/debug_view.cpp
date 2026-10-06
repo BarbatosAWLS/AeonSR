@@ -1,7 +1,10 @@
 #include "aeon_sr/core/debug_view.hpp"
 
-#include "aeon_sr/interop/native_d3d.hpp"
-#include "aeon_sr/ngx/ngx_common.hpp"
+#include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/settings.hpp"
+#include "aeon_sr/motion/optical_flow.hpp"
+
+#include <cwchar>
 
 namespace aeon_sr {
 
@@ -9,131 +12,137 @@ namespace {
 
 constexpr float kArrowCellPx = 32.0f;
 
+constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+D3D12_RESOURCE_STATES readable(D3D12_RESOURCE_STATES s) noexcept
+{
+	return (s & kRead) != 0 ? s : kRead;
+}
+
 }
 
 void DebugView::release() noexcept
 {
-	if (field_copy_) { field_copy_->Release(); field_copy_ = nullptr; }
-	if (frame_copy_) { frame_copy_->Release(); frame_copy_ = nullptr; }
-	field_w_ = field_h_ = field_fmt_ = 0;
-	frame_w_ = frame_h_ = frame_fmt_ = 0;
+	if (frame_copy_ != nullptr) {
+		frame_copy_->Release();
+		frame_copy_ = nullptr;
+	}
+	frame_copy_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+	blit_.release();
 	device_ = nullptr;
 }
 
-bool DebugView::ensure_copy(ID3D11Device *dev, ID3D11Resource *src, ID3D11Texture2D **out,
-	uint32_t *w, uint32_t *h, uint32_t *fmt) noexcept
+void DebugView::fail(int stage, const char *why)
 {
-	ID3D11Texture2D *tex = nullptr;
-	if (src == nullptr ||
-		FAILED(src->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) ||
-		tex == nullptr)
-		return false;
-	D3D11_TEXTURE2D_DESC d{};
-	tex->GetDesc(&d);
-	tex->Release();
-	if (d.Width == 0 || d.Height == 0)
-		return false;
-	if (*out != nullptr && *w == d.Width && *h == d.Height &&
-		*fmt == static_cast<uint32_t>(d.Format))
-		return true;
-	if (*out != nullptr) { (*out)->Release(); *out = nullptr; }
+	last = stage;
+	note = why;
+	if (last == logged)
+		return;
+	logged = last;
+	wchar_t buf[160]{};
+	_snwprintf_s(buf, _TRUNCATE, L"debug view: %hs (stage %d)", why, stage);
+	if (stage == -6)
+		diag_info("debug-view", buf);
+	else
+		diag_warn("debug-view", buf);
+}
 
-	D3D11_TEXTURE2D_DESC c{};
-	c.Width = d.Width;
-	c.Height = d.Height;
-	c.MipLevels = 1;
-	c.ArraySize = 1;
-	c.Format = d.Format;
-	c.SampleDesc.Count = 1;
-	c.Usage = D3D11_USAGE_DEFAULT;
-	c.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	if (FAILED(dev->CreateTexture2D(&c, nullptr, out)))
+bool DebugView::ensure_frame_copy(ID3D12Device *device, const D3D12_RESOURCE_DESC &color) noexcept
+{
+	if (frame_copy_ != nullptr) {
+		const D3D12_RESOURCE_DESC d = frame_copy_->GetDesc();
+		if (d.Width == color.Width && d.Height == color.Height && d.Format == color.Format)
+			return true;
+		frame_copy_->Release();
+		frame_copy_ = nullptr;
+	}
+	D3D12_RESOURCE_DESC d = color;
+	d.MipLevels = 1;
+	d.DepthOrArraySize = 1;
+	d.SampleDesc = { 1, 0 };
+	d.Flags = D3D12_RESOURCE_FLAG_NONE;
+	d.Alignment = 0;
+	D3D12_HEAP_PROPERTIES heap{};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST,
+			nullptr, IID_PPV_ARGS(&frame_copy_))))
 		return false;
-	*w = d.Width;
-	*h = d.Height;
-	*fmt = static_cast<uint32_t>(d.Format);
+	frame_copy_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
 	return true;
 }
 
-void DebugView::apply(const PassContext &ctx, const Settings &s, const FrameInputs &in,
-	const DepthConvention &how)
+void DebugView::apply(unsigned int mode, const FrameInputs &in, const DepthConvention &how)
 {
-	if (s.debug_view == 0 || s.debug_view > kDebugViewCount - 1u ||
-		ctx.runtime == nullptr || ctx.pipelines == nullptr) {
+	if (mode == 0 || mode > kDebugViewCount - 1u) {
 		last = 0;
 		logged = 0;
 		note = "";
 		return;
 	}
-	reshade::api::device *const device = ctx.runtime->get_device();
-	if (device == nullptr)
-		return;
-
-	const reshade::api::resource field =
-		s.debug_view == 3 ? in.motion_confidence
-		: s.debug_view == 4 ? in.depth
-		: in.motion_vectors;
-	if (field.handle == 0 || in.color.handle == 0) {
-		last = -6;
-		note = s.debug_view == 3 ? "no confidence buffer yet"
-			: s.debug_view == 4 ? "no depth buffer"
-			: "no motion vectors yet - the estimator needs two frames";
-		if (last != logged) {
-			logged = last;
-			diag_info("debug-view", L"nothing to draw yet");
-		}
+	const EngineFrame &e = in.engine;
+	if (!e.ready() || e.device == nullptr) {
+		fail(-5, "the frame never reached the add-on's engine");
 		return;
 	}
 
-	if (ID3D11Device *const dev11 = native_d3d11_device(device)) {
-		ID3D11DeviceContext *const ctx11 = native_d3d11_context(ctx.runtime);
-		auto *const src = native_res<ID3D11Resource>(field);
-		auto *const dst = native_res<ID3D11Resource>(in.color);
-		if (ctx11 == nullptr || src == nullptr || dst == nullptr) {
-			last = -5;
-			note = "no D3D11 context to draw with";
-		} else {
-			if (device_ != dev11)
-				release();
-			device_ = dev11;
-			if (!ensure_copy(dev11, src, &field_copy_, &field_w_, &field_h_, &field_fmt_) ||
-				!ensure_copy(dev11, dst, &frame_copy_, &frame_w_, &frame_h_, &frame_fmt_)) {
-				last = -9;
-				note = "could not allocate the debug copies";
-			} else {
-				ctx11->CopyResource(field_copy_, src);
-				ctx11->CopyResource(frame_copy_, dst);
-				last = ctx.pipelines->d3d11.debug_view_draw(ctx11, field_copy_, frame_copy_, dst,
-					s.debug_view, kArrowCellPx, how.far_plane, how.reversed);
-				note = last > 0 ? "" : "the draw was refused";
-			}
-		}
+	ID3D12Resource *field = nullptr;
+	D3D12_RESOURCE_STATES field_state = D3D12_RESOURCE_STATE_COMMON;
+	if (mode == 3) {
+		field = in.have_motion_confidence ? e.confidence : nullptr;
+		field_state = OpticalFlowD3D12::kPublishedState;
+	} else if (mode == 4) {
+		field = in.have_depth ? e.depth : nullptr;
+		field_state = e.depth_state;
 	} else {
-		ID3D12Device *const dev12 = native_d3d12_device(device);
-		ID3D12GraphicsCommandList *const cmd12 = native_d3d12_list(ctx.cmd_list);
-		auto *const src = native_res<ID3D12Resource>(field);
-		auto *const dst = native_res<ID3D12Resource>(in.color);
-		if (dev12 != nullptr && cmd12 != nullptr && src != nullptr && dst != nullptr) {
-			const reshade::api::resource_desc dd = device->get_resource_desc(in.color);
-			const uint32_t mode = s.debug_view == 4 ? 2u : 1u;
-			last = ctx.pipelines->d3d12.draw_fullscreen(dev12, cmd12, src,
-				dst, static_cast<DXGI_FORMAT>(dd.texture.format), dd.texture.width, dd.texture.height,
-				0.0f, mode) ? 1 : -7;
-			note = s.debug_view == 2 ? "arrows need D3D11; showing the raw field" : "";
-		} else {
-			last = -5;
-			note = "no D3D12 command list to draw with";
-		}
+		field = in.have_motion_vectors ? e.motion : nullptr;
+		field_state = e.motion_state;
+	}
+	if (field == nullptr) {
+		fail(-6, mode == 3 ? "no confidence buffer yet"
+			: mode == 4 ? "no depth buffer"
+			: "no motion vectors yet - the estimator needs two frames");
+		return;
 	}
 
-	if (last < 0 && last != logged) {
-		logged = last;
-		wchar_t buf[96]{};
-		_snwprintf_s(buf, _TRUNCATE, L"debug view: failed at stage %d", last);
-		diag_warn("debug-view", buf);
-	} else if (last > 0) {
-		logged = 0;
+	if (device_ != e.device)
+		release();
+	device_ = e.device;
+
+	const D3D12_RESOURCE_DESC cd = e.color->GetDesc();
+	const bool arrows = mode == 2;
+	if (arrows && !ensure_frame_copy(e.device, cd)) {
+		fail(-9, "could not allocate the frame copy");
+		return;
 	}
+
+	ID3D12GraphicsCommandList *const cmd = e.cmd;
+	if (arrows) {
+		barrier12(cmd, e.color, e.color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		barrier12(cmd, frame_copy_, frame_copy_state_, D3D12_RESOURCE_STATE_COPY_DEST);
+		cmd->CopyResource(frame_copy_, e.color);
+		barrier12(cmd, frame_copy_, D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+		frame_copy_state_ = kRead;
+		barrier12(cmd, e.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	} else {
+		barrier12(cmd, e.color, e.color_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}
+	const D3D12_RESOURCE_STATES field_read = readable(field_state);
+	barrier12(cmd, field, field_state, field_read);
+
+	const bool reversed = in.depth_sense_known() ? false : how.reversed;
+	const bool drawn = blit_.draw_debug_view(e.device, cmd, field, arrows ? frame_copy_ : field, e.color,
+		cd.Format, static_cast<uint32_t>(cd.Width), cd.Height, mode, kArrowCellPx, how.far_plane, reversed);
+
+	barrier12(cmd, field, field_read, field_state);
+	barrier12(cmd, e.color, D3D12_RESOURCE_STATE_RENDER_TARGET, e.color_state);
+
+	if (!drawn) {
+		fail(-7, "the draw was rejected");
+		return;
+	}
+	last = 1;
+	logged = 0;
+	note = "";
 }
 
 }

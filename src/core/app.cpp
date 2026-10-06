@@ -323,6 +323,7 @@ void App::run_engine_work(reshade::api::effect_runtime *runtime, const FrameInpu
 	observed_ = false;
 	hud_detected_ = false;
 	interface_split_ = false;
+	debug_view_.apply(settings_.debug_view, inputs, depth_how_);
 	if (upscaler_capture_.scope_recording() && !scope_list_lost_)
 		upscaler_capture_.scope_copy(ScopePlane::Final, inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state);
@@ -701,37 +702,46 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 		depth_jitter_u, depth_jitter_v) ? 1 : -1;
 }
 
-DepthConvention depth_convention_of(reshade::api::effect_runtime *runtime)
+void App::refresh_depth_convention(reshade::api::effect_runtime *runtime)
 {
-	DepthConvention how;
-	if (runtime == nullptr)
-		return how;
+	if (depth_how_read_ || runtime == nullptr)
+		return;
 
-	const auto flag = [runtime](const char *name, bool fallback) {
-		char value[32] = {};
-		if (!runtime->get_preprocessor_definition(name, value) || value[0] == '\0')
-			return fallback;
-		return std::strtol(value, nullptr, 10) != 0;
-	};
-	const auto number = [runtime](const char *name, float fallback) {
-		char value[32] = {};
-		if (!runtime->get_preprocessor_definition(name, value) || value[0] == '\0')
-			return fallback;
-		const float v = std::strtof(value, nullptr);
-		return std::isfinite(v) ? v : fallback;
-	};
+	std::vector<DepthEffect> effects;
+	runtime->enumerate_techniques(nullptr,
+		[&effects](reshade::api::effect_runtime *rt, reshade::api::effect_technique technique) {
+			char name[MAX_PATH] = {};
+			rt->get_technique_effect_name(technique, name);
+			const bool on = rt->get_technique_state(technique);
+			for (DepthEffect &e : effects) {
+				if (e.name == name) {
+					e.active = e.active || on;
+					return;
+				}
+			}
+			effects.push_back({ name, on });
+		});
 
-	how.upside_down = flag("RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN", false);
-	how.mirrored = flag("RESHADE_DEPTH_INPUT_IS_MIRRORED", false);
-	how.reversed = flag("RESHADE_DEPTH_INPUT_IS_REVERSED", true);
-	how.logarithmic = flag("RESHADE_DEPTH_INPUT_IS_LOGARITHMIC", false);
-	how.multiplier = number("RESHADE_DEPTH_MULTIPLIER", 1.0f);
-	how.far_plane = number("RESHADE_DEPTH_LINEARIZATION_FAR_PLANE", 1000.0f);
-	how.x_scale = number("RESHADE_DEPTH_INPUT_X_SCALE", 1.0f);
-	how.y_scale = number("RESHADE_DEPTH_INPUT_Y_SCALE", 1.0f);
-	how.x_offset = number("RESHADE_DEPTH_INPUT_X_OFFSET", 0.0f);
-	how.y_offset = number("RESHADE_DEPTH_INPUT_Y_OFFSET", 0.0f);
-	return how;
+	DepthDefinitions defs;
+	defs.own = [runtime](const std::string &effect, const char *name, std::string &value) {
+		char text[64] = {};
+		if (!runtime->get_preprocessor_definition_for_effect(effect.c_str(), name, text))
+			return false;
+		value = text;
+		return true;
+	};
+	defs.shared = [runtime](const char *name, std::string &value) {
+		char text[64] = {};
+		if (!runtime->get_preprocessor_definition(name, text))
+			return false;
+		value = text;
+		return true;
+	};
+	depth_resolved_ = resolve_depth_convention(defs, effects);
+	depth_how_ = depth_resolved_.how;
+	depth_how_read_ = true;
+	diag_state("depth-convention", depth_resolved_.overridden.empty() ? DiagLevel::Info : DiagLevel::Warn,
+		"depth", describe_depth_convention(depth_resolved_));
 }
 
 ViewportClip App::viewport_clip() const noexcept
@@ -753,7 +763,7 @@ void App::fill_uncovered_edges(FrameInputs &inputs)
 		frame_shift_blit_, inputs.engine.color, inputs.engine.color_state, 0.0f, 0.0f, band.uv);
 }
 
-void App::normalize_depth(reshade::api::effect_runtime *runtime, FrameInputs &inputs)
+void App::normalize_depth(FrameInputs &inputs)
 {
 	if (!inputs.have_depth || depth_failed_ || !inputs.engine.ready())
 		return;
@@ -769,10 +779,6 @@ void App::normalize_depth(reshade::api::effect_runtime *runtime, FrameInputs &in
 	if (!depth_.ensure(dev12, inputs.width, inputs.height, &error)) {
 		depth_failed_ = true;
 		return;
-	}
-	if (!depth_how_read_) {
-		depth_how_ = depth_convention_of(runtime);
-		depth_how_read_ = true;
 	}
 	const DepthConvention &how = depth_how_;
 
@@ -1735,13 +1741,10 @@ void App::run_frame(
 		upscaler_capture_.scope_copy(ScopePlane::Mask, inputs.engine.device, inputs.engine.cmd, hud_restore_.mask(),
 			HudRestoreD3D12::kMaskState);
 
-	if (!depth_how_read_) {
-		depth_how_ = depth_convention_of(runtime);
-		depth_how_read_ = true;
-	}
+	refresh_depth_convention(runtime);
 	{
 		const StageScope depth_time(stage_times_, StageTimings::Stage::Depth, inputs);
-		normalize_depth(runtime, inputs);
+		normalize_depth(inputs);
 	}
 	update_native_dlss();
 	run_internal_flow(runtime, inputs);
@@ -1809,7 +1812,6 @@ void App::run_frame(
 
 		run_engine_work(runtime, inputs, plan, nullptr, UpscalerParams{});
 		finish_frame(runtime, cmd_list, inputs);
-		debug_view_.apply(pctx, settings_, inputs, depth_how_);
 		return;
 	}
 
@@ -1820,7 +1822,6 @@ void App::run_frame(
 
 		run_engine_work(runtime, inputs, plan, nullptr, UpscalerParams{});
 		finish_frame(runtime, cmd_list, inputs);
-		debug_view_.apply(pctx, settings_, inputs, depth_how_);
 		return;
 	}
 
@@ -1835,7 +1836,6 @@ void App::run_frame(
 			  L"still shrink and re-enlarge the frame for nothing, so the frame is left alone.";
 		run_engine_work(runtime, inputs, plan, nullptr, UpscalerParams{});
 		finish_frame(runtime, cmd_list, inputs);
-		debug_view_.apply(pctx, settings_, inputs, depth_how_);
 		return;
 	}
 
@@ -1864,7 +1864,6 @@ void App::run_frame(
 	if (probes_.sample_flow(pctx, inputs, motion_px))
 		history_.last_motion_px = motion_px;
 
-	debug_view_.apply(pctx, settings_, inputs, depth_how_);
 	note_state();
 }
 
@@ -2081,6 +2080,11 @@ PanelState App::panel_state(bool for_overlay)
 	s.depth_reversed = depth_how_.reversed;
 	s.depth_logarithmic = depth_how_.logarithmic;
 	s.depth_far_plane = depth_how_.far_plane;
+	s.depth_upside_down = depth_how_.upside_down;
+	s.depth_mirrored = depth_how_.mirrored;
+	s.depth_overridden.clear();
+	for (const std::string &name : depth_resolved_.overridden)
+		s.depth_overridden += (s.depth_overridden.empty() ? "" : ", ") + name;
 	s.have_global_flow = last_inputs_.have_global_flow;
 	s.have_motion_confidence = last_inputs_.have_motion_confidence;
 	s.color_info = last_inputs_.color_info;

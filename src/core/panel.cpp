@@ -835,9 +835,13 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 	if (state.depth_provider == DepthProvider::None) {
 		ImGui::TextDisabled("No depth: pick the game's depth buffer in ReShade's own depth settings.");
 	} else {
-		ImGui::TextDisabled("Depth: %s, far %.0f%s", state.depth_reversed ? "reversed" : "normal",
+		ImGui::TextDisabled("Depth: %s%s%s, far %.0f%s", state.depth_reversed ? "reversed" : "normal",
+			state.depth_upside_down ? ", upside down" : "", state.depth_mirrored ? ", mirrored" : "",
 			state.depth_far_plane, state.depth_logarithmic ? ", logarithmic" : "");
-		hint("Taken from ReShade's own depth settings.");
+		hint("Taken from ReShade's preprocessor definitions; updates when you apply them.");
+		if (!state.depth_overridden.empty())
+			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f), "Different depth inside: %s",
+				state.depth_overridden.c_str());
 	}
 	{
 		if (state.flow_note.empty()) {

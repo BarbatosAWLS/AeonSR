@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.0.0 LANGUAGES C CXX)
+project(AeonSR VERSION 1.0.1 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -101,6 +101,7 @@ set(AEONSR_SOURCES
   src/interop/bridge_vulkan.cpp
   src/depth/d3d9_depth.cpp
   src/core/debug_view.cpp
+  src/depth/depth_convention.cpp
   src/depth/depth_normalize.cpp
   src/depth/depth_on_grid.cpp
   src/core/diag_report.cpp

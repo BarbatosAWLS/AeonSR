@@ -150,7 +150,8 @@ private:
 	bool neural_teardown_pending_ = false;
 	void service_neural_teardown();
 
-	void normalize_depth(reshade::api::effect_runtime *runtime, FrameInputs &inputs);
+	void normalize_depth(FrameInputs &inputs);
+	void refresh_depth_convention(reshade::api::effect_runtime *runtime);
 	void run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &inputs);
 
 	JitterDriver jitter_{ scene_jitter() };
@@ -163,6 +164,7 @@ private:
 	OpticalFlowD3D12 flow_;
 	DepthNormalizeD3D12 depth_;
 	DepthConvention depth_how_;
+	ResolvedDepthConvention depth_resolved_;
 	bool depth_how_read_ = false;
 	bool depth_failed_ = false;
 	bool flow_failed_ = false;

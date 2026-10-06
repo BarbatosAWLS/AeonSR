@@ -173,10 +173,16 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			"Pick the game's depth buffer in ReShade's own depth settings. "
 			"The add-on works without it, with slightly worse edges.");
 	} else {
-		add("Depth buffer", CheckState::Ok,
-			format("%s, %s, far %.0f", depth_provider_label(state.depth_provider),
-				state.depth_reversed ? "reversed" : "normal",
-				static_cast<double>(state.depth_far_plane)));
+		const std::string depth_line = format("%s, %s%s%s, far %.0f",
+			depth_provider_label(state.depth_provider), state.depth_reversed ? "reversed" : "normal",
+			state.depth_upside_down ? ", upside down" : "", state.depth_mirrored ? ", mirrored" : "",
+			static_cast<double>(state.depth_far_plane));
+		if (state.depth_overridden.empty())
+			add("Depth buffer", CheckState::Ok, depth_line);
+		else
+			add("Depth buffer", CheckState::Warn, depth_line,
+				"These effects carry their own depth definitions in the preset and see a different depth: " +
+				state.depth_overridden + ". Remove them from the preset file.");
 	}
 
 	const bool no_upscaler = !settings.enabled ||
@@ -427,11 +433,14 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 	out += wformat(L"  motion  %ux%u fmt %u  [%hs]%s\n",
 		state.motion_info.width, state.motion_info.height, state.motion_info.format,
 		motion_provider_label(state.motion_provider), flow_note.c_str());
-	out += wformat(L"  depth   %ux%u fmt %u  [%hs]%s%s\n",
+	out += wformat(L"  depth   %ux%u fmt %u  [%hs]%s%s%s%s%hs%hs\n",
 		state.depth_info.width, state.depth_info.height, state.depth_info.format,
 		depth_provider_label(state.depth_provider),
 		state.depth_reversed ? L", reversed" : L"",
-		state.depth_logarithmic ? L", logarithmic" : L"");
+		state.depth_upside_down ? L", upside down" : L"",
+		state.depth_mirrored ? L", mirrored" : L"",
+		state.depth_logarithmic ? L", logarithmic" : L"",
+		state.depth_overridden.empty() ? "" : "; different in ", state.depth_overridden.c_str());
 	if (state.probe_valid)
 		out += wformat(L"  motion probe  %.0f%% non-zero, mean %.2f px, max %.2f px\n",
 			static_cast<double>(state.probe_nonzero_pct),

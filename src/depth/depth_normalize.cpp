@@ -299,8 +299,8 @@ bool DepthNormalizeD3D12::record(ID3D12GraphicsCommandList *cmd, ID3D12Resource 
 	c.multiplier = how.multiplier;
 	c.x_scale = how.x_scale != 0.0f ? how.x_scale : 1.0f;
 	c.y_scale = how.y_scale != 0.0f ? how.y_scale : 1.0f;
-	c.x_offset = how.x_offset;
-	c.y_offset = how.y_offset;
+	c.x_offset = depth_x_offset(how, width_);
+	c.y_offset = depth_y_offset(how, height_);
 	for (int i = 0; i < 4; ++i)
 		c.valid[i] = valid_uv != nullptr ? valid_uv[i] : 0.0f;
 

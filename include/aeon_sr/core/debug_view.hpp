@@ -1,11 +1,10 @@
 #pragma once
 
-#include "aeon_sr/depth/depth_normalize.hpp"
+#include "aeon_sr/depth/depth_convention.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
-#include "aeon_sr/core/pass_context.hpp"
-#include "aeon_sr/core/settings.hpp"
+#include "aeon_sr/interop/blit_d3d12.hpp"
 
-#include <d3d11.h>
+#include <d3d12.h>
 
 #include <cstdint>
 
@@ -16,19 +15,17 @@ struct DebugView {
 	int logged = 0;
 	const char *note = "";
 
-	void apply(const PassContext &ctx, const Settings &s, const FrameInputs &in,
-		const DepthConvention &how);
+	void apply(unsigned int mode, const FrameInputs &in, const DepthConvention &how);
 	void release() noexcept;
 
 private:
-	bool ensure_copy(ID3D11Device *dev, ID3D11Resource *src, ID3D11Texture2D **out,
-		uint32_t *w, uint32_t *h, uint32_t *fmt) noexcept;
+	void fail(int stage, const char *why);
+	bool ensure_frame_copy(ID3D12Device *device, const D3D12_RESOURCE_DESC &color) noexcept;
 
-	ID3D11Device *device_ = nullptr;
-	ID3D11Texture2D *field_copy_ = nullptr;
-	ID3D11Texture2D *frame_copy_ = nullptr;
-	uint32_t field_w_ = 0, field_h_ = 0, field_fmt_ = 0;
-	uint32_t frame_w_ = 0, frame_h_ = 0, frame_fmt_ = 0;
+	BlitPipelineD3D12 blit_;
+	ID3D12Device *device_ = nullptr;
+	ID3D12Resource *frame_copy_ = nullptr;
+	D3D12_RESOURCE_STATES frame_copy_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
 };
 
 }

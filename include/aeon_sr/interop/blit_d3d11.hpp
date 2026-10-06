@@ -12,7 +12,6 @@ struct BlitPipelineD3D11 {
 	ID3D11VertexShader *vs = nullptr;
 	ID3D11PixelShader *ps_blit = nullptr;
 	ID3D11PixelShader *ps_debug = nullptr;
-	ID3D11PixelShader *ps_debug_view = nullptr;
 	ID3D11SamplerState *sampler = nullptr;
 	ID3D11RasterizerState *rs = nullptr;
 	ID3D11DepthStencilState *dss = nullptr;
@@ -35,10 +34,6 @@ struct BlitPipelineD3D11 {
 
 	bool bias_mask(ID3D11DeviceContext *ctx, ID3D11Resource *confidence,
 		ID3D11Resource *dst, float strength);
-
-	int debug_view_draw(ID3D11DeviceContext *ctx, ID3D11Resource *field, ID3D11Resource *frame,
-		ID3D11Resource *dst, uint32_t mode, float cell_px,
-		float depth_far, bool depth_reversed);
 };
 
 }

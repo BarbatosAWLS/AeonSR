@@ -133,7 +133,7 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC base_pso_desc(ID3D12RootSignature *rs, ID3DBl
 void release_pso(BlitPipelineD3D12::PsoPair &pp)
 {
 	for (ID3D12PipelineState **s : { &pp.blit, &pp.debug, &pp.proxy, &pp.guide, &pp.delta,
-			&pp.rebuild, &pp.smooth, &pp.neural }) {
+			&pp.rebuild, &pp.smooth, &pp.neural, &pp.debug_view }) {
 		if (*s) { (*s)->Release(); *s = nullptr; }
 	}
 	pp.rtv = DXGI_FORMAT_UNKNOWN;
@@ -270,6 +270,7 @@ void BlitPipelineD3D12::release()
 	rel_blob(vs_blob); rel_blob(ps_blit_blob); rel_blob(ps_debug_blob);
 	rel_blob(ps_proxy_blob); rel_blob(ps_guide_blob); rel_blob(ps_delta_blob);
 	rel_blob(ps_rebuild_blob); rel_blob(ps_smooth_blob); rel_blob(ps_neural_blob);
+	rel_blob(ps_debug_view_blob);
 	if (root_sig) { root_sig->Release(); root_sig = nullptr; }
 	if (srv_heap) { srv_heap->Release(); srv_heap = nullptr; }
 	if (rtv_heap) { rtv_heap->Release(); rtv_heap = nullptr; }
@@ -373,6 +374,45 @@ bool BlitPipelineD3D12::draw_fullscreen(ID3D12Device *device, ID3D12GraphicsComm
 
 	cmd->SetGraphicsRoot32BitConstants(0, kBlitConstantCount, constants, 0);
 	cmd->SetPipelineState(debug_mode != 0 ? pair->debug : pair->blit);
+	cmd->DrawInstanced(3, 1, 0, 0);
+	return true;
+}
+
+bool BlitPipelineD3D12::draw_debug_view(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
+	ID3D12Resource *field, ID3D12Resource *frame, ID3D12Resource *dst, DXGI_FORMAT dst_format,
+	uint32_t dst_w, uint32_t dst_h, uint32_t mode, float cell_px, float depth_far, bool depth_reversed)
+{
+	if (!ensure(device) || cmd == nullptr || field == nullptr || frame == nullptr || dst == nullptr || mode == 0)
+		return false;
+	if (ps_debug_view_blob == nullptr) {
+		ID3DBlob *blob = nullptr, *err = nullptr;
+		if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSDebugView", "ps_5_0",
+				0, 0, &blob, &err))) {
+			if (err) { diag_error("shader", L"d3d12 debug view PS compile failed"); err->Release(); }
+			return false;
+		}
+		ps_debug_view_blob = blob;
+	}
+
+	PsoPair *const pair = prepare_draw(device, cmd, field, frame, nullptr, nullptr, dst, dst_format, dst_w, dst_h);
+	if (pair == nullptr)
+		return false;
+	if (pair->debug_view == nullptr) {
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = base_pso_desc(root_sig, static_cast<ID3DBlob *>(vs_blob),
+			static_cast<ID3DBlob *>(ps_debug_view_blob), pair->rtv);
+		if (FAILED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pair->debug_view))))
+			return false;
+	}
+
+	const float constants[kBlitConstantCount] = {
+		cell_px, 0.0f,
+		static_cast<float>(dst_w), static_cast<float>(dst_h),
+		0.0f, static_cast<float>(mode), 0.0f, 0.0f,
+		0.0f, 0.0f,
+		depth_far, depth_reversed ? 1.0f : 0.0f,
+		0.0f, 0.0f, 0.0f, 0.0f };
+	cmd->SetGraphicsRoot32BitConstants(0, kBlitConstantCount, constants, 0);
+	cmd->SetPipelineState(pair->debug_view);
 	cmd->DrawInstanced(3, 1, 0, 0);
 	return true;
 }

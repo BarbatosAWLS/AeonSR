@@ -1,5 +1,7 @@
 #pragma once
 
+#include "aeon_sr/depth/depth_convention.hpp"
+
 #include <d3d12.h>
 #include <dxgi.h>
 
@@ -7,28 +9,6 @@
 #include <string>
 
 namespace aeon_sr {
-
-struct DepthConvention {
-	bool upside_down = false;
-	bool mirrored = false;
-	bool reversed = true;
-	bool logarithmic = false;
-	float multiplier = 1.0f;
-	float far_plane = 1000.0f;
-	float x_scale = 1.0f;
-	float y_scale = 1.0f;
-	float x_offset = 0.0f;
-	float y_offset = 0.0f;
-
-	bool operator==(const DepthConvention &o) const noexcept
-	{
-		return upside_down == o.upside_down && mirrored == o.mirrored &&
-			reversed == o.reversed && logarithmic == o.logarithmic &&
-			multiplier == o.multiplier && far_plane == o.far_plane &&
-			x_scale == o.x_scale && y_scale == o.y_scale &&
-			x_offset == o.x_offset && y_offset == o.y_offset;
-	}
-};
 
 class DepthNormalizeD3D12 {
 public:

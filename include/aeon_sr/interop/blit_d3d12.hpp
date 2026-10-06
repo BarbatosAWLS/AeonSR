@@ -64,11 +64,13 @@ struct BlitPipelineD3D12 {
 		ID3D12PipelineState *rebuild = nullptr;
 		ID3D12PipelineState *smooth = nullptr;
 		ID3D12PipelineState *neural = nullptr;
+		ID3D12PipelineState *debug_view = nullptr;
 	};
 	PsoPair pso_cache[8]{};
 	void *vs_blob = nullptr, *ps_blit_blob = nullptr, *ps_debug_blob = nullptr;
 	void *ps_proxy_blob = nullptr, *ps_guide_blob = nullptr, *ps_delta_blob = nullptr;
 	void *ps_rebuild_blob = nullptr, *ps_smooth_blob = nullptr, *ps_neural_blob = nullptr;
+	void *ps_debug_view_blob = nullptr;
 	ID3D12DescriptorHeap *srv_heap = nullptr;
 	ID3D12DescriptorHeap *rtv_heap = nullptr;
 	uint32_t ring_index = 0;
@@ -83,6 +85,10 @@ struct BlitPipelineD3D12 {
 		float sharpness = 0.0f,
 		uint32_t debug_mode = 0, float jitter_u = 0.0f, float jitter_v = 0.0f,
 		const float *valid_uv = nullptr, bool catmull_rom = false);
+
+	bool draw_debug_view(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *field,
+		ID3D12Resource *frame, ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h,
+		uint32_t mode, float cell_px, float depth_far, bool depth_reversed);
 
 	bool clear(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *dst, DXGI_FORMAT dst_format,
 		const float rgba[4]);
