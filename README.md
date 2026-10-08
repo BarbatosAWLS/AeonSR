@@ -1,17 +1,21 @@
 # Aeon SR
 
-A ReShade add-on that brings temporal upscaling and anti-aliasing through NVIDIA
-DLSS, AMD FSR and Intel XeSS to games that never shipped with them. It runs on
-every graphics API ReShade supports, and motion vectors come from a built-in
-optical flow estimator, so the game does not need to provide them.
+A ReShade add-on that brings temporal anti-aliasing through NVIDIA DLSS, AMD FSR
+and Intel XeSS to games that never shipped with them. It runs on every graphics
+API ReShade supports, and motion vectors come from a built-in optical flow
+estimator, so the game does not need to provide them.
+
+The game keeps rendering at its own resolution. The quality modes below native
+hand DLSS, FSR and XeSS less of the frame to work from; they do not make the game
+run faster.
 
 Author: **Barbatos AWLS**
 
 ## Features
 
-- **Temporal upscaling and anti-aliasing** through NVIDIA DLSS, AMD FSR (FSR 4
-  where the GPU supports it, FSR 3.1 otherwise) and Intel XeSS
-- **Built-in optical flow** that produces the motion vectors the upscalers need
+- **Temporal anti-aliasing** through NVIDIA DLSS, AMD FSR (FSR 4 where the GPU
+  supports it, FSR 3.1 otherwise) and Intel XeSS
+- **Built-in optical flow** that produces the motion vectors DLSS, FSR and XeSS need
 - **No native motion vectors required** from the game
 - **Sub-pixel jitter** drawn into the game's own rendering
 - **Every graphics API**: DirectX 8, 9, 10, 11 and 12, OpenGL and Vulkan
@@ -35,7 +39,7 @@ listed below, and `Licenses\` with every vendor's licence.
 
 Do not use Aeon SR in games protected by anti-cheat.
 
-## Upscaler runtimes
+## Runtimes
 
 Aeon SR drives the vendors' own runtime DLLs. They are not part of Aeon SR and
 keep their own licences (see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
@@ -85,11 +89,11 @@ flowchart TB
     bridge --> engine
     subgraph engine["Engine device (Direct3D 12)"]
         direction LR
-        flow["Optical flow<br/>motion vectors"] --> up["Upscaler<br/>DLSS / FSR / XeSS"]
+        flow["Optical flow<br/>motion vectors"] --> up["Anti-aliasing<br/>DLSS / FSR / XeSS"]
         depth["Depth<br/>normalised"] --> up
         up -.-> nr["DLSS Neural Rendering<br/>optional"]
     end
-    engine -- "back through the bridge" --> out["Game's back buffer<br/>upscaled frame"]
+    engine -- "back through the bridge" --> out["Game's back buffer<br/>anti-aliased frame"]
 ```
 
 - **One engine, one bridge per API.** FSR 4 and DLSS Neural Rendering exist only
@@ -97,22 +101,22 @@ flowchart TB
   the game's GPU. In a Direct3D 12 game the engine is the game's own device and
   nothing is copied. On every other API a bridge shares the game's colour and
   depth with the engine (shared textures on Direct3D 9 to 11, external memory on
-  OpenGL and Vulkan) and returns the upscaled frame. A DirectX 8 game reaches
+  OpenGL and Vulkan) and returns the finished frame. A DirectX 8 game reaches
   ReShade as DirectX 9 through d3d8to9.
 - **Motion vectors.** The optical flow estimator runs on the engine device and
   produces dense motion vectors from the colour buffer, with a camera model fitted
   through depth for thin geometry such as wires and fences.
-- **Jitter.** The sub-pixel offset the upscalers need is drawn into the game's own
+- **Jitter.** The sub-pixel offset DLSS, FSR and XeSS need is drawn into the game's own
   rendering (its shaders, its projection or its viewport, depending on the API).
   The add-on then tries to put the interface back as the game drew it. How well
   that works depends on the game: in some, Earth Defense Force 6 among them, the
   interface can still shake with the jitter.
 - **32-bit games.** The vendor runtimes are 64-bit only. `AeonSR.addon32` hands
   the frame to `AeonSRHost.exe`, a 64-bit process that holds the engine and runs
-  the upscalers.
+  DLSS, FSR and XeSS.
 - **RTX Video Super Resolution** is an experiment. It runs through NVAPI on the
   game's own Direct3D 11 device, needs no motion vectors and, being spatial,
-  rarely improves on the temporal upscalers.
+  rarely improves on DLSS, FSR and XeSS.
 - **`ngxshim\nvngx.dll`** is a small forwarder through which the add-on loads the
   DLSS Neural Rendering runtime. It sits in its own folder so it is never mistaken
   for NVIDIA's NGX core.
@@ -144,7 +148,7 @@ Vulkan headers. The FidelityFX API and DX11 headers, the OpenGL headers and the
 XeSS declarations the add-on compiles against are in `third_party/`.
 
 The x64 build produces, in `build\x64\Release\`, `AeonSR.addon64`,
-`AeonSRHost.exe` (the 64-bit process that runs the vendor upscalers for 32-bit
+`AeonSRHost.exe` (the 64-bit process that runs DLSS, FSR and XeSS for 32-bit
 games), `ngxshim\nvngx.dll` and `runtime\` with the vendor DLLs. The Win32 build
 produces `AeonSR.addon32`; a 32-bit game also needs `AeonSRHost.exe` and
 `runtime\` from the x64 build next to it.
