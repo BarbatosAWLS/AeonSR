@@ -579,6 +579,24 @@ float3 NrDeltaUpsample(float2 uv, float guide) {
 }
 bool NrDeltaIsExact() { return all(nrModelSize == nrFrameSize) && !NrWarped(); }
 
+void NrCarryEnding(float3 Op, float3 delta, out float3 base, out float3 result) {
+  const float eps = 1e-6;
+  float3 lin = Op + delta;
+  float3 headroom = max(nrGuard, 1.0) * max(Op, kNrGuardFloor) - Op;
+  float3 kc = float3(1e6, 1e6, 1e6);
+  kc = delta > eps ? max(headroom, 0.0) / max(delta, eps) : kc;
+  kc = delta < -eps ? max(Op, 0.0) / max(-delta, eps) : kc;
+  float k = saturate(min(kc.r, min(kc.g, kc.b)));
+  if (!NrDeltaIsExact() && k < 1.0)
+    lin = Op + delta * k;
+  lin = max(lin, 0.0);
+  lin /= max(max(lin.r, max(lin.g, lin.b)), 1.0);
+  base = NrDecode(Op);
+  result = NrDecode(lin);
+}
+
+static const float kNrDetailExtraMax = 2.0;
+
 float4 PSNeuralComposite(VSOut i) : SV_Target {
   if (nrCarry > 0.5) {
     const float eps = 1e-6;
@@ -589,23 +607,18 @@ float4 PSNeuralComposite(VSOut i) : SV_Target {
     if (nrDebug > 2.5) return float4(NrDebugSigned(delta), orig.a);
     if (nrDebug > 1.5) return float4(NrDecode(saturate(Op + delta)), orig.a);
     if (nrDebug > 0.5) return float4(NrDecode(Op), orig.a);
-    delta *= nrDetail * nrScaleComp;
-    float3 lin = Op + delta;
-
-    float3 headroom = max(nrGuard, 1.0) * max(Op, kNrGuardFloor) - Op;
-    float3 kc = float3(1e6, 1e6, 1e6);
-    kc = delta > eps ? max(headroom, 0.0) / max(delta, eps) : kc;
-    kc = delta < -eps ? max(Op, 0.0) / max(-delta, eps) : kc;
-    float k = saturate(min(kc.r, min(kc.g, kc.b)));
-    if (!NrDeltaIsExact() && k < 1.0)
-      lin = Op + delta * k;
-    lin = max(lin, 0.0);
-    lin /= max(max(lin.r, max(lin.g, lin.b)), 1.0);
-    float3 base = NrDecode(Op);
-    float3 result = NrDecode(lin);
+    delta *= nrScaleComp;
+    float3 base, result;
+    NrCarryEnding(Op, delta * min(nrDetail, 1.0), base, result);
     float s = (NrLuma(result) + eps) / (NrLuma(base) + eps);
     float3 g = base > 0.0 ? (result + eps) / (base + eps) : s;
-    return float4(frame * lerp(s, g, saturate(nrColour)), orig.a);
+    float extra = 1.0;
+    if (nrDetail > 1.0) {
+      float3 baseX, resultX;
+      NrCarryEnding(Op, delta * nrDetail, baseX, resultX);
+      extra = clamp((NrLuma(resultX) + eps) / (NrLuma(result) + eps), 1.0 / kNrDetailExtraMax, kNrDetailExtraMax);
+    }
+    return float4(frame * lerp(s, g, saturate(nrColour)) * extra, orig.a);
   }
 
   const float eps = 1e-6;

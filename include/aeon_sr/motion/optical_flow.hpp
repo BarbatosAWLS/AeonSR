@@ -43,6 +43,7 @@ public:
 	uint32_t texture_retry_ms = 5000;
 	uint32_t fail_textures_for_test = 0;
 	uint32_t fail_model_textures_for_test = 0;
+	static inline const char *source_for_test = nullptr;
 	Quality usable(Quality want) const noexcept
 	{
 		const uint32_t q = static_cast<uint32_t>(want);
@@ -85,6 +86,14 @@ public:
 	ID3D12Resource *published_camera() const noexcept { return theta_pub_.res; }
 	ID3D12Resource *model_weight() const noexcept { return alpha_q_.res; }
 	bool camera_model_ran() const noexcept { return model_ran_; }
+	static constexpr uint32_t kLandingPeriod = 32;
+	bool landing(float out[4]) noexcept;
+	void reset_landing() noexcept
+	{
+		landing_reset_ = true;
+		landing_copied_ = false;
+		landing_fresh_ = false;
+	}
 	static constexpr D3D12_RESOURCE_STATES kPublishedState =
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -137,6 +146,7 @@ private:
 		float dejitter_x, dejitter_y;
 		uint32_t colour_space;
 		uint32_t pad_colour;
+		float prev_dejitter_x, prev_dejitter_y;
 	};
 
 	bool make_pipelines(std::wstring *error);
@@ -193,6 +203,12 @@ private:
 
 	float prev_jitter_x_ = 0.0f, prev_jitter_y_ = 0.0f;
 	uint32_t skipped_ = 0;
+	ID3D12Resource *landing_rb_ = nullptr;
+	uint32_t landing_tick_ = 0;
+	bool landing_copied_ = false;
+	bool landing_fresh_ = false;
+	bool landing_reset_ = false;
+	float landing_sums_[4]{};
 
 	uint32_t width_ = 0, height_ = 0;
 	uint32_t frames_ = 0;

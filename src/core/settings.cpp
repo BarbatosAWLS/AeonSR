@@ -387,10 +387,6 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			const unsigned int v = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
 			out.neural_toggle_key = (v <= 0xFFu) ? v : 0u;
 		}
-		else if (key == "DlssBiasStrength") {
-			const float v = static_cast<float>(std::atof(val.c_str()));
-			out.dlss_bias_strength = (v >= 0.0f && v <= 1.0f) ? v : 1.0f;
-		}
 		else if (key == "SplitCatmullRom") out.split_catmull_rom = parse_bool(val);
 		else if (key == "JitterSceneRule") {
 			const unsigned long v = std::strtoul(val.c_str(), nullptr, 10);
@@ -474,9 +470,6 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "ScreenshotIterations=" << clamp_accum_iterations(in.accum_iterations) << "\n";
 	out << "NeuralResetOnCut=" << (in.neural_reset_on_cut ? 1 : 0) << "\n";
 	out << "NeuralToggleKey=" << (in.neural_toggle_key <= 0xFFu ? in.neural_toggle_key : 0u) << "\n";
-	out << "DlssBiasStrength="
-		<< ((in.dlss_bias_strength >= 0.0f && in.dlss_bias_strength <= 1.0f) ? in.dlss_bias_strength : 1.0f)
-		<< "\n";
 	out << "SplitCatmullRom=" << (in.split_catmull_rom ? 1 : 0) << "\n";
 	out << "JitterSceneRule=" << (in.jitter_scene_rule <= 2u ? in.jitter_scene_rule : 0u) << "\n";
 	if (!in.jitter_tested_quads)

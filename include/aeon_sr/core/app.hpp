@@ -15,6 +15,7 @@
 #include "aeon_sr/core/gpu_vendor.hpp"
 #include "aeon_sr/core/frame_observer.hpp"
 #include "aeon_sr/jitter/hud_restore.hpp"
+#include "aeon_sr/jitter/jitter_landing.hpp"
 #include "aeon_sr/motion/guide_builder.hpp"
 #include "aeon_sr/core/input_probes.hpp"
 #include "aeon_sr/interop/interop.hpp"
@@ -231,6 +232,7 @@ private:
 	uint32_t learned_scene_w_ = 0, learned_scene_h_ = 0;
 	uint32_t learned_scene_dw_ = 0, learned_scene_dh_ = 0;
 	bool move_all_ = false;
+	JitterLanding landing_;
 	BlitPipelineD3D12 frame_shift_blit_;
 	Gpu12Fence frame_shift_fence_;
 	StageTimings stage_times_;

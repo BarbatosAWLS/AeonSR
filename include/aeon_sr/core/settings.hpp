@@ -143,7 +143,6 @@ struct Settings {
 
 	std::string fsr_provider;
 
-	float dlss_bias_strength = 1.0f;
 	unsigned int jitter_scene_rule = 0;
 	bool jitter_tested_quads = true;
 	bool split_catmull_rom = false;

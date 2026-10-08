@@ -126,6 +126,11 @@ void barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
 	cmd->ResourceBarrier(1, &b);
 }
 
+const char *flow_source()
+{
+	return OpticalFlowD3D12::source_for_test != nullptr ? OpticalFlowD3D12::source_for_test : kFlowHlsl;
+}
+
 }
 
 OpticalFlowD3D12::~OpticalFlowD3D12()
@@ -172,6 +177,9 @@ void OpticalFlowD3D12::release()
 	safe_release(root_);
 	safe_release(prof_heap_);
 	safe_release(prof_readback_);
+	safe_release(landing_rb_);
+	landing_copied_ = landing_fresh_ = landing_reset_ = false;
+	landing_tick_ = 0;
 	prof_on_ = false;
 	prof_count_ = 0;
 	quality_ok[0] = quality_ok[1] = false;
@@ -361,7 +369,7 @@ bool OpticalFlowD3D12::make_pipelines(std::wstring *error)
 		};
 		for (uint32_t i = 0; i < kFirstModelShader; ++i) {
 			ID3DBlob *cs = nullptr, *cerr = nullptr;
-			if (FAILED(D3DCompile(kFlowHlsl, std::strlen(kFlowHlsl), "aeon_flow", defines,
+			if (FAILED(D3DCompile(flow_source(), std::strlen(flow_source()), "aeon_flow", defines,
 					nullptr, entry_of(i), "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
 				std::wstring detail = L"optical flow: ";
 				detail += widen_ascii(entry_of(i));
@@ -427,7 +435,7 @@ void OpticalFlowD3D12::build_model_pipelines()
 			break;
 		}
 		ID3DBlob *cs = nullptr, *cerr = nullptr;
-		if (FAILED(D3DCompile(kFlowHlsl, std::strlen(kFlowHlsl), "aeon_flow", nullptr,
+		if (FAILED(D3DCompile(flow_source(), std::strlen(flow_source()), "aeon_flow", nullptr,
 				nullptr, entry_of(i), "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
 			why = L"camera model: ";
 			why += widen_ascii(entry_of(i));
@@ -619,6 +627,16 @@ void OpticalFlowD3D12::make_model_textures()
 	}
 	device_bytes_ = bytes_before;
 	model_textures_error_ = L"camera model: its textures could not be created at this size";
+}
+
+bool OpticalFlowD3D12::landing(float out[4]) noexcept
+{
+	if (!landing_fresh_)
+		return false;
+	landing_fresh_ = false;
+	for (int i = 0; i < 4; ++i)
+		out[i] = landing_sums_[i];
+	return true;
 }
 
 uint32_t OpticalFlowD3D12::records_per_ring() const noexcept
@@ -821,7 +839,7 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 	m.terms_gx = groups(qw, 16);
 	m.terms_gy = groups(qh, 16);
 	m.partial_rows = kPartialRows;
-	m.model_flags = (model_cold_ ? 1u : 0u) | (base.model_flags & 6u);
+	m.model_flags = (model_cold_ ? 1u : 0u) | (base.model_flags & 14u);
 
 	m.model_iter = 0;
 	if (depth_logarithmic_)
@@ -1066,11 +1084,18 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	c.dejitter_y = jitter_y_px * c.inv_full_y;
 	c.colour_space = colour_space_;
 	const bool same_positions = jitter_x_px == prev_jitter_x_ && jitter_y_px == prev_jitter_y_;
+	c.prev_dejitter_x = prev_jitter_x_ * c.inv_full_x;
+	c.prev_dejitter_y = prev_jitter_y_ * c.inv_full_y;
 	prev_jitter_x_ = jitter_x_px;
 	prev_jitter_y_ = jitter_y_px;
 	const bool publish = publish_want && (same_positions || skipped_ != 0u || first != 0u);
 	const bool cross = publish_want && !publish && camera_model && model_ok() && !model_cold_;
 	c.model_flags = same_positions ? 2u : (cross ? 4u : 0u);
+	const bool model_runs = cross || (publish && camera_model && model_ok() && first == 0u);
+	if (landing_reset_ && model_runs) {
+		c.model_flags |= 8u;
+		landing_reset_ = false;
+	}
 	skipped_ = publish ? 0u : skipped_ + 1u;
 
 	{
@@ -1300,6 +1325,55 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	to_state(cmd, theta_[0], kPublishedState);
 	to_state(cmd, theta_pub_, kPublishedState);
 	to_state(cmd, alpha_q_, kPublishedState);
+
+	if (theta_pub_.res != nullptr && ++landing_tick_ >= kLandingPeriod) {
+		landing_tick_ = 0;
+		if (landing_copied_ && landing_rb_ != nullptr) {
+			void *mapped = nullptr;
+			const D3D12_RANGE range{ 0, 256u * 8u };
+			if (SUCCEEDED(landing_rb_->Map(0, &range, &mapped)) && mapped != nullptr) {
+				const uint8_t *rows = static_cast<const uint8_t *>(mapped);
+				std::memcpy(&landing_sums_[0], rows + 6u * 256u + 14u * 4u, 8u);
+				std::memcpy(&landing_sums_[2], rows + 7u * 256u + 14u * 4u, 8u);
+				const D3D12_RANGE none{ 0, 0 };
+				landing_rb_->Unmap(0, &none);
+				landing_fresh_ = true;
+			}
+		}
+		if (landing_rb_ == nullptr) {
+			D3D12_HEAP_PROPERTIES hp{};
+			hp.Type = D3D12_HEAP_TYPE_READBACK;
+			D3D12_RESOURCE_DESC rd{};
+			rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			rd.Width = 256u * 8u;
+			rd.Height = 1;
+			rd.DepthOrArraySize = 1;
+			rd.MipLevels = 1;
+			rd.SampleDesc.Count = 1;
+			rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+					D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&landing_rb_))))
+				landing_rb_ = nullptr;
+		}
+		if (landing_rb_ != nullptr && model_ok()) {
+			barrier(cmd, theta_pub_.res, kPublishedState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			D3D12_TEXTURE_COPY_LOCATION dst{};
+			dst.pResource = landing_rb_;
+			dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+			dst.PlacedFootprint.Footprint.Width = 16;
+			dst.PlacedFootprint.Footprint.Height = 8;
+			dst.PlacedFootprint.Footprint.Depth = 1;
+			dst.PlacedFootprint.Footprint.RowPitch = 256;
+			D3D12_TEXTURE_COPY_LOCATION src{};
+			src.pResource = theta_pub_.res;
+			src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			src.SubresourceIndex = 0;
+			cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			barrier(cmd, theta_pub_.res, D3D12_RESOURCE_STATE_COPY_SOURCE, kPublishedState);
+			landing_copied_ = true;
+		}
+	}
 
 	if (have_depth_ && depth_state != read_state)
 		barrier(cmd, depth, read_state, depth_state);

@@ -23,6 +23,7 @@ cbuffer Params : register(b0)
 	float2 dejitter;
 	uint   colour_space;
 	uint   pad_colour;
+	float2 prev_dejitter;
 };
 
 float2 on_grid(float2 uv) { return uv + dejitter; }
@@ -163,9 +164,8 @@ float2 compute_flow(float2 uv)
 		return float2(0.0, 0.0);
 
 	static const int2 C8[8] = {
-		int2(-1, 1), int2(0, 1), int2(1, 1),
-		int2(-1, 0),             int2(1, 0),
-		int2(-1,-1), int2(0,-1), int2(1,-1)
+		int2(-1, 1), int2(0, 1), int2(1, 1), int2(1, 0),
+		int2(1,-1), int2(0,-1), int2(-1,-1), int2(-1, 0)
 	};
 	static const int2 C8_IT[9] = {
 		int2(6, 3), int2(0, 3), int2(0, 5), int2(2, 5),
@@ -202,7 +202,8 @@ float2 compute_flow(float2 uv)
 	float match_cost = zad(uv, uv + prediction, texel2, mip2);
 	int match_i = 8;
 
-	for (int s = 0; s < SEARCH_ITER; ++s) {
+	const int iters = (mip2 == 0u) ? SEARCH_ITER : min(SEARCH_ITER, 2);
+	for (int s = 0; s < iters; ++s) {
 		int i = C8_IT[match_i].x;
 		const int end = C8_IT[match_i].y;
 		const float2 centre = residual;
@@ -632,9 +633,6 @@ static const float kLineTol = 1.0;
 static const float kTexTol = 0.5;
 static const float kLineNoise = 0.6;
 static const float kTexNoise = 0.15;
-static const float kGateTexTol = 0.08;
-static const float kGateStructLo = 0.60;
-static const float kGateStructHi = 0.80;
 static const int kSurfaceReach = 8;
 static const float kSurfaceAgreeLo = 0.80;
 static const float kSurfaceAgreeHi = 0.92;
@@ -1118,6 +1116,8 @@ static const float kPublishSnapPx = 0.35;
 
 static const float kCrossSwitchPx = 0.20;
 static const float kCrossQuality = 0.5;
+static const float kCrossDistrust = 2.0;
+static const float kLandingDecay = 0.98;
 
 float frame_apart(float a[11], float b[11])
 {
@@ -1130,6 +1130,22 @@ float frame_apart(float a[11], float b[11])
 			const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
 			const float2 x = norm_of(uv);
 			s += length((model_at(a, x, rho) - model_at(b, x, rho)) * px_per_unit);
+		}
+	}
+	return s / 144.0;
+}
+
+float2 frame_shift(float a[11], float b[11])
+{
+	float2 s = float2(0.0, 0.0);
+	[loop]
+	for (int j = 0; j < 9; ++j) {
+		[loop]
+		for (int i = 0; i < 16; ++i) {
+			const float2 uv = (float2(i, j) + 0.5) / float2(16.0, 9.0);
+			const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
+			const float2 x = norm_of(uv);
+			s += (model_at(a, x, rho) - model_at(b, x, rho)) * px_per_unit;
 		}
 	}
 	return s / 144.0;
@@ -1167,6 +1183,28 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 		usable = usable && (raw[k1] == raw[k1]);
 	if ((model_flags & 1u) != 0u || !usable)
 		n = 0u;
+	if ((model_flags & 8u) != 0u) {
+		OutS[uint2(14, 6)] = 0.0;
+		OutS[uint2(15, 6)] = 0.0;
+		OutS[uint2(14, 7)] = 0.0;
+		OutS[uint2(15, 7)] = 0.0;
+	}
+	const float stored_distrust = OutS[uint2(12, 7)];
+	float distrust = (stored_distrust == stored_distrust) ? clamp(stored_distrust, 0.0, 8.0) : 0.0;
+	if (OutS[uint2(11, 7)] > 0.5 && (model_flags & 4u) == 0u) {
+		if ((model_flags & 2u) != 0u && (model_flags & 1u) == 0u && usable) {
+			float switched[11], before[11];
+			[unroll]
+			for (int k9 = 0; k9 < 11; ++k9) {
+				switched[k9] = OutS[uint2(k9, 7)];
+				before[k9] = OutS[uint2(3 + k9, 6)];
+			}
+			const bool against = frame_apart(raw, before) < frame_apart(raw, switched);
+			distrust = against ? min(distrust + 1.0, 8.0) : max(distrust - 1.0, 0.0);
+			OutS[uint2(13, 7)] = against ? 1.0 : -1.0;
+		}
+		OutS[uint2(11, 7)] = 0.0;
+	}
 	float apart = -1.0;
 	bool keep = false;
 	if ((model_flags & 4u) != 0u) {
@@ -1175,9 +1213,31 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 		for (int k8 = 0; k8 < 11; ++k8)
 			pub[k8] = OutS[uint2(k8, 0)];
 		apart = (n > 0u) ? frame_apart(raw, pub) : 0.0;
-		keep = !(apart > kCrossSwitchPx) || !(model_support() > kCrossQuality);
+		const bool supported = model_support() > kCrossQuality;
+		const bool asks = apart > kCrossSwitchPx && supported;
+		if (n > 0u && supported) {
+			const float2 moved = (dejitter - prev_dejitter) * float2(norm_x, 2.0) * px_per_unit;
+			const float2 left = frame_shift(raw, pub);
+			float4 sums = float4(OutS[uint2(14, 6)], OutS[uint2(15, 6)], OutS[uint2(14, 7)], OutS[uint2(15, 7)]);
+			sums = (all(sums == sums) ? sums : float4(0.0, 0.0, 0.0, 0.0)) * kLandingDecay +
+				float4(left.x * moved.x, moved.x * moved.x, left.y * moved.y, moved.y * moved.y);
+			OutS[uint2(14, 6)] = sums.x;
+			OutS[uint2(15, 6)] = sums.y;
+			OutS[uint2(14, 7)] = sums.z;
+			OutS[uint2(15, 7)] = sums.w;
+		}
+		if (asks) {
+			[unroll]
+			for (int k10 = 0; k10 < 11; ++k10) {
+				OutS[uint2(k10, 7)] = raw[k10];
+				OutS[uint2(3 + k10, 6)] = pub[k10];
+			}
+			OutS[uint2(11, 7)] = 1.0;
+		}
+		keep = !asks || distrust >= kCrossDistrust;
 		n = 0u;
 	}
+	OutS[uint2(12, 7)] = distrust;
 	OutS[uint2(1, 6)] = keep ? 1.0 : 0.0;
 	OutS[uint2(2, 6)] = apart;
 	if (keep)
@@ -1285,10 +1345,8 @@ float gate_alpha(float4 st, float2 f, float2 x, float th[11])
 	const float2 n = float2(cos(st.x), sin(st.x));
 	const float l = line_like(st);
 	const float k = sqrt(saturate(st.z));
-	const float held = (has_depth != 0u) ? 0.0 : smoothstep(kGateStructLo, kGateStructHi, saturate(st.z));
-	const float tex_tol = lerp(kTexTol, kGateTexTol, held);
-	const float an = 1.0 - smoothstep(1.0, 2.5, abs(dot(r, n)) * k / lerp(tex_tol, kLineTol, l));
-	const float at = 1.0 - smoothstep(1.0, 2.5, abs(dot(r, float2(-n.y, n.x))) * k / tex_tol);
+	const float an = 1.0 - smoothstep(1.0, 2.5, abs(dot(r, n)) * k / lerp(kTexTol, kLineTol, l));
+	const float at = 1.0 - smoothstep(1.0, 2.5, abs(dot(r, float2(-n.y, n.x))) * k / kTexTol);
 	return an * lerp(at, 1.0, l);
 }
 )HLSL"

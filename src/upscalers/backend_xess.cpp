@@ -226,7 +226,7 @@ bool XessD3D12Backend::ensure_resources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	if (device_ == nullptr || context_ == nullptr)
 		return false;
 
-	const DXGI_FORMAT scratch = resolve_scratch_format(fmt);
+	const DXGI_FORMAT scratch = upscaler_scratch_format(fmt);
 	const bool same = (width_ == w && height_ == h && created_backbuffer_format_ == fmt &&
 		created_quality_mode_ == quality_mode_ && created_render_scale_ == render_scale_ &&
 		output_tex_ != nullptr && color_full_ != nullptr && color_copy_ != nullptr);

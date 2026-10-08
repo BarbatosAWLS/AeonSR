@@ -14,4 +14,6 @@ DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) noexcept;
 
 DXGI_FORMAT resolve_scratch_format(DXGI_FORMAT backbuffer_fmt) noexcept;
 
+DXGI_FORMAT upscaler_scratch_format(DXGI_FORMAT backbuffer_fmt) noexcept;
+
 }

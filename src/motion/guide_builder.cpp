@@ -29,9 +29,8 @@ reshade::api::resource GuideBuilder::bias_mask(const PassContext &ctx, const Set
 		return { 0 };
 	if (!in.have_motion_confidence || in.engine.confidence == nullptr || !in.engine.ready())
 		return { 0 };
-	const float strength = s.dlss_bias_strength >= 0.0f && s.dlss_bias_strength <= 1.0f
-		? s.dlss_bias_strength : 1.0f;
-	return draw(ctx, bias_, in, Kind::BiasFromConfidence, strength, false);
+	(void)s;
+	return draw(ctx, bias_, in, Kind::BiasFromConfidence, 1.0f, false);
 }
 
 reshade::api::resource GuideBuilder::draw(const PassContext &ctx, Mask &mask, const FrameInputs &in,

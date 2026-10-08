@@ -265,8 +265,7 @@ void draw_quality_section(const PanelState &state, Settings &settings, PanelActi
 	} else if (settings.spatial_jitter) {
 		ImGui::TextDisabled("On, waiting for the game to draw a frame.");
 	}
-	if ((settings.spatial_jitter || state.scope_capture_enabled) && state.scope_have &&
-		ImGui::TreeNode("Jitter numbers")) {
+	if (state.scope_capture_enabled && state.scope_have && ImGui::TreeNode("Jitter numbers")) {
 		draw_jitter_numbers(state, actions);
 		ImGui::TreePop();
 	}
@@ -287,14 +286,6 @@ void draw_quality_section(const PanelState &state, Settings &settings, PanelActi
 				"Which DLSS image model to use.")) {
 			actions.reset = true;
 			actions.persist = true;
-		}
-
-		if (state.have_motion_confidence) {
-			ImGui::SliderFloat("Confidence mask", &settings.dlss_bias_strength, 0.0f, 1.0f, "%.2f");
-			hint("Reduces trailing behind flames, dust and flickering lights.\n"
-				"0 turns it off.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
 		}
 	}
 

@@ -737,7 +737,7 @@ bool Fsr4D3D12Backend::run_native(
 	}
 	const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
 	backbuffer_format_ = bb_desc.Format;
-	const DXGI_FORMAT fmt = resolve_scratch_format(bb_desc.Format);
+	const DXGI_FORMAT fmt = upscaler_scratch_format(bb_desc.Format);
 	const uint32_t w = static_cast<uint32_t>(bb_desc.Width);
 	const uint32_t h = bb_desc.Height;
 

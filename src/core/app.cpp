@@ -899,6 +899,19 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 		return;
 	}
 
+	{
+		float sums[4];
+		if (flow_.landing(sums) && landing_.update(sums)) {
+			flow_.reset_landing();
+			wchar_t text[200]{};
+			_snwprintf_s(text, _TRUNCATE, L"jitter: the picture moved %.2f times the offset across and %.2f down; "
+				L"drawn turned over %ls", landing_.factor_x(), landing_.factor_y(),
+				landing_.flip_x() && landing_.flip_y() ? L"on both axes"
+				: landing_.flip_x() ? L"across" : landing_.flip_y() ? L"down" : L"on neither axis");
+			diag_info("jitter", text);
+		}
+	}
+
 	if (flow_.model_failed())
 		diag_state("camera-model", DiagLevel::Warn, "flow", flow_.model_error());
 
@@ -1197,6 +1210,10 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 	const JitterReach reach = JitterReach::SceneTargets;
 	JitterArm arm = make_jitter_arm(history_.jitter_index, j.x, j.y, inputs.width, inputs.height,
 		rw, rh, tw, th, scene_depth, runtime->get_back_buffer(0).handle, reach);
+	if (landing_.flip_x())
+		arm.target_x = -arm.target_x;
+	if (landing_.flip_y())
+		arm.target_y = -arm.target_y;
 	move_all_ = jitter_move_all(move_all_, jitter_.drawn());
 	scene_rules(settings_.jitter_scene_rule, move_all_, &arm.size_targets, &arm.move_window);
 	arm.tested_quads = settings_.jitter_tested_quads;

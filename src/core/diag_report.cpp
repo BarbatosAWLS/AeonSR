@@ -49,8 +49,7 @@ void append_settings(std::wstring &out, const Settings &s)
 	out += wformat(L"  upscale_effects=%hs  jitter=%hs  flow_quality=%u  mv_probe=%hs\n",
 		bool_label(s.upscale_effects), bool_label(s.spatial_jitter),
 		s.internal_flow_quality, bool_label(s.mv_probe));
-	out += wformat(L"  dlss_bias_strength=%.2f  vsr_input_format=%u  fsr_provider=%hs\n",
-		static_cast<double>(s.dlss_bias_strength), s.vsr_input_format,
+	out += wformat(L"  vsr_input_format=%u  fsr_provider=%hs\n", s.vsr_input_format,
 		s.fsr_provider.empty() ? "auto" : s.fsr_provider.c_str());
 	static const wchar_t *const kModeNames[kNeuralModeCount] = {
 		L"quality", L"balanced", L"performance", L"ultra performance" };
