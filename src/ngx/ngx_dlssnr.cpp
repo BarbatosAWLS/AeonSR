@@ -6,14 +6,11 @@
 #include "aeon_sr/ngx/ngx_common.hpp"
 
 #include <Windows.h>
-#include <bcrypt.h>
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi.h>
 #include <dxgi1_4.h>
 #include <excpt.h>
-
-#pragma comment(lib, "bcrypt.lib")
 
 #ifndef CUDA_VERSION
 typedef unsigned long long CUtexObject;
@@ -211,75 +208,6 @@ bool read_runtime_min_driver(const std::wstring &path, uint32_t *out_major, uint
 		return true;
 	}
 	return false;
-}
-
-std::string sha256_hex(const char *bytes, size_t size)
-{
-	BCRYPT_ALG_HANDLE alg = nullptr;
-	if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
-		return {};
-	std::string out;
-	BCRYPT_HASH_HANDLE hash = nullptr;
-	if (BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0))) {
-		bool ok = true;
-		for (size_t off = 0; ok && off < size;) {
-			const ULONG chunk = static_cast<ULONG>(std::min<size_t>(size - off, size_t{ 1 } << 30));
-			ok = BCRYPT_SUCCESS(BCryptHashData(hash,
-				reinterpret_cast<PUCHAR>(const_cast<char *>(bytes + off)), chunk, 0));
-			off += chunk;
-		}
-		unsigned char digest[32]{};
-		if (ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof digest, 0))) {
-			char hex[65]{};
-			for (int i = 0; i < 32; ++i)
-				snprintf(hex + 2 * i, 3, "%02x", digest[i]);
-			out = hex;
-		}
-		BCryptDestroyHash(hash);
-	}
-	BCryptCloseAlgorithmProvider(alg, 0);
-	return out;
-}
-
-bool read_runtime_file(const std::wstring &path, NeuralRuntimeKernels *out_kernels,
-	NeuralRuntimeIdentity *out_identity, std::string *out_sha256)
-{
-	*out_kernels = NeuralRuntimeKernels{};
-	*out_identity = NeuralRuntimeIdentity{};
-	out_sha256->clear();
-
-	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-		OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-	if (file == INVALID_HANDLE_VALUE)
-		return false;
-	LARGE_INTEGER size{};
-	bool got = false;
-	if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= (512ll << 20)) {
-		const size_t n = static_cast<size_t>(size.QuadPart);
-		std::vector<char> buf;
-		try {
-			buf.resize(n);
-		} catch (const std::bad_alloc &) {
-			CloseHandle(file);
-			return false;
-		}
-		size_t off = 0;
-		bool read_ok = true;
-		while (read_ok && off < n) {
-			const DWORD chunk = static_cast<DWORD>(std::min<size_t>(n - off, size_t{ 1 } << 24));
-			DWORD read = 0;
-			read_ok = ReadFile(file, buf.data() + off, chunk, &read, nullptr) != 0 && read == chunk;
-			off += read;
-		}
-		if (read_ok) {
-			*out_kernels = neural_kernels_in(buf.data(), n);
-			*out_identity = neural_identity_in(buf.data(), n);
-			*out_sha256 = sha256_hex(buf.data(), n);
-			got = true;
-		}
-	}
-	CloseHandle(file);
-	return got;
 }
 
 bool kernels_name_card(const NeuralRuntimeKernels &k, uint32_t architecture)
@@ -723,30 +651,54 @@ long NgxShim::requirements(IDXGIAdapter *adapter, const void *discovery, void *o
 
 bool NeuralRenderCommon::ensure_dll_present()
 {
-	dll_present = false;
-	shim_present = false;
-	runtime_candidates = neural_runtime_candidates(addon_dir, exe_directory_w());
-	if (runtime_candidates.empty()) {
-		status = UpscalerStatus::MissingRuntime;
-		last_error = L"nvngx_dlssnr.dll not found. It is not part of this package - NVIDIA does not\n"
+	return refresh_files(true);
+}
+
+bool NeuralRenderCommon::probe_dll_present()
+{
+	return refresh_files(false);
+}
+
+bool NeuralRenderCommon::refresh_files(bool choose)
+{
+	const std::vector<std::wstring> found = neural_runtime_candidates(addon_dir, exe_directory_w());
+	if (found.empty()) {
+		{
+			const std::lock_guard<std::mutex> lock(text_mutex);
+			runtime_candidates.clear();
+			dll_present = false;
+			shim_present = false;
+		}
+		set_status(UpscalerStatus::MissingRuntime,
+			L"nvngx_dlssnr.dll not found. It is not part of this package - NVIDIA does not\n"
 			L"publish it in the DLSS SDK and the driver does not install it. Copy it from a game\n"
-			L"that ships DLSS Neural Rendering into the folder holding AeonSR.addon64.";
+			L"that ships DLSS Neural Rendering into the folder holding AeonSR.addon64.");
 		return false;
 	}
 
-	bool still_there = false;
-	for (const std::wstring &c : runtime_candidates)
-		still_there = still_there || _wcsicmp(c.c_str(), dll_path.c_str()) == 0;
-	if (!still_there)
-		dll_path = runtime_candidates.front();
-	dll_dir = directory_part(dll_path);
-	dll_present = true;
-	shim_present = !shim_path().empty();
-	if (!shim_present) {
-		status = UpscalerStatus::MissingRuntime;
-		last_error = L"ngxshim\\nvngx.dll is missing beside nvngx_dlssnr.dll. The runtime only "
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		runtime_candidates = found;
+		if (choose) {
+			bool still_there = false;
+			for (const std::wstring &c : found)
+				still_there = still_there || _wcsicmp(c.c_str(), dll_path.c_str()) == 0;
+			if (!still_there)
+				dll_path = found.front();
+			dll_dir = directory_part(dll_path);
+		}
+		dll_present = true;
+	}
+	const bool shim = !shim_path().empty();
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		shim_present = shim;
+	}
+	if (!shim) {
+		set_status(UpscalerStatus::MissingRuntime,
+			L"ngxshim\\nvngx.dll is missing beside nvngx_dlssnr.dll. The runtime only "
 			L"initialises when its caller is a module with that name, so the pass cannot run "
-			L"without it - rebuild, or copy the ngxshim folder from the release.";
+			L"without it - rebuild, or copy the ngxshim folder from the release.");
 		return false;
 	}
 	return true;
@@ -754,7 +706,13 @@ bool NeuralRenderCommon::ensure_dll_present()
 
 std::wstring NeuralRenderCommon::shim_path() const
 {
-	for (const std::wstring *dir : { &addon_dir, &dll_dir }) {
+	std::wstring runtime_dir;
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		runtime_dir = dll_dir;
+	}
+	const std::wstring *const dirs[] = { &addon_dir, &runtime_dir };
+	for (const std::wstring *dir : dirs) {
 		if (dir->empty())
 			continue;
 		std::wstring p = nr_shim_path(*dir);
@@ -766,9 +724,8 @@ std::wstring NeuralRenderCommon::shim_path() const
 
 void NeuralRenderCommon::fail(UpscalerStatus s, std::wstring detail)
 {
-	status = s;
-	last_error = std::move(detail);
-	diag_error("neural", last_error);
+	diag_error("neural", detail);
+	set_status(s, std::move(detail));
 }
 
 void NeuralRenderD3D12::set_command_queue(ID3D12CommandQueue *q)
@@ -805,16 +762,24 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 	diag_info("neural", L"init begin");
 
 	card_architecture = nvidia_architecture_id();
-	runtime_targets_known = false;
-	runtime_kernels = NeuralRuntimeKernels{};
-	runtime_identity = NeuralRuntimeIdentity{};
-	runtime_sha256.clear();
-	for (size_t i = 0; i < runtime_candidates.size(); ++i) {
-		const std::wstring &path = runtime_candidates[i];
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		runtime_targets_known = false;
+		runtime_kernels = NeuralRuntimeKernels{};
+		runtime_identity = NeuralRuntimeIdentity{};
+		runtime_sha256.clear();
+	}
+	std::vector<std::wstring> candidates;
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		candidates = runtime_candidates;
+	}
+	for (size_t i = 0; i < candidates.size(); ++i) {
+		const std::wstring &path = candidates[i];
 		NeuralRuntimeKernels kernels;
 		NeuralRuntimeIdentity identity;
 		std::string sha;
-		const bool known = read_runtime_file(path, &kernels, &identity, &sha);
+		const bool known = neural_read_runtime_file(path, &kernels, &identity, &sha);
 		const bool serves = !known || card_architecture == 0u ||
 			neural_kernels_serve(kernels, card_architecture);
 		{
@@ -830,6 +795,7 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 			diag_info("neural", buf);
 		}
 		if (i == 0 || serves) {
+			const std::lock_guard<std::mutex> lock(text_mutex);
 			dll_path = path;
 			runtime_targets_known = known;
 			runtime_kernels = std::move(kernels);
@@ -839,7 +805,10 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 		if (serves)
 			break;
 	}
-	dll_dir = directory_part(dll_path);
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		dll_dir = directory_part(dll_path);
+	}
 
 	read_runtime_min_driver(dll_path, &required_driver_major, &required_driver_minor);
 	nvidia_driver_version(device->GetAdapterLuid().LowPart, device->GetAdapterLuid().HighPart,
@@ -960,6 +929,7 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 	}
 
 	unsigned long seh = 0;
+	note_own_ngx_start();
 	const long r = shim.init(kAppId, data_dir.c_str(), device, NVSDK_NGX_Version_API, &seh);
 	diag_info("neural", format_result(L"nr_runtime Init_Ext", r));
 	if (seh != 0) {
@@ -978,8 +948,7 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 
 	params = new NeuralParams();
 	initialized = true;
-	status = UpscalerStatus::Idle;
-	last_error.clear();
+	set_status(UpscalerStatus::Idle, std::wstring());
 
 	{
 		const NeuralArchHookStats hs = neural_arch_hook_stats();
@@ -1169,6 +1138,7 @@ void NeuralRenderD3D12::shutdown_device()
 	queue = nullptr;
 	device = nullptr;
 	width = height = 0;
+	const std::lock_guard<std::mutex> lock(text_mutex);
 	if (status != UpscalerStatus::MissingRuntime)
 		status = UpscalerStatus::Idle;
 }
@@ -1292,8 +1262,7 @@ bool NeuralRenderD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t 
 		return false;
 	}
 
-	status = UpscalerStatus::Ready;
-	last_error.clear();
+	set_status(UpscalerStatus::Ready, std::wstring());
 	if (created_passes < passes) {
 		wchar_t buf[200]{};
 		_snwprintf_s(buf, _TRUNCATE, L"built %u of the %u requested passes (%s); the chain runs with %u",
@@ -1448,7 +1417,7 @@ bool NeuralRenderD3D12::evaluate_chain(ID3D12GraphicsCommandList *cmd, uint32_t 
 			} else {
 
 				capture.requested = false;
-				capture.last = L"not captured: " + last_error;
+				capture.last = L"not captured: " + text().last_error;
 				diag_info("neural", L"capture: " + capture.last);
 			}
 		}
@@ -1717,8 +1686,7 @@ bool NeuralRenderD3D12::run_fast(ID3D12GraphicsCommandList *cmd,
 		cmd->CopyResource(color, output_tex);
 		barrier12(cmd, color, D3D12_RESOURCE_STATE_COPY_DEST, color_state);
 		barrier12(cmd, output_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		status = UpscalerStatus::Ready;
-		last_error.clear();
+		set_status(UpscalerStatus::Ready, std::wstring());
 	} else {
 		barrier12(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
 	}
@@ -1891,8 +1859,7 @@ bool NeuralRenderD3D12::run_composite(ID3D12GraphicsCommandList *cmd,
 	}
 	barrier12(cmd, frame_copy, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 	if (ok) {
-		status = UpscalerStatus::Ready;
-		last_error.clear();
+		set_status(UpscalerStatus::Ready, std::wstring());
 	}
 	return ok;
 }

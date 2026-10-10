@@ -31,6 +31,9 @@ struct PanelState {
 
 	bool native_dlss = false;
 	std::wstring native_dlss_modules;
+	std::wstring ngx_layer;
+	bool ngx_layer_relevant = false;
+	bool ngx_layer_nvidia = false;
 	bool active_is_xess = false;
 	bool active_is_vsr = false;
 	bool active_on12 = false;
@@ -47,6 +50,7 @@ struct PanelState {
 	bool upscaler_dll_present = false;
 	bool upscalers_remote = false;
 	bool host_ready = false;
+	std::wstring host_error;
 	uint32_t host_pid = 0;
 	bool upscaler_initialized = false;
 	uint32_t upscaler_out_width = 0, upscaler_out_height = 0;

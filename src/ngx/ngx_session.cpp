@@ -10,14 +10,10 @@ namespace aeon_sr {
 
 bool NgxSession::ensure_dll_present()
 {
-	dll_present = false;
-	for (const std::wstring &dir : runtime_search_dirs(addon_dir, exe_directory_w())) {
-		if (!file_exists_w(ngx_dll_path(dir)))
-			continue;
-		dll_present = true;
+	const std::wstring dir = find_ngx_runtime_dir(addon_dir);
+	dll_present = !dir.empty();
+	if (dll_present)
 		dll_dir = dir;
-		break;
-	}
 	if (!dll_present) {
 		status = UpscalerStatus::MissingRuntime;
 		last_error = L"Place nvngx_dlss.dll next to AeonSR.addon64, or in a runtime\\ folder beside it";

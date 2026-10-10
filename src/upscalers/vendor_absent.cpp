@@ -93,15 +93,19 @@ void NgxRuntimeD3D12::shutdown_device() {}
 
 bool NeuralRenderCommon::ensure_dll_present()
 {
-	status = UpscalerStatus::MissingRuntime;
-	last_error = kWhy;
+	set_status(UpscalerStatus::MissingRuntime, kWhy);
+	return false;
+}
+
+bool NeuralRenderCommon::probe_dll_present()
+{
+	set_status(UpscalerStatus::MissingRuntime, kWhy);
 	return false;
 }
 
 bool NeuralRenderD3D12::init_device(ID3D12Device *, uint32_t, uint32_t)
 {
-	status = UpscalerStatus::MissingRuntime;
-	last_error = kWhy;
+	set_status(UpscalerStatus::MissingRuntime, kWhy);
 	return false;
 }
 void NeuralRenderD3D12::shutdown_device() {}

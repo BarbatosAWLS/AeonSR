@@ -20,6 +20,7 @@
 #include "aeon_sr/core/input_probes.hpp"
 #include "aeon_sr/interop/interop.hpp"
 #include "aeon_sr/upscalers/native_dlss.hpp"
+#include "aeon_sr/interop/engine_route.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
 #include "aeon_sr/ngx/ngx_runtime.hpp"
 #include "aeon_sr/ngx/ngx_runtime_d3d12.hpp"
@@ -105,6 +106,8 @@ private:
 	bool remote_wanted() const noexcept;
 	bool runs_remote(const UpscalerBackend *backend) const noexcept;
 	bool dlss_needs_host() const noexcept;
+	EngineRoute engine_route_now() const noexcept;
+	bool crosses(const UpscalerBackend *backend) const noexcept;
 	void ensure_remote();
 	void run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 		const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params,
@@ -133,7 +136,12 @@ private:
 	GpuInfo gpu_;
 
 	NativeDlss native_dlss_;
+	unsigned long long native_dlss_scanned_ms_ = 0;
+	uint32_t landing_discards_logged_ = 0;
 	bool native_dlss_seen_ = false;
+	unsigned long long ngx_layers_scanned_ms_ = 0;
+	std::vector<NgxLayer> ngx_layers_;
+	void update_ngx_layers();
 	void update_native_dlss();
 
 	NeuralColorSpace color_space_ = NeuralColorSpace::Sdr;

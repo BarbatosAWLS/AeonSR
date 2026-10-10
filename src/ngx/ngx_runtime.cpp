@@ -119,6 +119,7 @@ bool NgxRuntime::init_device(ID3D11Device *dev, uint32_t w, uint32_t h)
 
 	NVSDK_NGX_Result init_res = NVSDK_NGX_Result_Fail;
 
+	note_own_ngx_start();
 	init_res = NVSDK_NGX_D3D11_Init(ngx_dlss::kAppId, data_dir.c_str(), device, &feature_info, NVSDK_NGX_Version_API);
 	diag_info("dlss", ngx_format_result(L"Init(AppId)", init_res));
 

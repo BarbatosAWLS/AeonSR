@@ -988,15 +988,27 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 		ImGui::TextWrapped("Detail: %s", narrow_lossy(state.active_error).c_str());
 
 	if (state.native_dlss) {
-		ImGui::TextDisabled("Game's own DLSS: yes (%s)",
+		ImGui::TextDisabled("The game loaded NVIDIA's DLSS or Streamline itself (%s).",
 			narrow_lossy(state.native_dlss_modules).c_str());
 		if (state.host_ready)
 			ImGui::TextDisabled("Aeon SR's DLSS runs in AeonSRHost.exe, apart from the game's.");
+		hint("Read from what the game has loaded, not from the files in its folder.\n"
+			"If the game's DLSS is on, use it and set the upscaler here to None:\n"
+			"two upscalers in a row cause trailing.");
 	} else {
-		ImGui::TextDisabled("Game's own DLSS: none seen.");
+		ImGui::TextDisabled("The game has not loaded DLSS of its own.");
+		hint("Read from what the game has loaded, not from the files in its folder.");
 	}
-		hint("If the game has its own DLSS, use that one and set the upscaler here\n"
-			"to None. Two upscalers in a row cause trailing.");
+	if (!state.ngx_layer.empty() && state.ngx_layer_relevant) {
+		ImGui::TextDisabled("%s is loaded in this game. Aeon SR's DLSS and DLSS neural rendering run in "
+			"AeonSRHost.exe, apart from it%s.", narrow_lossy(state.ngx_layer).c_str(),
+			state.host_ready ? "" : !state.host_error.empty() ? ", which did not start" : " (starting)");
+		if (!state.host_ready && !state.host_error.empty())
+			ImGui::TextDisabled("AeonSRHost.exe: %s", narrow_lossy(state.host_error).c_str());
+		hint("That program answers DLSS calls inside the game. Aeon SR runs its own in a process\n"
+			"of its own, so both work. Found by what the program does, not by its file name,\n"
+			"which it borrows from Windows.");
+	}
 
 	if (state.active_is_fsr && state.fsr_providers.size() > 1) {
 		std::vector<RowOption> opts;

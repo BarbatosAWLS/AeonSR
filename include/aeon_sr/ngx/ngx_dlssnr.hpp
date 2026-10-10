@@ -13,7 +13,9 @@
 #include <dxgi.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace aeon_sr {
 
@@ -151,9 +153,51 @@ struct NeuralRenderCommon {
 	std::vector<std::wstring> runtime_candidates;
 	std::wstring data_dir;
 
+	mutable std::mutex text_mutex;
+	struct Text {
+		UpscalerStatus status = UpscalerStatus::Idle;
+		std::wstring last_error;
+		std::wstring dll_path;
+		std::vector<std::wstring> candidates;
+		bool targets_known = false;
+		NeuralRuntimeKernels kernels;
+		NeuralRuntimeIdentity identity;
+		std::string sha256;
+	};
+	Text text() const
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		Text t;
+		t.status = status;
+		t.last_error = last_error;
+		t.dll_path = dll_path;
+		t.candidates = runtime_candidates;
+		t.targets_known = runtime_targets_known;
+		t.kernels = runtime_kernels;
+		t.identity = runtime_identity;
+		t.sha256 = runtime_sha256;
+		return t;
+	}
+	void set_status(UpscalerStatus s, std::wstring detail)
+	{
+		const std::lock_guard<std::mutex> lock(text_mutex);
+		status = s;
+		last_error = std::move(detail);
+	}
+	bool serves_card(const Text &t) const noexcept
+	{
+		if (!t.targets_known || card_architecture == 0u)
+			return true;
+		return neural_kernels_serve(t.kernels, card_architecture);
+	}
+
 	bool ensure_dll_present();
+	bool probe_dll_present();
 	std::wstring shim_path() const;
 	void fail(UpscalerStatus s, std::wstring detail);
+
+private:
+	bool refresh_files(bool choose);
 };
 
 struct NeuralCapturePlane {

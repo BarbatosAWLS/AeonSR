@@ -1218,9 +1218,14 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 		if (n > 0u && supported) {
 			const float2 moved = (dejitter - prev_dejitter) * float2(norm_x, 2.0) * px_per_unit;
 			const float2 left = frame_shift(raw, pub);
+			const float2 lm = left * moved;
+			const float2 mm = moved * moved;
+			const float2 tol = 0.1 * abs(moved);
+			const bool take_x = lm.x >= -2.0 * mm.x - tol.x && lm.x <= 4.0 * mm.x + tol.x;
+			const bool take_y = lm.y >= -2.0 * mm.y - tol.y && lm.y <= 4.0 * mm.y + tol.y;
 			float4 sums = float4(OutS[uint2(14, 6)], OutS[uint2(15, 6)], OutS[uint2(14, 7)], OutS[uint2(15, 7)]);
 			sums = (all(sums == sums) ? sums : float4(0.0, 0.0, 0.0, 0.0)) * kLandingDecay +
-				float4(left.x * moved.x, moved.x * moved.x, left.y * moved.y, moved.y * moved.y);
+				float4(take_x ? lm.x : 0.0, take_x ? mm.x : 0.0, take_y ? lm.y : 0.0, take_y ? mm.y : 0.0);
 			OutS[uint2(14, 6)] = sums.x;
 			OutS[uint2(15, 6)] = sums.y;
 			OutS[uint2(14, 7)] = sums.z;

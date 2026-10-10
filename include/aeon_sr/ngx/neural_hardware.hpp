@@ -50,6 +50,10 @@ struct NeuralRuntimeIdentity {
 
 NeuralRuntimeIdentity neural_identity_in(const char *bytes, size_t size);
 
+bool neural_read_runtime_file(const std::wstring &path, NeuralRuntimeKernels *out_kernels,
+	NeuralRuntimeIdentity *out_identity, std::string *out_sha256);
+uint32_t neural_runtime_file_reads() noexcept;
+
 uint32_t neural_constant_return(const unsigned char *code, size_t size) noexcept;
 
 bool neural_allgpu_build_targets(uint32_t architecture) noexcept;

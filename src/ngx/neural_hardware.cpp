@@ -2,8 +2,12 @@
 #include "aeon_sr/core/runtime_search.hpp"
 
 #include <Windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cwctype>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -447,6 +451,169 @@ std::vector<std::wstring> neural_runtime_candidates(const std::wstring &addon_di
 		}
 	}
 	return out;
+}
+
+#pragma comment(lib, "bcrypt.lib")
+
+namespace {
+
+std::string sha256_hex(const char *bytes, size_t size)
+{
+	BCRYPT_ALG_HANDLE alg = nullptr;
+	if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+		return {};
+	std::string out;
+	BCRYPT_HASH_HANDLE hash = nullptr;
+	if (BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0))) {
+		bool ok = true;
+		for (size_t off = 0; ok && off < size;) {
+			const ULONG chunk = static_cast<ULONG>(std::min<size_t>(size - off, size_t{ 1 } << 30));
+			ok = BCRYPT_SUCCESS(BCryptHashData(hash,
+				reinterpret_cast<PUCHAR>(const_cast<char *>(bytes + off)), chunk, 0));
+			off += chunk;
+		}
+		unsigned char digest[32]{};
+		if (ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof digest, 0))) {
+			char hex[65]{};
+			for (int i = 0; i < 32; ++i)
+				snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+			out = hex;
+		}
+		BCryptDestroyHash(hash);
+	}
+	BCryptCloseAlgorithmProvider(alg, 0);
+	return out;
+}
+
+bool read_runtime_file_now(const std::wstring &path, NeuralRuntimeKernels *out_kernels,
+	NeuralRuntimeIdentity *out_identity, std::string *out_sha256)
+{
+	*out_kernels = NeuralRuntimeKernels{};
+	*out_identity = NeuralRuntimeIdentity{};
+	out_sha256->clear();
+
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+		OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	LARGE_INTEGER size{};
+	bool got = false;
+	if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= (512ll << 20)) {
+		const size_t n = static_cast<size_t>(size.QuadPart);
+		std::vector<char> buf;
+		try {
+			buf.resize(n);
+		} catch (const std::bad_alloc &) {
+			CloseHandle(file);
+			return false;
+		}
+		size_t off = 0;
+		bool read_ok = true;
+		while (read_ok && off < n) {
+			const DWORD chunk = static_cast<DWORD>(std::min<size_t>(n - off, size_t{ 1 } << 24));
+			DWORD read = 0;
+			read_ok = ReadFile(file, buf.data() + off, chunk, &read, nullptr) != 0 && read == chunk;
+			off += read;
+		}
+		if (read_ok) {
+			*out_kernels = neural_kernels_in(buf.data(), n);
+			*out_identity = neural_identity_in(buf.data(), n);
+			*out_sha256 = sha256_hex(buf.data(), n);
+			got = true;
+		}
+	}
+	CloseHandle(file);
+	return got;
+}
+
+struct RuntimeStamp {
+	DWORD volume = 0;
+	ULONGLONG index = 0;
+	ULONGLONG size = 0;
+	LONGLONG written = 0;
+	LONGLONG changed = 0;
+	bool operator==(const RuntimeStamp &o) const noexcept
+	{
+		return volume == o.volume && index == o.index && size == o.size && written == o.written && changed == o.changed;
+	}
+};
+
+bool stamp_of(const std::wstring &path, RuntimeStamp *out)
+{
+	const HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE)
+		return false;
+	BY_HANDLE_FILE_INFORMATION info{};
+	FILE_BASIC_INFO basic{};
+	const bool ok = GetFileInformationByHandle(h, &info) &&
+		GetFileInformationByHandleEx(h, FileBasicInfo, &basic, sizeof(basic));
+	CloseHandle(h);
+	if (!ok)
+		return false;
+	out->volume = info.dwVolumeSerialNumber;
+	out->index = (static_cast<ULONGLONG>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+	out->size = (static_cast<ULONGLONG>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+	out->written = basic.LastWriteTime.QuadPart;
+	out->changed = basic.ChangeTime.QuadPart;
+	return true;
+}
+
+struct RuntimeRead {
+	RuntimeStamp stamp;
+	bool got = false;
+	NeuralRuntimeKernels kernels;
+	NeuralRuntimeIdentity identity;
+	std::string sha256;
+};
+
+std::mutex g_runtime_reads_mutex;
+std::vector<RuntimeRead> g_runtime_reads;
+std::atomic<uint32_t> g_runtime_file_reads{ 0 };
+
+}
+
+bool neural_read_runtime_file(const std::wstring &path, NeuralRuntimeKernels *out_kernels,
+	NeuralRuntimeIdentity *out_identity, std::string *out_sha256)
+{
+	*out_kernels = NeuralRuntimeKernels{};
+	*out_identity = NeuralRuntimeIdentity{};
+	out_sha256->clear();
+	RuntimeStamp stamp;
+	if (path.empty() || !stamp_of(path, &stamp))
+		return false;
+	{
+		std::lock_guard<std::mutex> lock(g_runtime_reads_mutex);
+		for (const RuntimeRead &r : g_runtime_reads) {
+			if (r.stamp == stamp) {
+				*out_kernels = r.kernels;
+				*out_identity = r.identity;
+				*out_sha256 = r.sha256;
+				return r.got;
+			}
+		}
+	}
+	RuntimeRead r;
+	r.stamp = stamp;
+	r.got = read_runtime_file_now(path, &r.kernels, &r.identity, &r.sha256);
+	g_runtime_file_reads.fetch_add(1, std::memory_order_relaxed);
+	*out_kernels = r.kernels;
+	*out_identity = r.identity;
+	*out_sha256 = r.sha256;
+	const bool got = r.got;
+	if (got) {
+		std::lock_guard<std::mutex> lock(g_runtime_reads_mutex);
+		g_runtime_reads.erase(std::remove_if(g_runtime_reads.begin(), g_runtime_reads.end(),
+			[&](const RuntimeRead &o) { return o.stamp.volume == stamp.volume && o.stamp.index == stamp.index; }),
+			g_runtime_reads.end());
+		g_runtime_reads.push_back(std::move(r));
+	}
+	return got;
+}
+
+uint32_t neural_runtime_file_reads() noexcept
+{
+	return g_runtime_file_reads.load(std::memory_order_relaxed);
 }
 
 }

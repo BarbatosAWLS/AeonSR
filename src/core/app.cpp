@@ -256,7 +256,7 @@ bool App::neural_runtime_present() noexcept
 
 	if (!gpu_.may_be_nvidia())
 		return false;
-	return neural12_.ensure_dll_present();
+	return neural12_.probe_dll_present();
 }
 
 const UpscalerBackend &App::backend_for_api(reshade::api::device_api) const noexcept
@@ -453,7 +453,8 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		if (scope)
 			upscaler_capture_.scope_copy(ScopePlane::UpscalerIn, inputs.engine.device, inputs.engine.cmd,
 				inputs.engine.color, inputs.engine.color_state);
-		run_remote_engine_work(runtime, inputs, plan, backend, params, sizeof(void *) != 4);
+		run_remote_engine_work(runtime, inputs, plan, backend, params,
+			sizeof(void *) != 4 && !engine_route_now().all_in_host);
 		stage_times_.cancel(upscaler_stage);
 		stage_times_.cancel(StageTimings::Stage::Total);
 		stage_times_.note_remote_frame();
@@ -465,6 +466,8 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		dlss12_.status = UpscalerStatus::InitFailed;
 		const wchar_t *const why = sizeof(void *) == 4
 			? L"a 32-bit game runs its upscaler in AeonSRHost.exe"
+			: !ngx_layers_.empty()
+			? L"another program answers DLSS calls in this game, so Aeon SR's DLSS runs in AeonSRHost.exe, apart from it"
 			: L"the game runs its own DLSS, so Aeon SR's runs in AeonSRHost.exe";
 		dlss12_.last_error = remote_.last_error.empty()
 			? std::wstring(why) + L", which is starting"
@@ -566,9 +569,10 @@ void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 		remote_in_height_ = rp.in_height;
 	}
 	if (!neural_here && plan.neural.run && RemoteEngine::reports_neural(rp)) {
-		neural12_.status = rp.neural_ran >= 0 ? UpscalerStatus::Ready : UpscalerStatus::EvaluateFailed;
-		if (rp.neural_ran < 0)
-			neural12_.last_error = rp.message;
+		if (rp.neural_ran >= 0)
+			neural12_.set_status(UpscalerStatus::Ready, neural12_.text().last_error);
+		else
+			neural12_.set_status(UpscalerStatus::EvaluateFailed, rp.message);
 		neural12_.model_width = rp.neural_model_width;
 		neural12_.model_height = rp.neural_model_height;
 		neural12_.last_eval_rows = rp.neural_eval_rows;
@@ -592,22 +596,38 @@ bool App::remote_wanted() const noexcept
 {
 	if constexpr (sizeof(void *) == 4)
 		return true;
-	return dlss_needs_host();
+	const EngineRoute r = engine_route_now();
+	return r.dlss_in_host || r.all_in_host;
+}
+
+EngineRoute App::engine_route_now() const noexcept
+{
+	return engine_route(sizeof(void *) == 4, native_dlss_seen_, !ngx_layers_.empty(),
+		settings_.enabled && settings_.backend == static_cast<unsigned>(BackendChoice::Dlss),
+		settings_.neural_render && gpu_.may_be_nvidia());
 }
 
 bool App::dlss_needs_host() const noexcept
 {
 	if constexpr (sizeof(void *) == 4)
 		return true;
-	return native_dlss_seen_ && settings_.enabled &&
-		settings_.backend == static_cast<unsigned>(BackendChoice::Dlss);
+	return engine_route_now().dlss_in_host;
 }
 
 bool App::runs_remote(const UpscalerBackend *backend) const noexcept
 {
 	if constexpr (sizeof(void *) == 4)
 		return true;
-	return backend == static_cast<const UpscalerBackend *>(&dlss12_);
+	if (backend != nullptr && !crosses(backend))
+		return false;
+	return backend == static_cast<const UpscalerBackend *>(&dlss12_) || engine_route_now().all_in_host;
+}
+
+bool App::crosses(const UpscalerBackend *backend) const noexcept
+{
+	return backend == static_cast<const UpscalerBackend *>(&dlss12_) ||
+		backend == static_cast<const UpscalerBackend *>(&fsr12_) ||
+		backend == static_cast<const UpscalerBackend *>(&xess12_);
 }
 
 void App::ensure_remote()
@@ -661,14 +681,26 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 		return;
 	if (!inputs.engine.ready() || neural12_.crashed)
 		return;
+	if (sizeof(void *) != 4 && engine_route_now().all_in_host) {
+		if (active_ != nullptr && !crosses(active_))
+			neural12_.set_status(UpscalerStatus::InitFailed, L"another program answers DLSS calls in this game, so "
+				L"DLSS neural rendering runs in AeonSRHost.exe, after an upscaler that runs there: DLSS, FSR or XeSS. "
+				L"The upscaler running now runs in the game.");
+		else if (remote_tried_ && !remote_.ready())
+			neural12_.set_status(UpscalerStatus::InitFailed, L"another program answers DLSS calls in this game, so "
+				L"DLSS neural rendering runs in AeonSRHost.exe, which did not start: " + remote_.last_error);
+		else
+			neural12_.set_status(UpscalerStatus::Loading, L"another program answers DLSS calls in this game, so "
+				L"DLSS neural rendering runs in AeonSRHost.exe, which is starting");
+		return;
+	}
 	if (fsr12_.fsr_device_busy() || xess12_.xess_loading() || dlss12_.dlss_loading())
 		return;
 
 	if (!gpu_.may_be_nvidia()) {
-		if (neural12_.status != UpscalerStatus::UnsupportedGpu) {
-			neural12_.status = UpscalerStatus::UnsupportedGpu;
-			neural12_.last_error = L"DLSS neural rendering needs an NVIDIA GPU: its runtime refuses to "
-				L"initialise on any other adapter.";
+		if (neural12_.text().status != UpscalerStatus::UnsupportedGpu) {
+			neural12_.set_status(UpscalerStatus::UnsupportedGpu, L"DLSS neural rendering needs an NVIDIA GPU: its "
+				L"runtime refuses to initialise on any other adapter.");
 		}
 		neural_last_ = -1;
 		return;
@@ -819,20 +851,41 @@ const char *api_label(reshade::api::device_api api) noexcept
 
 }
 
+void App::update_ngx_layers()
+{
+	if (!ngx_layers_.empty())
+		return;
+	const ULONGLONG now = GetTickCount64();
+	if (ngx_layers_scanned_ms_ != 0 && now - ngx_layers_scanned_ms_ < 1000)
+		return;
+	ngx_layers_scanned_ms_ = now;
+	ngx_layers_ = scan_ngx_layers(module_);
+	if (ngx_layers_.empty())
+		return;
+	std::wstring names;
+	for (const NgxLayer &l : ngx_layers_)
+		names += (names.empty() ? L"" : L", ") + ngx_layer_label(l) + L" at " + l.path;
+	diag_state("ngx-layer", DiagLevel::Info, "aeonsr", names + L" is loaded in this game and answers DLSS calls in "
+		L"it; Aeon SR's DLSS and DLSS neural rendering run in AeonSRHost.exe, apart from it, whenever they are on.");
+}
+
 void App::update_native_dlss()
 {
-	native_dlss_ = scan_native_dlss();
 	if (native_dlss_seen_)
 		return;
-	const bool ours = ngx_.ngx_initialized || ngx12_.ngx_initialized || dlss12_.dlss_starting() ||
-		neural12_.initialized;
-	native_dlss_seen_ = native_dlss_.streamline ||
-		(!ours && (native_dlss_.dlss || native_dlss_.frame_generation ||
-			native_dlss_.ray_reconstruction));
+	const ULONGLONG now = GetTickCount64();
+	const bool deciding = settings_.enabled && settings_.backend == static_cast<unsigned>(BackendChoice::Dlss) &&
+		!own_ngx_started();
+	if (native_dlss_.queried && !deciding && now - native_dlss_scanned_ms_ < 1000)
+		return;
+	native_dlss_scanned_ms_ = now;
+	const std::wstring dir = find_ngx_runtime_dir(ngx12_.addon_dir);
+	native_dlss_ = scan_native_dlss(dir.empty() ? std::wstring() : ngx_dll_path(dir));
+	native_dlss_seen_ = native_dlss_.native;
 	if (native_dlss_seen_) {
 		diag_state("native-dlss", DiagLevel::Warn, "aeonsr",
-			L"the game brings its own DLSS: " + native_dlss_.modules +
-			(native_dlss_.dlss_path.empty() ? L"" : (L" from " + native_dlss_.dlss_path)));
+			L"the game runs NVIDIA's DLSS stack itself: " + native_dlss_.source + L" from " + native_dlss_.dlss_path +
+			L" (loaded: " + native_dlss_.modules + L")");
 	}
 }
 
@@ -901,8 +954,18 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 
 	{
 		float sums[4];
-		if (flow_.landing(sums) && landing_.update(sums)) {
+		const JitterLanding::Verdict verdict = flow_.landing(sums) ? landing_.update(sums)
+			: JitterLanding::Verdict::None;
+		if (verdict != JitterLanding::Verdict::None)
 			flow_.reset_landing();
+		const uint32_t thrown = landing_.discarded();
+		if (thrown != landing_discards_logged_ && (thrown == 1u || thrown == 10u || thrown == 100u || thrown % 1000u == 0u)) {
+			landing_discards_logged_ = thrown;
+			diag_logf(DiagLevel::Info, "jitter", L"jitter: %u reading(s) of which way the picture moves set aside as "
+				L"the camera's, not the drawing's (the last %.2f across, %.2f down)", thrown, landing_.rejected_x(),
+				landing_.rejected_y());
+		}
+		if (verdict == JitterLanding::Verdict::Turned) {
 			wchar_t text[200]{};
 			_snwprintf_s(text, _TRUNCATE, L"jitter: the picture moved %.2f times the offset across and %.2f down; "
 				L"drawn turned over %ls", landing_.factor_x(), landing_.factor_y(),
@@ -1034,8 +1097,9 @@ void App::note_state()
 			(nr.crashed ? L"faulted"
 				: neural_last_ == 1 ? L"running"
 				: neural_last_ == -1 ? L"failed" : L"idle");
-		if (!nr.last_error.empty())
-			line += L" - " + nr.last_error;
+		const std::wstring error = nr.text().last_error;
+		if (!error.empty())
+			line += L" - " + error;
 		diag_state("neural", neural_last_ == 1 ? DiagLevel::Info : DiagLevel::Warn,
 			"neural", line);
 	}
@@ -1764,6 +1828,7 @@ void App::run_frame(
 		normalize_depth(inputs);
 	}
 	update_native_dlss();
+	update_ngx_layers();
 	run_internal_flow(runtime, inputs);
 	if (hud_detected_ && inputs.have_motion_vectors && inputs.engine.motion != nullptr)
 		(void)hud_restore_.clear_motion(inputs.engine.device, inputs.engine.cmd, inputs.engine.motion,
@@ -1939,7 +2004,13 @@ PanelState App::panel_state(bool for_overlay)
 	s.log_path = diag_log_path();
 
 	s.native_dlss = native_dlss_seen_;
-	s.native_dlss_modules = native_dlss_.modules;
+	s.native_dlss_modules = native_dlss_.source;
+	s.ngx_layer.clear();
+	for (const NgxLayer &l : ngx_layers_)
+		s.ngx_layer += (s.ngx_layer.empty() ? L"" : L", ") + ngx_layer_label(l);
+	s.ngx_layer_nvidia = gpu_.may_be_nvidia();
+	s.ngx_layer_relevant = s.ngx_layer_nvidia &&
+		((settings_.enabled && settings_.backend == static_cast<unsigned>(BackendChoice::Dlss)) || settings_.neural_render);
 	s.gpu_vendor = gpu_.vendor;
 	s.gpu_vendor_id = gpu_.vendor_id;
 	s.gpu_name = gpu_.name;
@@ -2037,6 +2108,7 @@ PanelState App::panel_state(bool for_overlay)
 
 	{
 		const NeuralRenderCommon &nr = neural();
+		const NeuralRenderCommon::Text nt = nr.text();
 
 		s.neural_dll_found = nr.dll_present && nr.shim_present;
 		s.neural_dll_present = nr.dll_present;
@@ -2044,8 +2116,8 @@ PanelState App::panel_state(bool for_overlay)
 		s.neural_initialized = nr.initialized;
 		s.neural_crashed = nr.crashed;
 		s.neural_driver_too_old = nr.driver_too_old();
-		s.neural_status = nr.status;
-		s.neural_error = nr.last_error;
+		s.neural_status = nt.status;
+		s.neural_error = nt.last_error;
 		s.neural_driver_major = nr.driver_major;
 		s.neural_driver_minor = nr.driver_minor;
 		s.neural_required_driver_major = nr.required_driver_major;
@@ -2054,19 +2126,19 @@ PanelState App::panel_state(bool for_overlay)
 		s.neural_adapter_unsupported = nr.adapter_unsupported();
 		s.neural_min_architecture = nr.min_architecture;
 		s.neural_gpu_architecture = nr.card_architecture;
-		s.neural_runtime_serves_card = nr.runtime_serves_card();
+		s.neural_runtime_serves_card = nr.serves_card(nt);
 		s.neural_allgpu_build_targets = neural_allgpu_build_targets(nr.card_architecture);
 		s.neural_runtime_kernels.clear();
 		s.neural_runtime_cards.clear();
-		if (nr.runtime_targets_known) {
-			s.neural_runtime_kernels = neural_kernels_label(nr.runtime_kernels);
-			s.neural_runtime_cards = neural_kernels_cards(nr.runtime_kernels);
-			s.neural_runtime_file = nr.dll_path;
-			s.neural_runtime_version = nr.runtime_identity.file_version;
-			s.neural_runtime_certificate = nr.runtime_identity.has_certificate;
-			s.neural_runtime_sha256 = nr.runtime_sha256;
+		if (nt.targets_known) {
+			s.neural_runtime_kernels = neural_kernels_label(nt.kernels);
+			s.neural_runtime_cards = neural_kernels_cards(nt.kernels);
+			s.neural_runtime_file = nt.dll_path;
+			s.neural_runtime_version = nt.identity.file_version;
+			s.neural_runtime_certificate = nt.identity.has_certificate;
+			s.neural_runtime_sha256 = nt.sha256;
 		}
-		s.neural_runtime_candidates = nr.runtime_candidates;
+		s.neural_runtime_candidates = nt.candidates;
 		s.neural_runtime_minimum = nr.runtime_minimum_architecture;
 		s.neural_reported_architecture = nr.reported_architecture;
 		s.neural_feature_unsupported = nr.feature_unsupported;
@@ -2196,6 +2268,8 @@ PanelState App::panel_state(bool for_overlay)
 	s.upscalers_remote = true;
 #endif
 	s.host_ready = remote_.ready();
+	if (!s.host_ready && remote_tried_ && remote_wanted())
+		s.host_error = remote_.last_error.empty() ? std::wstring(L"it did not start") : remote_.last_error;
 
 	if (s.upscalers_remote && !s.host_ready) {
 		s.neural_dll_found = true;

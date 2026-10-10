@@ -1,14 +1,109 @@
 #include "aeon_sr/ngx/ngx_common.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/runtime_search.hpp"
 #include "aeon_sr/core/settings.hpp"
 
 #include <Windows.h>
 #include <ShlObj.h>
+#include <psapi.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <mutex>
 
 namespace aeon_sr {
+
+namespace {
+
+std::atomic<bool> g_own_ngx{ false };
+std::mutex g_before_mutex;
+std::vector<std::wstring> g_before;
+
+void marker_name(wchar_t (&out)[64]) noexcept
+{
+	std::swprintf(out, 64, L"Local\\AeonSR.OwnNgxStarted.%lu", static_cast<unsigned long>(GetCurrentProcessId()));
+}
+
+}
+
+std::wstring own_ngx_marker_name()
+{
+	wchar_t n[64];
+	marker_name(n);
+	return n;
+}
+
+std::wstring find_ngx_runtime_dir(const std::wstring &addon_dir)
+{
+	for (const std::wstring &dir : runtime_search_dirs(addon_dir, exe_directory_w())) {
+		if (file_exists_w(ngx_dll_path(dir)))
+			return dir;
+	}
+	return std::wstring();
+}
+
+std::vector<std::wstring> loaded_module_paths()
+{
+	std::vector<std::wstring> out;
+	std::vector<HMODULE> mods(512);
+	DWORD need = 0;
+	for (int tries = 0; tries < 4; ++tries) {
+		if (!K32EnumProcessModules(GetCurrentProcess(), mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)),
+				&need))
+			return out;
+		if (need <= mods.size() * sizeof(HMODULE))
+			break;
+		mods.resize(need / sizeof(HMODULE) + 64);
+	}
+	const size_t n = std::min<size_t>(need / sizeof(HMODULE), mods.size());
+	out.reserve(n);
+	wchar_t buf[MAX_PATH * 2];
+	for (size_t i = 0; i < n; ++i) {
+		const DWORD len = GetModuleFileNameW(mods[i], buf, static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])));
+		if (len > 0 && len < sizeof(buf) / sizeof(buf[0]))
+			out.emplace_back(buf, len);
+	}
+	return out;
+}
+
+void note_own_ngx_start() noexcept
+{
+	if (g_own_ngx.load(std::memory_order_acquire))
+		return;
+	const bool earlier_load = own_ngx_started();
+	try {
+		std::lock_guard<std::mutex> lock(g_before_mutex);
+		if (!earlier_load && g_before.empty())
+			g_before = loaded_module_paths();
+	} catch (...) {
+	}
+	wchar_t n[64];
+	marker_name(n);
+	CreateMutexW(nullptr, FALSE, n);
+	g_own_ngx.store(true, std::memory_order_release);
+}
+
+bool own_ngx_started() noexcept
+{
+	if (g_own_ngx.load(std::memory_order_acquire))
+		return true;
+	wchar_t n[64];
+	marker_name(n);
+	const HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, n);
+	if (h == nullptr)
+		return false;
+	CloseHandle(h);
+	g_own_ngx.store(true, std::memory_order_release);
+	return true;
+}
+
+std::vector<std::wstring> modules_before_own_ngx()
+{
+	std::lock_guard<std::mutex> lock(g_before_mutex);
+	return g_before;
+}
 
 void NVSDK_CONV ngx_log_callback(const char *message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature)
 {

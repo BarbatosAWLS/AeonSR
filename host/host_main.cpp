@@ -3,10 +3,14 @@
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/remote_protocol.hpp"
 #include "aeon_sr/core/settings.hpp"
+#include "aeon_sr/upscalers/native_dlss.hpp"
 
 #include <Windows.h>
+#include <delayimp.h>
+#include <psapi.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cwchar>
 #include <string>
@@ -20,9 +24,60 @@
 
 namespace {
 
+FARPROC WINAPI system32_only(unsigned notify, PDelayLoadInfo info)
+{
+	if (notify != dliNotePreLoadLibrary || info == nullptr || info->szDll == nullptr)
+		return nullptr;
+	wchar_t name[MAX_PATH] = {};
+	if (MultiByteToWideChar(CP_ACP, 0, info->szDll, -1, name, MAX_PATH) == 0)
+		return nullptr;
+	return reinterpret_cast<FARPROC>(LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+}
+
+}
+
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = system32_only;
+
+namespace {
+
 using namespace aeon_sr;
 using aeon_sr::host::HostSession;
 using aeon_sr::host::copy_text;
+
+const wchar_t *const kSystemFirst[] = {
+	L"dxgi.dll", L"d3d12.dll", L"d3d11.dll", L"D3DCOMPILER_47.dll", L"bcrypt.dll",
+	L"version.dll", L"winmm.dll", L"dbghelp.dll", L"wininet.dll", L"winhttp.dll",
+};
+
+void load_system_first()
+{
+	for (const wchar_t *name : kSystemFirst)
+		LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
+void note_foreign_modules(const wchar_t *when)
+{
+	std::wstring found;
+	for (const NgxLayer &l : scan_ngx_layers(nullptr))
+		found += (found.empty() ? L"" : L", ") + ngx_layer_label(l) + L" at " + l.path;
+	HMODULE mods[512];
+	DWORD need = 0;
+	if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need)) {
+		const DWORD n = std::min<DWORD>(need / sizeof(HMODULE), 512);
+		for (DWORD i = 0; i < n; ++i) {
+			if (GetProcAddress(mods[i], "ReShadeRegisterAddon") == nullptr)
+				continue;
+			wchar_t path[MAX_PATH * 2] = {};
+			GetModuleFileNameW(mods[i], path, MAX_PATH * 2);
+			found += (found.empty() ? L"ReShade at " : L", ReShade at ") + std::wstring(path);
+		}
+	}
+	if (found.empty())
+		diag_logf(DiagLevel::Info, "host", L"%ls: no program of the game's in this process", when);
+	else
+		diag_logf(DiagLevel::Warn, "host", L"%ls: loaded in this process from the game's folder: %ls", when,
+			found.c_str());
+}
 
 enum Exit : int {
 	ExitOk = 0,
@@ -164,8 +219,11 @@ int run(const Args &args, const std::wstring &host_dir)
 		return ExitNoSession;
 	}
 
+	note_foreign_modules(L"before the engine");
 	HostSession session;
-	if (!session.start(args.pid, block, host_dir)) {
+	const bool started = session.start(args.pid, block, host_dir);
+	note_foreign_modules(L"with the engine up");
+	if (!started) {
 		block->host_ready = 0;
 		block->step = static_cast<uint32_t>(remote::RemoteStep::Engine);
 		copy_text(block->message, remote::kTextChars, session.last_error());
@@ -223,6 +281,7 @@ int run(const Args &args, const std::wstring &host_dir)
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
+	load_system_first();
 	const Args args = parse_args();
 
 	const std::wstring host_dir = module_directory(GetModuleHandleW(nullptr));

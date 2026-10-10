@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.1.0 LANGUAGES C CXX)
+project(AeonSR VERSION 1.1.1 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -233,6 +233,7 @@ if(AEONSR_X64)
     src/ngx/neural_arch_hook.cpp
     src/ngx/neural_hardware.cpp
     src/ngx/ngx_common.cpp
+    src/upscalers/native_dlss.cpp
     src/ngx/ngx_dlssnr.cpp
     src/ngx/ngx_runtime_d3d12.cpp
     src/ngx/ngx_session.cpp
@@ -256,7 +257,9 @@ if(AEONSR_X64)
     AEONSR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     AEONSR_VERSION_MINOR=${PROJECT_VERSION_MINOR})
   target_link_libraries(AeonSRHost PRIVATE
-    d3d11 d3d12 dxgi d3dcompiler shell32 ole32 user32 advapi32 "${NGX_LIB}")
+    d3d11 d3d12 dxgi d3dcompiler shell32 ole32 user32 advapi32 "${NGX_LIB}" delayimp)
+  target_link_options(AeonSRHost PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:d3d11.dll
+    /DELAYLOAD:D3DCOMPILER_47.dll /DELAYLOAD:bcrypt.dll /DELAYLOAD:version.dll)
 
   add_executable(AeonSRPrebuild WIN32
     prebuild/prebuild_main.cpp

@@ -250,9 +250,21 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 		add("Upscaler", s, std::move(detail), std::move(action));
 	}
 
+	if (!state.ngx_layer.empty() && state.ngx_layer_nvidia) {
+		if (state.ngx_layer_relevant && !state.host_error.empty())
+			add("Other DLSS program", CheckState::Fail, "loaded in the game: " + diag_narrow(state.ngx_layer),
+				"Aeon SR's DLSS and DLSS neural rendering run in AeonSRHost.exe, apart from it, and it did not "
+				"start: " + diag_narrow(state.host_error));
+		else
+			add("Other DLSS program", CheckState::Ok, "loaded in the game: " + diag_narrow(state.ngx_layer),
+				state.ngx_layer_relevant
+					? "Aeon SR's DLSS and DLSS neural rendering run in AeonSRHost.exe, apart from it."
+					: "Aeon SR's DLSS and DLSS neural rendering would run in AeonSRHost.exe, apart from it.");
+	}
+
 	if (state.native_dlss)
 		add("Game's own DLSS", CheckState::Warn,
-			"present: " + diag_narrow(state.native_dlss_modules),
+			"loaded by the game: " + diag_narrow(state.native_dlss_modules),
 			"Use the game's own setting and set the upscaler here to None. Two in series ghost.");
 
 	if (!settings.neural_render) {

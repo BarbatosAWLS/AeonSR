@@ -34,6 +34,7 @@ NVSDK_NGX_Result ngx12_acquire(ID3D12Device *device, const wchar_t *data_dir,
 			return NVSDK_NGX_Result_Success;
 		}
 	}
+	note_own_ngx_start();
 	NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(ngx_dlss::kAppId, data_dir, device, info, NVSDK_NGX_Version_API);
 	diag_info("dlss", std::wstring(tag) + ngx_format_result(L"Init(AppId)", r));
 	if (NVSDK_NGX_FAILED(r)) {
