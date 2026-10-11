@@ -158,9 +158,10 @@ public:
 
 		if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device9ex_))) || device9ex_ == nullptr) {
 			safe_release(device9ex_);
-			last_error = L"this game creates a plain Direct3D 9 device, and only Direct3D 9Ex "
-				L"can hand a texture to another device. The frame will travel through system "
-				L"memory instead, which costs about two milliseconds a frame at 1080p.";
+			last_error = L"this game's Direct3D 9 device is a plain one (Direct3D 9Ex refused it), and "
+				L"only Direct3D 9Ex can hand a texture to another device. The frame will travel "
+				L"through system memory instead, which is slow: around 13 ms a frame at 1280x720 "
+				L"and several times that at 2560x1440.";
 			return false;
 		}
 		device9_ = device;
@@ -271,7 +272,8 @@ public:
 			return BridgeStep::Import;
 		}
 
-		const bool have_color = ensure_plane(color_, cd.Width, cd.Height, cd.Format, true,
+		const D3DFORMAT color_fmt = cd.Format == D3DFMT_X8R8G8B8 ? D3DFMT_A8R8G8B8 : cd.Format;
+		const bool have_color = ensure_plane(color_, cd.Width, cd.Height, color_fmt, true,
 			D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) &&
 			carry_in(game_color, in.color, color_);
 		safe_release(game_color);

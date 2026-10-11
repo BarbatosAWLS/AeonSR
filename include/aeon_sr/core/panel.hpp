@@ -67,9 +67,6 @@ struct PanelState {
 	std::vector<std::string> fsr_providers;
 	bool fsr_dx12_dlls_present = false;
 	std::wstring fsr11_loaded_dll_name;
-	std::wstring game_fsr_modules;
-	std::wstring game_xess_modules;
-	std::wstring game_ngx_modules;
 
 	bool ngx_dll_present = false;
 	bool ngx_initialized = false;
@@ -82,6 +79,7 @@ struct PanelState {
 	bool neural_dll_found = false;
 	bool neural_dll_present = false;
 	bool neural_shim_present = false;
+	bool neural_host_refused = false;
 	bool neural_initialized = false;
 	bool neural_crashed = false;
 	bool neural_driver_too_old = false;

@@ -126,8 +126,6 @@ struct Settings {
 
 	bool upscale_effects = false;
 
-	unsigned int internal_flow_quality = 1;
-
 	bool mv_probe = true;
 
 	bool gpu_timings = false;
@@ -145,6 +143,7 @@ struct Settings {
 
 	unsigned int jitter_scene_rule = 0;
 	bool jitter_tested_quads = true;
+	bool depth_regrid = true;
 	bool split_catmull_rom = false;
 	bool upscaler_capture = false;
 	bool scope_capture = false;

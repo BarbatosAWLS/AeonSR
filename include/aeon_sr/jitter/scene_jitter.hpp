@@ -45,6 +45,7 @@ struct JitterArm {
 	bool scene_targets = true;
 	bool move_window = false;
 	bool tested_quads = false;
+	bool depth_regrid = false;
 	uint64_t back_buffer = 0;
 	uint64_t back_buffers[kJitterBackBuffers]{};
 	uint32_t back_buffer_count = 0;

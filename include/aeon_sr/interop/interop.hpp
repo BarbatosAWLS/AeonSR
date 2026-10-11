@@ -62,6 +62,16 @@ public:
 
 	static constexpr uint32_t kFramesInFlight = 2;
 
+	enum class Ring : uint32_t { Frame = 0 };
+	static constexpr uint32_t kRings = 2;
+	bool use_ring(Ring ring) noexcept
+	{
+		if (list_open_)
+			return false;
+		ring_ = static_cast<uint32_t>(ring);
+		return true;
+	}
+
 	ID3D12GraphicsCommandList *begin_list();
 	bool submit_list();
 	void abandon_list();
@@ -80,9 +90,10 @@ private:
 	ID3D12Device *device12_ = nullptr;
 	ID3D12CommandQueue *queue12_ = nullptr;
 	ID3D12CommandQueue *borrowed_queue_ = nullptr;
-	ID3D12CommandAllocator *allocators_[kFramesInFlight] = {};
-	uint64_t allocator_value_[kFramesInFlight] = {};
-	uint32_t slot_ = 0;
+	ID3D12CommandAllocator *allocators_[kRings][kFramesInFlight] = {};
+	uint64_t allocator_value_[kRings][kFramesInFlight] = {};
+	uint32_t slot_[kRings] = {};
+	uint32_t ring_ = 0;
 	ID3D12GraphicsCommandList *list_ = nullptr;
 	ID3D12Fence *fence12_ = nullptr;
 	uint64_t fence_value_ = 0;

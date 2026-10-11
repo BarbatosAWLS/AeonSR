@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.1.1 LANGUAGES C CXX)
+project(AeonSR VERSION 1.1.2 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -81,9 +81,28 @@ add_library(aeon_sr_minhook STATIC
   "${MINHOOK_DIR}/src/hde/hde64.c")
 target_include_directories(aeon_sr_minhook PUBLIC "${MINHOOK_DIR}/include")
 
+set(AEONSR_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+add_executable(aeon_flow_bake tools/flow_bake/flow_bake.cpp)
+target_include_directories(aeon_flow_bake PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_definitions(aeon_flow_bake PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(aeon_flow_bake PRIVATE d3dcompiler)
+if(MSVC)
+  set_property(TARGET aeon_flow_bake PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+add_custom_command(
+  OUTPUT "${AEONSR_GEN_DIR}/aeon_sr/motion/flow_baked.h"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${AEONSR_GEN_DIR}/aeon_sr/motion"
+  COMMAND aeon_flow_bake "${AEONSR_GEN_DIR}/aeon_sr/motion/flow_baked.h"
+  DEPENDS aeon_flow_bake "${CMAKE_CURRENT_SOURCE_DIR}/src/motion/optical_flow_shaders.inl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/aeon_sr/motion/optical_flow_entries.hpp"
+  COMMENT "Compiling the optical flow kernels"
+  VERBATIM)
+add_custom_target(aeon_flow_baked DEPENDS "${AEONSR_GEN_DIR}/aeon_sr/motion/flow_baked.h")
+
 set(AEONSR_SOURCES
   src/core/addon_main.cpp
   src/core/app.cpp
+  src/core/present_drive.cpp
   src/upscalers/backend_dlss.cpp
   src/upscalers/backend_dlss_d3d11.cpp
   src/upscalers/backend_fsr_d3d11.cpp
@@ -96,6 +115,7 @@ set(AEONSR_SOURCES
   src/interop/bridge_d3d10.cpp
   src/interop/bridge_d3d11.cpp
   src/interop/bridge_d3d9.cpp
+  src/interop/d3d9ex_upgrade.cpp
   src/interop/bridge_opengl.cpp
   src/interop/bridge_staging.cpp
   src/interop/bridge_vulkan.cpp
@@ -116,6 +136,7 @@ set(AEONSR_SOURCES
   src/jitter/frame_shift.cpp
   src/core/frame_observer.cpp
   src/jitter/hud_restore.cpp
+  src/jitter/depth_regrid.cpp
   src/interop/gpu12.cpp
   src/core/gpu_vendor.cpp
   src/motion/guide_builder.cpp
@@ -132,6 +153,7 @@ set(AEONSR_SOURCES
   src/ngx/ngx_dlssnr.cpp
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
+  src/ngx/ngx_shared_d3d12.cpp
   src/ngx/ngx_session.cpp
   src/motion/optical_flow.cpp
   src/core/panel.cpp
@@ -168,6 +190,7 @@ set(AEONSR_VENDOR_SOURCES
   src/ngx/ngx_dlssnr.cpp
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
+  src/ngx/ngx_shared_d3d12.cpp
   src/ngx/ngx_session.cpp
   src/upscalers/xess_loader.cpp
 )
@@ -192,8 +215,10 @@ endif()
 
 set_target_properties(AeonSR PROPERTIES OUTPUT_NAME "AeonSR" PREFIX "" SUFFIX "${AEONSR_ADDON_EXT}")
 
+add_dependencies(AeonSR aeon_flow_baked)
 target_include_directories(AeonSR PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${AEONSR_GEN_DIR}"
   "${RESHADE_ROOT}/include"
   "${RESHADE_ROOT}/deps/imgui"
   "${NGX_INCLUDE_DIR}"
@@ -236,6 +261,7 @@ if(AEONSR_X64)
     src/upscalers/native_dlss.cpp
     src/ngx/ngx_dlssnr.cpp
     src/ngx/ngx_runtime_d3d12.cpp
+    src/ngx/ngx_shared_d3d12.cpp
     src/ngx/ngx_session.cpp
     src/interop/remote_protocol.cpp
     src/core/runtime_search.cpp
@@ -288,6 +314,10 @@ if(MSVC)
 endif()
 
 set(AEONSR_OUT "$<TARGET_FILE_DIR:AeonSR>")
+add_custom_command(TARGET AeonSR POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/package/AeonSR.addonfx"
+    "${AEONSR_OUT}/AeonSR.addonfx"
+  COMMENT "Placing AeonSR.addonfx beside the add-on")
 if(AEONSR_X64)
   set(_aeonsr_copy_runtime)
   foreach(f IN LISTS AEONSR_RUNTIME_FILES)
@@ -303,6 +333,7 @@ if(AEONSR_X64)
 endif()
 
 install(FILES "$<TARGET_FILE:AeonSR>" DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/package/AeonSR.addonfx" DESTINATION .)
 foreach(entry IN LISTS AEONSR_LICENSE_FILES)
   string(REPLACE "|" ";" pair "${entry}")
   list(GET pair 0 src)

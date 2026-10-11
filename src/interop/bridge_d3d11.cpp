@@ -40,6 +40,20 @@ DXGI_FORMAT shareable_format_for(DXGI_FORMAT fmt) noexcept
 
 namespace bridge_util {
 
+void short_wait() noexcept
+{
+	static thread_local HANDLE timer = [] {
+		HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 ,
+			TIMER_ALL_ACCESS);
+		return t != nullptr ? t : CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+	}();
+	LARGE_INTEGER due{};
+	due.QuadPart = -2500;
+	if (timer == nullptr || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) ||
+		WaitForSingleObject(timer, 100) != WAIT_OBJECT_0)
+		Sleep(1);
+}
+
 void release_plane(SharedPlane &plane)
 {
 	safe_release(plane.engine);

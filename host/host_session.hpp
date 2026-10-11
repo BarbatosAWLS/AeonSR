@@ -54,6 +54,7 @@ private:
 	bool ensure_fence();
 	bool open_planes();
 	bool run_upscaler(const FrameInputs &inputs);
+	void fail_neural(const std::wstring &text);
 	void run_neural(const FrameInputs &inputs, ID3D12Resource *colour,
 		ID3D12Resource *motion, ID3D12Resource *depth);
 

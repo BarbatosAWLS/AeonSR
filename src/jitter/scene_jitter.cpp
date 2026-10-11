@@ -183,6 +183,7 @@ JitterArm disarmed(const JitterArm &arm) noexcept
 	kept.scene_targets = arm.scene_targets;
 	kept.move_window = arm.move_window;
 	kept.tested_quads = arm.tested_quads;
+	kept.depth_regrid = arm.depth_regrid;
 	kept.back_buffer = arm.back_buffer;
 	kept.back_buffer_count = arm.back_buffer_count;
 	for (uint32_t i = 0; i < arm.back_buffer_count; ++i)

@@ -19,7 +19,6 @@ struct FsrPipelineCache;
 
 struct XessD3D12Backend : UpscalerBackend {
 	std::wstring addon_dir;
-	std::wstring game_xess_modules;
 	std::wstring cache_dir_override;
 
 	~XessD3D12Backend() override

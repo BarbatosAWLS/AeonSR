@@ -11,6 +11,7 @@
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
 #include "aeon_sr/core/runtime_search.hpp"
+#include "aeon_sr/ngx/neural_hardware.hpp"
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -244,6 +245,27 @@ void App::trace_close()
 	++trace_presents_;
 	if (upscaler_capture_.scope_recording())
 		upscaler_capture_.scope_end(trace_cur_, scope_header());
+}
+
+namespace {
+
+void neural_files_beside(const std::wstring &dir, bool *dll, bool *shim)
+{
+	const std::vector<std::wstring> found = neural_runtime_candidates(dir, dir);
+	*dll = !found.empty();
+	const auto shim_in = [](const std::wstring &d) {
+		return !d.empty() && GetFileAttributesW(join_path(join_path(d, L"ngxshim"), L"nvngx.dll").c_str()) !=
+			INVALID_FILE_ATTRIBUTES;
+	};
+	std::wstring runtime_dir;
+	if (*dll) {
+		const size_t cut = found.front().find_last_of(L"\\/");
+		if (cut != std::wstring::npos)
+			runtime_dir = found.front().substr(0, cut);
+	}
+	*shim = shim_in(dir) || shim_in(runtime_dir);
+}
+
 }
 
 const NeuralRenderCommon &App::neural() const noexcept
@@ -883,7 +905,7 @@ void App::update_native_dlss()
 	native_dlss_ = scan_native_dlss(dir.empty() ? std::wstring() : ngx_dll_path(dir));
 	native_dlss_seen_ = native_dlss_.native;
 	if (native_dlss_seen_) {
-		diag_state("native-dlss", DiagLevel::Warn, "aeonsr",
+		diag_state("native-dlss", DiagLevel::Info, "aeonsr",
 			L"the game runs NVIDIA's DLSS stack itself: " + native_dlss_.source + L" from " + native_dlss_.dlss_path +
 			L" (loaded: " + native_dlss_.modules + L")");
 	}
@@ -925,9 +947,7 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 	ID3D12Resource *const depth12 = inputs.depth_provider == DepthProvider::Normalized
 		? inputs.engine.depth : nullptr;
 
-	const OpticalFlowD3D12::Quality quality = settings_.internal_flow_quality != 0u
-		? OpticalFlowD3D12::Quality::High
-		: OpticalFlowD3D12::Quality::Balanced;
+	const OpticalFlowD3D12::Quality quality = OpticalFlowD3D12::Quality::High;
 
 	flow_.set_depth_logarithmic(depth_how_.logarithmic);
 	flow_.set_colour_space(static_cast<uint32_t>(color_space_));
@@ -1281,6 +1301,7 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 	move_all_ = jitter_move_all(move_all_, jitter_.drawn());
 	scene_rules(settings_.jitter_scene_rule, move_all_, &arm.size_targets, &arm.move_window);
 	arm.tested_quads = settings_.jitter_tested_quads;
+	arm.depth_regrid = settings_.depth_regrid;
 	diag_state("jitter_move_all", DiagLevel::Info, "jitter", arm.move_window
 		? std::wstring(L"jitter: no draw shows the scene by its depth; everything of the scene's size takes the offset")
 		: std::wstring(L"jitter: the scene is found by its depth"));
@@ -1455,6 +1476,8 @@ void App::on_destroy_device(reshade::api::device *device)
 {
 	pending_devices_.remove(device);
 	scene_snapshot().release(device);
+	if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11)
+		GameStateGuard::release_cached();
 	const std::optional<BridgeRelease> release =
 		bridge_release_on_destroy(device, bridge_device_, device != nullptr && is_engine_device(device));
 	if (!release)
@@ -1561,7 +1584,7 @@ void App::on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 	invalidate_temporal_history();
 }
 
-void App::on_destroy_swapchain(reshade::api::swapchain * , bool )
+void App::on_destroy_swapchain(reshade::api::swapchain *swapchain, bool )
 {
 	jitter_.forget();
 	if (bridge_ != nullptr)
@@ -1617,9 +1640,168 @@ void App::on_finish_effects(
 void App::run_effects_frame(reshade::addon_event event, reshade::api::effect_runtime *runtime,
 	reshade::api::command_list *cmd_list, reshade::api::resource_view rtv)
 {
+	bool taken = false;
+	{
+		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		for (RuntimeDrive &d : runtimes_)
+			if (d.runtime == runtime) {
+				d.drive.effects_event();
+				taken = d.drive.frame_taken();
+				break;
+			}
+	}
+	if (taken)
+		return;
+	if (runtime == nullptr || !runtime->get_effects_state())
+		return;
 	const EffectsFrame frame = effects_frame_of(event, settings_.upscale_effects);
 	if (frame.runs)
 		run_frame(runtime, cmd_list, rtv, frame.after_effects);
+}
+
+namespace {
+
+std::string reshade_base_path()
+{
+	const HMODULE m = reshade::internal::get_reshade_module_handle();
+	if (m == nullptr)
+		return {};
+	using GetBasePath = void (*)(char *, size_t *);
+	if (const auto get = reinterpret_cast<GetBasePath>(GetProcAddress(m, "ReShadeGetBasePath"))) {
+		size_t size = 0;
+		get(nullptr, &size);
+		if (size > 1) {
+			std::string path(size, '\0');
+			get(path.data(), &size);
+			path.resize(size);
+			return path;
+		}
+	}
+	const std::wstring dir = module_directory(m);
+	const int n = WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string out(n > 0 ? static_cast<size_t>(n - 1) : 0u, '\0');
+	if (n > 1)
+		WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, out.data(), n, nullptr, nullptr);
+	return out;
+}
+
+bool effect_search_paths(reshade::api::effect_runtime *runtime, std::vector<std::string> *paths)
+{
+	size_t size = 0;
+	if (!reshade::get_config_value(runtime, "GENERAL", "EffectSearchPaths", nullptr, &size))
+		return false;
+	std::string listed(size, '\0');
+	if (size != 0 && !reshade::get_config_value(runtime, "GENERAL", "EffectSearchPaths", listed.data(), &size))
+		return false;
+	listed.resize(size);
+	for (size_t from = 0; from < listed.size();) {
+		const size_t end = listed.find('\0', from);
+		const std::string one = listed.substr(from, end == std::string::npos ? std::string::npos : end - from);
+		if (!one.empty())
+			paths->push_back(one);
+		if (end == std::string::npos)
+			break;
+		from = end + 1;
+	}
+	return true;
+}
+
+}
+
+void App::on_init_effect_runtime(reshade::api::effect_runtime *runtime)
+{
+	if (runtime == nullptr)
+		return;
+	{
+		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		const bool known = std::any_of(runtimes_.begin(), runtimes_.end(),
+			[runtime](const RuntimeDrive &d) { return d.runtime == runtime; });
+		if (!known) {
+			RuntimeDrive d;
+			d.runtime = runtime;
+			d.device = runtime->get_device();
+			d.hwnd = runtime->get_hwnd();
+			runtimes_.push_back(d);
+		}
+	}
+	const std::wstring dir = module_directory(module_);
+	if (dir.empty() || GetFileAttributesW(join_path(dir, L"AeonSR.addonfx").c_str()) == INVALID_FILE_ATTRIBUTES)
+		return;
+	std::vector<std::string> paths;
+	if (!effect_search_paths(runtime, &paths) && !effect_search_paths(nullptr, &paths))
+		paths.push_back(".\\");
+	const int n = WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+	std::string dir8(n > 0 ? static_cast<size_t>(n - 1) : 0u, '\0');
+	if (n > 1)
+		WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, dir8.data(), n, nullptr, nullptr);
+	std::string base = reshade_base_path();
+	if (base.empty())
+		base = dir8;
+	if (dir8.empty() || effect_paths_reach(paths, dir8, base))
+		return;
+	paths.push_back(dir8);
+	std::string joined;
+	for (const std::string &p : paths) {
+		joined += p;
+		joined += '\0';
+	}
+	reshade::set_config_value(runtime, "GENERAL", "EffectSearchPaths", joined.data(), joined.size());
+	diag_info("aeonsr", L"added the add-on's folder (" + dir + L") to ReShade's effect search paths, so ReShade loads "
+		L"AeonSR.addonfx and runs its effects frame and its depth support where no effect package is installed");
+}
+
+void App::on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
+{
+	const std::lock_guard<std::mutex> lock(runtimes_lock_);
+	runtimes_.erase(std::remove_if(runtimes_.begin(), runtimes_.end(),
+		[runtime](const RuntimeDrive &d) { return d.runtime == runtime; }), runtimes_.end());
+}
+
+void App::on_game_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+{
+	if (queue == nullptr || swapchain == nullptr)
+		return;
+	const bool wanted = settings_.enabled || settings_.neural_render;
+	reshade::api::device *const device = swapchain->get_device();
+	void *const hwnd = swapchain->get_hwnd();
+	reshade::api::effect_runtime *runtime = nullptr;
+	{
+		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		for (const RuntimeDrive &d : runtimes_)
+			if (d.device == device && d.hwnd == hwnd) {
+				runtime = d.runtime;
+				break;
+			}
+	}
+	if (runtime == nullptr)
+		return;
+	const bool effects_on = runtime->get_effects_state();
+	bool drive = false;
+	uint64_t driven = 0;
+	{
+		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		for (RuntimeDrive &d : runtimes_)
+			if (d.runtime == runtime) {
+				drive = d.drive.at_present(wanted, effects_on);
+				driven = d.drive.driven();
+				break;
+			}
+	}
+	if (!drive)
+		return;
+	if (driven == 1)
+		diag_info("aeonsr", L"ReShade is running no effect in this game (none loaded, or still compiling), so "
+			L"the add-on takes each frame at the game's present instead");
+	reshade::api::command_list *const cmd_list = queue->get_immediate_command_list();
+	if (cmd_list == nullptr)
+		return;
+	const GameStateGuard keep(device, cmd_list);
+	const reshade::api::resource back_buffer = current_back_buffer_of(swapchain);
+	if (back_buffer.handle != 0)
+		cmd_list->barrier(back_buffer, reshade::api::resource_usage::present, reshade::api::resource_usage::render_target);
+	run_frame(runtime, cmd_list, reshade::api::resource_view{ 0 }, false);
+	if (back_buffer.handle != 0)
+		cmd_list->barrier(back_buffer, reshade::api::resource_usage::render_target, reshade::api::resource_usage::present);
 }
 
 void App::run_frame(
@@ -1636,6 +1818,12 @@ void App::run_frame(
 		jitter_.begin_frame(reinterpret_cast<uintptr_t>(runtime), counts);
 	}
 	jitter_note_ = jitter_.note();
+
+	if (d3d9_device_lost(runtime->get_device())) {
+		note_frame_blocked(L"the game's Direct3D 9 device is lost (switched away from fullscreen, or "
+			L"changing mode); frames resume when the game resets it");
+		return;
+	}
 
 	if (!fault_read_) {
 		fault_read_ = true;
@@ -1742,8 +1930,19 @@ void App::run_frame(
 	const PassContext pctx{ runtime, cmd_list, &pipelines_ };
 
 	FrameInputs inputs;
-	if (!resolve_frame_inputs(runtime, rtv, inputs))
+	if (!resolve_frame_inputs(runtime, rtv, inputs)) {
+		wchar_t why[200]{};
+		_snwprintf_s(why, _TRUNCATE, L"ReShade named no back buffer for this frame (%u back buffers, current %u, %ls)",
+			runtime->get_back_buffer_count(), runtime->get_current_back_buffer_index(),
+			rtv.handle != 0 ? L"a target was named but has no resource" : L"no target named");
+		UpscalerBackend *const all[] = { &dlss12_, &fsr12_, &xess12_ };
+		for (UpscalerBackend *b : all) {
+			b->status = UpscalerStatus::EvaluateFailed;
+			b->last_error = std::wstring(L"the frame never reached the upscaler: ") + why;
+		}
+		note_frame_blocked(why);
 		return;
+	}
 
 	BridgeInputs bin = bridge_inputs_of(inputs, after_effects);
 	SceneSnapshotTaken snap;
@@ -2086,13 +2285,6 @@ PanelState App::panel_state(bool for_overlay)
 		s.vsr_in_use = v.in_use;
 		s.vsr_level = v.level;
 	}
-	if (active_ == static_cast<const UpscalerBackend *>(&fsr11_))
-		s.game_fsr_modules = fsr11_.game_fsr_modules;
-	else if (!fsr12_.fsr_loading())
-		s.game_fsr_modules = fsr12_.game_fsr_modules;
-	s.game_xess_modules = xess12_.game_xess_modules;
-	if (!dlss12_.dlss_loading())
-		s.game_ngx_modules = ngx12_.game_ngx_modules;
 
 	const NgxSession &session = active_ == static_cast<const UpscalerBackend *>(&dlss11_)
 		? static_cast<const NgxSession &>(ngx_) : static_cast<const NgxSession &>(ngx12_);
@@ -2281,9 +2473,13 @@ PanelState App::panel_state(bool for_overlay)
 	if (s.upscalers_remote && s.host_ready) {
 		s.host_pid = remote_.host_pid();
 		const bool neural_there = remote_.neural_present();
+		bool dll = neural_there, shim = neural_there;
+		if (!neural_there)
+			neural_files_beside(module_directory(module_), &dll, &shim);
 		s.neural_dll_found = neural_there;
-		s.neural_dll_present = neural_there;
-		s.neural_shim_present = neural_there;
+		s.neural_dll_present = dll;
+		s.neural_shim_present = shim;
+		s.neural_host_refused = !neural_there && dll && shim;
 		if (s.active_is_dlss)
 			s.upscaler_dll_present = remote_.backend_present(BackendChoice::Dlss);
 		else if (s.active_is_fsr)

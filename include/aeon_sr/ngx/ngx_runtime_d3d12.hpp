@@ -35,8 +35,6 @@ struct NgxRuntimeD3D12 : NgxSession {
 
 	Gpu12InitList init_list;
 
-	std::wstring game_ngx_modules;
-
 	BlitPipelineD3D12 blit_;
 
 	bool init_device(ID3D12Device *dev, uint32_t w, uint32_t h);

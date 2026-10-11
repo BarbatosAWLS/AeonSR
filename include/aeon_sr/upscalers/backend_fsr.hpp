@@ -26,7 +26,6 @@ struct Fsr31D3D11Backend final : UpscalerBackend {
 	std::wstring addon_dir;
 	std::wstring dll_dir;
 	std::wstring loaded_dll_name;
-	std::wstring game_fsr_modules;
 
 	const char *name() const override;
 	reshade::api::device_api api() const override;
@@ -81,7 +80,6 @@ private:
 	bool ensure_scratch(uint32_t w, uint32_t h, DXGI_FORMAT fmt);
 	bool query_render_size(uint32_t display_w, uint32_t display_h, uint32_t quality,
 		uint32_t &out_w, uint32_t &out_h);
-	void scan_game_fsr_modules();
 	FfxResource make_resource(ID3D11Resource *res, FfxResourceStates state) const;
 };
 
@@ -100,8 +98,6 @@ struct Fsr4D3D12Backend final : UpscalerBackend {
 
 	std::wstring addon_dir;
 	std::wstring dll_dir;
-
-	std::wstring game_fsr_modules;
 
 	~Fsr4D3D12Backend() override
 	{
@@ -224,7 +220,6 @@ private:
 	bool ensure_scratch(ID3D12GraphicsCommandList *cmd, uint32_t w, uint32_t h, DXGI_FORMAT fmt);
 	bool query_render_size(uint32_t display_w, uint32_t display_h, uint32_t quality,
 		uint32_t &out_w, uint32_t &out_h);
-	void scan_game_fsr_modules();
 };
 
 }

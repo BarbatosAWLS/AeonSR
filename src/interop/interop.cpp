@@ -296,9 +296,10 @@ bool EngineDevice::finish_device()
 	D3D12_COMMAND_QUEUE_DESC qdesc{};
 	qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 	bool ok = SUCCEEDED(device12_->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue12_)));
-	for (ID3D12CommandAllocator *&a : allocators_)
-		ok = ok && SUCCEEDED(device12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)));
-	ok = ok && SUCCEEDED(device12_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0], nullptr,
+	for (auto &ring : allocators_)
+		for (ID3D12CommandAllocator *&a : ring)
+			ok = ok && SUCCEEDED(device12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)));
+	ok = ok && SUCCEEDED(device12_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0][0], nullptr,
 		IID_PPV_ARGS(&list_)));
 	ok = ok && SUCCEEDED(device12_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence12_)));
 	if (!ok) {
@@ -310,9 +311,12 @@ bool EngineDevice::finish_device()
 
 	fence_value_ = 0;
 	last_gpu_value_ = 0;
-	for (uint64_t &v : allocator_value_)
-		v = 0;
-	slot_ = 0;
+	for (auto &ring : allocator_value_)
+		for (uint64_t &v : ring)
+			v = 0;
+	for (uint32_t &s : slot_)
+		s = 0;
+	ring_ = 0;
 	return true;
 }
 
@@ -325,8 +329,9 @@ void EngineDevice::shutdown()
 	drain_value_ = 0;
 	borrowed_queue_ = nullptr;
 	safe_release(list_);
-	for (ID3D12CommandAllocator *&a : allocators_)
-		safe_release(a);
+	for (auto &ring : allocators_)
+		for (ID3D12CommandAllocator *&a : ring)
+			safe_release(a);
 	safe_release(fence12_);
 	safe_release(queue12_);
 	safe_release(device12_);
@@ -342,9 +347,12 @@ void EngineDevice::shutdown()
 	borrowed_ = false;
 	fence_value_ = 0;
 	last_gpu_value_ = 0;
-	for (uint64_t &v : allocator_value_)
-		v = 0;
-	slot_ = 0;
+	for (auto &ring : allocator_value_)
+		for (uint64_t &v : ring)
+			v = 0;
+	for (uint32_t &s : slot_)
+		s = 0;
+	ring_ = 0;
 	list_open_ = false;
 	begin_stalls_ = 0;
 	begin_stall_ms_ = 0.0;
@@ -422,7 +430,7 @@ ID3D12GraphicsCommandList *EngineDevice::begin_list()
 {
 	if (!ready())
 		return nullptr;
-	if (list_ == nullptr || allocators_[slot_] == nullptr) {
+	if (list_ == nullptr || allocators_[ring_][slot_[ring_]] == nullptr) {
 		last_error = L"the engine has no command list of its own on a borrowed device";
 		return nullptr;
 	}
@@ -430,7 +438,7 @@ ID3D12GraphicsCommandList *EngineDevice::begin_list()
 		last_error = L"the engine command list was opened twice without a submit";
 		return nullptr;
 	}
-	const uint64_t need = allocator_value_[slot_];
+	const uint64_t need = allocator_value_[ring_][slot_[ring_]];
 	if (need > 0 && fence12_->GetCompletedValue() < need) {
 		LARGE_INTEGER freq{}, t0{}, t1{};
 		QueryPerformanceFrequency(&freq);
@@ -444,7 +452,7 @@ ID3D12GraphicsCommandList *EngineDevice::begin_list()
 		if (!ok)
 			return nullptr;
 	}
-	ID3D12CommandAllocator *const allocator = allocators_[slot_];
+	ID3D12CommandAllocator *const allocator = allocators_[ring_][slot_[ring_]];
 	if (FAILED(allocator->Reset()) || FAILED(list_->Reset(allocator, nullptr))) {
 		last_error = L"the engine command list could not be reset";
 		return nullptr;
@@ -475,10 +483,10 @@ bool EngineDevice::submit_list()
 	const bool signalled = SUCCEEDED(queue12_->Signal(fence12_, fence_value_ + 1));
 	if (signalled) {
 		++fence_value_;
-		allocator_value_[slot_] = fence_value_;
+		allocator_value_[ring_][slot_[ring_]] = fence_value_;
 		last_gpu_value_ = fence_value_;
 	}
-	slot_ = (slot_ + 1u) % kFramesInFlight;
+	slot_[ring_] = (slot_[ring_] + 1u) % kFramesInFlight;
 	if (!signalled) {
 		last_error = L"the engine queue refused a fence signal";
 		return false;

@@ -1,4 +1,6 @@
 #include "aeon_sr/motion/optical_flow.hpp"
+#include "aeon_sr/motion/optical_flow_entries.hpp"
+#include "aeon_sr/motion/flow_baked.h"
 
 #include <d3dcompiler.h>
 #include <string>
@@ -36,7 +38,7 @@ enum : uint32_t {
 	kSlotLumaMipSrv = kSlotLumaSrv + 2,
 	kSlotLumaUav = kSlotLumaMipSrv + 2 * kMaxLumaMips,
 	kSlotFlow = kSlotLumaUav + 2 * kMaxLumaMips,
-	kStagingCount = kSlotFlow + 50
+	kStagingCount = kSlotFlow + 52
 };
 
 std::wstring widen_ascii(const char *text)
@@ -53,28 +55,37 @@ std::wstring widen_ascii(const char *text)
 	return out;
 }
 
+const char *flow_source()
+{
+	return OpticalFlowD3D12::source_for_test != nullptr ? OpticalFlowD3D12::source_for_test : kFlowHlsl;
+}
+
 const char *entry_of(uint32_t shader)
 {
-	switch (shader) {
-	case 0: return "CSLuma";
-	case 1: return "CSDownsample";
-	case 2: return "CSCoarseTop";
-	case 3: return "CSCoarse";
-	case 4: return "CSMedian";
-	case 5: return "CSRefine";
-	case 6: return "CSGlobal";
-	case 7: return "CSConfidence";
-	case 8: return "CSExport";
-	case 9: return "CSCopyFlow";
-	case 10: return "CSStructure";
-	case 11: return "CSModelTerms";
-	case 12: return "CSModelReduce";
-	case 13: return "CSModelSolve";
-	case 14: return "CSDecision";
-	case 15: return "CSFuse";
-	case 16: return "CSPhotoTerms";
-	default: return "CSThetaPublish";
+	return flow_entries::kNames[shader < flow_entries::kCount ? shader : flow_entries::kCount - 1];
+}
+
+bool kernel_code(uint32_t shader, int level, ID3DBlob **compiled, const void **code, size_t *size, ID3DBlob **cerr)
+{
+	*compiled = nullptr;
+	*cerr = nullptr;
+	if (OpticalFlowD3D12::source_for_test == nullptr) {
+		const flow_baked::Kernel &k = level < 0 ? flow_baked::kModel[shader - flow_entries::kFirstModel]
+			: flow_baked::kMatcher[level][shader];
+		*code = k.code;
+		*size = k.size;
+		return true;
 	}
+	const D3D_SHADER_MACRO defines[] = {
+		{ "AEON_FLOW_QUALITY", level >= 0 ? flow_entries::kQualityDefine[level] : nullptr },
+		{ nullptr, nullptr }
+	};
+	if (FAILED(D3DCompile(flow_source(), std::strlen(flow_source()), "aeon_flow", level >= 0 ? defines : nullptr,
+			nullptr, entry_of(shader), "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, compiled, cerr)))
+		return false;
+	*code = (*compiled)->GetBufferPointer();
+	*size = (*compiled)->GetBufferSize();
+	return true;
 }
 
 constexpr DXGI_FORMAT kSrvRegisterFormat[kSrvCount] = {
@@ -96,8 +107,9 @@ constexpr DXGI_FORMAT kUavRegisterFormat[kUavCount] = {
 	DXGI_FORMAT_R32G32B32A32_FLOAT,
 };
 
-constexpr uint32_t kModelStats = 76;
+constexpr uint32_t kModelStats = 80;
 static_assert(kModelStats % 4u == 0u, "store_terms reduces the terms in four equal parts (kTermParts)");
+static_assert(kModelStats <= 80u, "sums_ holds one column per term");
 constexpr uint32_t kPartialRows = 4096;
 static_assert(kPartialRows <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, "one column of partial rows");
 constexpr uint32_t kModelIterations = 4;
@@ -126,11 +138,6 @@ void barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
 	cmd->ResourceBarrier(1, &b);
 }
 
-const char *flow_source()
-{
-	return OpticalFlowD3D12::source_for_test != nullptr ? OpticalFlowD3D12::source_for_test : kFlowHlsl;
-}
-
 }
 
 OpticalFlowD3D12::~OpticalFlowD3D12()
@@ -143,7 +150,7 @@ void OpticalFlowD3D12::release_textures()
 	Tex *const all[] = { &luma_[0], &luma_[1], &l4_, &l3_[0], &l3_[1], &l2_[0], &l2_[1],
 		&l1_[0], &l1_[1], &l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_,
 		&prev_flow_, &global_, &conf_quarter_, &prev_conf_, &motion_, &confidence_,
-		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_ };
+		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_ };
 	for (Tex *t : all) {
 		safe_release(t->res);
 		*t = Tex{};
@@ -189,6 +196,8 @@ void OpticalFlowD3D12::release()
 
 const char *OpticalFlowD3D12::kernel_name(uint32_t shader) noexcept
 {
+	static_assert(kShaderCount == flow_entries::kCount, "optical_flow_entries.hpp names every kernel");
+	static_assert(kFirstModelShader == flow_entries::kFirstModel, "and splits them where the estimator does");
 	static const char *const names[kShaderCount] = {
 		"luma", "downsample", "coarse top", "coarse", "median", "refine",
 		"global", "confidence", "export", "copy flow",
@@ -363,14 +372,11 @@ bool OpticalFlowD3D12::make_pipelines(std::wstring *error)
 	std::wstring first_error;
 	for (uint32_t q = 0; q < 2; ++q) {
 		quality_ok[q] = true;
-		const D3D_SHADER_MACRO defines[] = {
-			{ "AEON_FLOW_QUALITY", q == 0 ? "1" : "2" },
-			{ nullptr, nullptr }
-		};
 		for (uint32_t i = 0; i < kFirstModelShader; ++i) {
 			ID3DBlob *cs = nullptr, *cerr = nullptr;
-			if (FAILED(D3DCompile(flow_source(), std::strlen(flow_source()), "aeon_flow", defines,
-					nullptr, entry_of(i), "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
+			const void *code = nullptr;
+			size_t code_size = 0;
+			if (!kernel_code(i, static_cast<int>(q), &cs, &code, &code_size, &cerr)) {
 				std::wstring detail = L"optical flow: ";
 				detail += widen_ascii(entry_of(i));
 				detail += q == 0 ? L" (balanced)" : L" (high)";
@@ -389,8 +395,8 @@ bool OpticalFlowD3D12::make_pipelines(std::wstring *error)
 			safe_release(cerr);
 			D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
 			pd.pRootSignature = root_;
-			pd.CS.pShaderBytecode = cs->GetBufferPointer();
-			pd.CS.BytecodeLength = cs->GetBufferSize();
+			pd.CS.pShaderBytecode = code;
+			pd.CS.BytecodeLength = code_size;
 			const HRESULT ok = device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_[q][i]));
 			safe_release(cs);
 			if (FAILED(ok)) {
@@ -435,8 +441,9 @@ void OpticalFlowD3D12::build_model_pipelines()
 			break;
 		}
 		ID3DBlob *cs = nullptr, *cerr = nullptr;
-		if (FAILED(D3DCompile(flow_source(), std::strlen(flow_source()), "aeon_flow", nullptr,
-				nullptr, entry_of(i), "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
+		const void *code = nullptr;
+		size_t code_size = 0;
+		if (!kernel_code(i, -1, &cs, &code, &code_size, &cerr)) {
 			why = L"camera model: ";
 			why += widen_ascii(entry_of(i));
 			why += L" failed to compile";
@@ -451,8 +458,8 @@ void OpticalFlowD3D12::build_model_pipelines()
 		safe_release(cerr);
 		D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
 		pd.pRootSignature = root_;
-		pd.CS.pShaderBytecode = cs->GetBufferPointer();
-		pd.CS.BytecodeLength = cs->GetBufferSize();
+		pd.CS.pShaderBytecode = code;
+		pd.CS.BytecodeLength = code_size;
 		const HRESULT ok = device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&built[i]));
 		safe_release(cs);
 		if (FAILED(ok)) {
@@ -575,7 +582,7 @@ void OpticalFlowD3D12::make_flow_views()
 	Tex *const flow[] = { &l4_, &l3_[0], &l3_[1], &l2_[0], &l2_[1], &l1_[0], &l1_[1],
 		&l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_, &prev_flow_, &global_,
 		&conf_quarter_, &prev_conf_, &motion_, &confidence_,
-		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_ };
+		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_ };
 	static_assert(sizeof(flow) / sizeof(flow[0]) * 2 == kStagingCount - kSlotFlow,
 		"every flow texture needs an SRV and a UAV slot");
 	for (uint32_t i = 0; i < sizeof(flow) / sizeof(flow[0]); ++i) {
@@ -614,14 +621,15 @@ void OpticalFlowD3D12::make_model_textures()
 		make_tex(theta_[0], 16, 2, DXGI_FORMAT_R32_FLOAT, 1, &error) &&
 		make_tex(theta_[1], 16, 2, DXGI_FORMAT_R32_FLOAT, 1, &error) &&
 		make_tex(alpha_q_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16_FLOAT, 1, &error) &&
-		make_tex(theta_pub_, 16, 8, DXGI_FORMAT_R32_FLOAT, 1, &error);
+		make_tex(theta_pub_, 16, 8, DXGI_FORMAT_R32_FLOAT, 1, &error) &&
+		make_tex(kept_motion_, w, h, DXGI_FORMAT_R16G16_FLOAT, 1, &error);
 	if (model_textures_) {
 		model_retry_ms_ = 0;
 		return;
 	}
 	model_textures_failed_at_ = GetTickCount64();
 	model_retry_ms_ = model_retry_ms_ == 0 ? texture_retry_ms : (std::min)(2u * model_retry_ms_, 60000u);
-	for (Tex *t : { &struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_ }) {
+	for (Tex *t : { &struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_ }) {
 		safe_release(t->res);
 		*t = Tex{};
 	}
@@ -942,11 +950,18 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 	f.dst_h = height_;
 	f.inv_dst_x = base.inv_full_x;
 	f.inv_dst_y = base.inv_full_y;
+	const bool cross = (m.model_flags & 4u) != 0u;
+	if (cross) {
+		to_state(cmd, motion_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		to_state(cmd, kept_motion_, D3D12_RESOURCE_STATE_COPY_DEST);
+		cmd->CopyResource(kept_motion_.res, motion_.res);
+		to_state(cmd, kept_motion_, read_state);
+	}
 	to_state(cmd, motion_, write_state);
 	to_state(cmd, confidence_, write_state);
 	{
 		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
-			none, none, none, srv_of(dense_[1]), none, none,
+			none, none, none, srv_of(dense_[1]), cross ? srv_of(kept_motion_) : none, none,
 			staging(kSlotDepth), srv_of(conf_quarter_), srv_of(struct_q_), srv_of(theta_pub_), srv_of(alpha_q_)
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { uav_of(motion_), uav_of(confidence_), none };

@@ -21,6 +21,16 @@ void safe_release(T *&p)
 
 constexpr uint64_t kWaitNanoseconds = 2000ull * 1000ull * 1000ull;
 
+DXGI_FORMAT engine_format_of(DXGI_FORMAT fmt) noexcept
+{
+	switch (fmt) {
+	case DXGI_FORMAT_B8G8R8X8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	default: return fmt;
+	}
+}
+
 constexpr uint32_t kProbeSize = 64;
 constexpr rapi::format kProbeFormat = rapi::format::b8g8r8a8_unorm;
 
@@ -489,7 +499,7 @@ private:
 				L"add-on run.";
 			return false;
 		}
-		const DXGI_FORMAT dxgi = dxgi_format_of(desc.texture.format);
+		const DXGI_FORMAT dxgi = engine_format_of(dxgi_format_of(desc.texture.format));
 		if (dxgi == DXGI_FORMAT_UNKNOWN) {
 			last_error = L"one of the game's textures is in a format Direct3D 12 has no name "
 				L"for, so the upscaler cannot be shown it";

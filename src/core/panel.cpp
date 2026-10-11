@@ -6,6 +6,7 @@
 
 #include <dxgiformat.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -229,50 +230,12 @@ void draw_jitter_numbers(const PanelState &state, PanelActions &actions)
 
 void draw_quality_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
-	ImGui::SeparatorText("Reconstruct");
-	if (ImGui::Checkbox("Upscale the ReShade effects", &settings.upscale_effects)) {
-		actions.reset = true;
-		actions.invalidate_history = true;
+	ImGui::SeparatorText("Image");
+	ImGui::SliderFloat("Sharpness", &settings.sharpness, 0.0f, 1.0f, "%.2f");
+	hint("How sharp the final image looks.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
 		actions.persist = true;
-	}
-	hint("Also upscales the other ReShade effects.\n"
-		"Turn it off if your sharpening or grain looks washed out.");
-
-	if (ImGui::Checkbox("Sub-pixel jitter", &settings.spatial_jitter)) {
-		actions.reset = true;
-		actions.invalidate_history = true;
-		actions.persist = true;
-	}
-	hint("Improves edge quality. Leave it on unless something looks wrong.");
-
-	if (settings.spatial_jitter && state.jitter_refused) {
-		ImGui::TextDisabled("Not applied - the upscaler is running without it.");
-	} else if (state.jitter_in_frame && state.jitter_still) {
-		ImGui::TextDisabled("On - nothing drawn took it this frame, so the frame is left still.");
-	} else if (state.jitter_in_frame && state.jitter_mixed) {
-		ImGui::TextDisabled("Drawn into the game - mixed this frame, the upscaler was told none.");
-	} else if (state.jitter_in_frame && state.jitter_aliased_draws != 0) {
-		ImGui::TextDisabled("Drawn into the game: %u of %u draws moved, %u with another depth buffer.",
-			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws,
-			state.jitter_aliased_draws);
-	} else if (state.jitter_in_frame) {
-		ImGui::TextDisabled("Drawn into the game: %u of %u draws moved.",
-			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws);
-	} else if (settings.spatial_jitter && !state.jitter_active) {
-		ImGui::TextDisabled("On, idle this frame.");
-	} else if (settings.spatial_jitter && state.jitter_note[0] != '\0') {
-		ImGui::TextDisabled("Resampled - %s.", state.jitter_note);
-	} else if (settings.spatial_jitter) {
-		ImGui::TextDisabled("On, waiting for the game to draw a frame.");
-	}
-	if (state.scope_capture_enabled && state.scope_have && ImGui::TreeNode("Jitter numbers")) {
-		draw_jitter_numbers(state, actions);
-		ImGui::TreePop();
-	}
-
 	if (state.active_is_dlss) {
-		ImGui::SeparatorText("DLSS");
-
 		static const RowOption kPresetOptions[] = {
 			{ "Default", "Lets the driver choose" },
 			{ "E", "Older model" },
@@ -282,353 +245,256 @@ void draw_quality_section(const PanelState &state, Settings &settings, PanelActi
 			{ "L", "Suits Ultra Performance" },
 			{ "M", "Suits Performance" },
 		};
-		if (button_row_value("Render preset", &settings.render_preset, kPresetOptions, kFunctionalRenderPresets,
+		if (button_row_value("DLSS preset", &settings.render_preset, kPresetOptions, kFunctionalRenderPresets,
 				"Which DLSS image model to use.")) {
 			actions.reset = true;
 			actions.persist = true;
 		}
 	}
 
-	ImGui::SeparatorText("Output");
-	ImGui::SliderFloat("Sharpness", &settings.sharpness, 0.0f, 1.0f, "%.2f");
-	hint("How sharp the final image looks.");
-	if (ImGui::IsItemDeactivatedAfterEdit())
+	ImGui::SeparatorText("Reconstruction");
+	if (ImGui::Checkbox("Sub-pixel jitter", &settings.spatial_jitter)) {
+		actions.reset = true;
+		actions.invalidate_history = true;
 		actions.persist = true;
+	}
+	hint("Improves edge quality. Leave it on unless something looks wrong.");
+
+	if (settings.spatial_jitter && state.jitter_refused)
+		ImGui::TextDisabled("Not applied - the upscaler is running without it.");
+	if (ImGui::Checkbox("Upscale the ReShade effects", &settings.upscale_effects)) {
+		actions.reset = true;
+		actions.invalidate_history = true;
+		actions.persist = true;
+	}
+	hint("Also upscales the other ReShade effects.\n"
+		"Turn it off if your sharpening or grain looks washed out.");
+	if (ImGui::Button("Reset temporal history"))
+		actions.reset = true;
+	hint("Clears what the upscaler remembers from previous frames.\n"
+		"Try this after a glitch.");
 }
 
 void draw_neural_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
+	if (ImGui::Checkbox("Enable neural rendering", &settings.neural_render)) {
+		if (!settings.neural_render)
+			actions.neural_restart = true;
+		actions.persist = true;
+	}
+	hint("Adds fine detail to the finished image. Works with any upscaler, or on\n"
+		"its own. NVIDIA only, and needs an extra runtime file.");
+
+	const bool nvidia = vendor_may_be_nvidia(state.gpu_vendor);
+	const bool gpu_refused = nvidia &&
+		(state.neural_adapter_unsupported || state.neural_feature_unsupported ||
+			!state.neural_runtime_serves_card ||
+			state.neural_status == UpscalerStatus::UnsupportedGpu);
+	if (!nvidia || gpu_refused) {
+		ImGui::TextDisabled("Not available on this GPU - see Diagnostics.");
+	} else if (settings.neural_render) {
+		const bool on = state.neural_last == 1;
+		ImGui::TextColored(on ? ImVec4(0.4f, 0.9f, 0.4f, 1.0f) : ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
+			on ? "Running" : "Not running - see Diagnostics");
+	}
+	if (!settings.neural_render)
+		return;
+
+	ImGui::SeparatorText("Performance");
 	{
-		if (ImGui::Checkbox("Enable neural rendering", &settings.neural_render)) {
-			if (!settings.neural_render)
-				actions.neural_restart = true;
+		static const RowOption kScaleOptions[] = {
+			{ "Full", "Full resolution: most detail, heaviest" },
+			{ "90%", "" },
+			{ "80%", "" },
+			{ "70%", "" },
+			{ "60%", "Good balance" },
+			{ "50%", "" },
+			{ "40%", "Fastest, softest" },
+		};
+		if (button_row_index<kNeuralModelScaleCount>("Resolution", &settings.neural_model_scale,
+				kScaleOptions,
+				"The resolution the effect works at. Lower runs faster and\n"
+				"gives softer detail; Full gives the most."))
+			actions.persist = true;
+
+		static const RowOption kModeOptions[] = {
+			{ "Quality", "Full detail everywhere" },
+			{ "Balanced", "Faster; full detail in the middle" },
+			{ "Performance", "Faster still; less detail towards the edges" },
+			{ "Ultra performance", "Fastest; least detail at the edges" },
+		};
+		if (button_row_index<kNeuralModeCount>("DLSS 5 mode", &settings.neural_mode, kModeOptions,
+				"Every mode updates the whole picture every frame. The faster\n"
+				"ones keep full detail in the middle of the screen and spend\n"
+				"less towards the edges."))
+			actions.persist = true;
+
+		if (ImGui::Checkbox("Run without depth", &settings.neural_no_depth)) {
+			actions.neural_restart = true;
 			actions.persist = true;
 		}
-		hint("Adds fine detail to the finished image. Works with any upscaler, or on\n"
-			"its own. NVIDIA only, and needs an extra runtime file - see Diagnostics\n"
-			"if it will not start.");
+		hint("Skips the depth buffer. Slightly faster.");
 
-		if (!vendor_may_be_nvidia(state.gpu_vendor)) {
-			ImGui::TextDisabled("Neural rendering: unavailable (%s detected)",
-				vendor_label(state.gpu_vendor));
-			hint("Only this feature needs an NVIDIA card. Everything else works here.");
+		const unsigned int cost_mode = clamp_neural_mode(settings.neural_mode);
+		const float rows = cost_mode == 0u ? 1.0f
+			: (state.neural_area_share > 0.0f ? state.neural_area_share
+				: kNeuralModeKeep[cost_mode] * kNeuralModeKeep[cost_mode]);
+		const float rel = neural_chain_relative_cost(
+			neural_model_scale_factor(settings.neural_model_scale),
+			settings.neural_passes, rows);
+		if (state.neural_gpu_ms > 0.0f) {
+			ImGui::Text("Neural pass: %.2f ms of GPU time per frame", state.neural_gpu_ms);
+			hint("How long this effect takes each frame.\n"
+				"A 60 fps frame has 16.7 ms in total, and the game needs most of it.");
 		}
-		if (state.upscalers_remote) {
-			ImGui::TextDisabled(state.host_ready
-				? "Runs in AeonSRHost.exe, beside the game."
-				: "Runs in AeonSRHost.exe, which starts with the first upscaled frame.");
-			hint("This game is a 32-bit program and every upscaler is 64-bit, so they\n"
-				"run in a small helper process next to it.");
-		} else if (!state.neural_dll_found) {
-			ImGui::TextDisabled("nvngx_dlssnr.dll: missing (supply your own)");
-			hint((std::string("This file is not included and the driver does not install it.\n")
-				+ "Copy it from a game you own into the folder holding " + kAddonFileName + ".").c_str());
-		} else if (!state.neural_runtime_file.empty()) {
-			const size_t cut = state.neural_runtime_file.find_last_of(L"\\/");
-			const std::string name = narrow_lossy(cut == std::wstring::npos
-				? state.neural_runtime_file : state.neural_runtime_file.substr(cut + 1));
-			ImGui::TextDisabled("Runtime: %s, built for %s", name.c_str(),
-				state.neural_runtime_cards.empty() ? "unknown cards" : state.neural_runtime_cards.c_str());
-			hint("The neural rendering file in use and the cards it can run on.\n"
-				"A build in runtime\\dlss5-allgpu\\ is tried first.");
-		}
-		const bool gpu_refused = vendor_may_be_nvidia(state.gpu_vendor) &&
-			(state.neural_adapter_unsupported || state.neural_feature_unsupported ||
-				!state.neural_runtime_serves_card ||
-				state.neural_status == UpscalerStatus::UnsupportedGpu);
-		if (gpu_refused) {
-			ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f),
-				"Neural rendering: NVIDIA's runtime will not run this pass on this GPU.");
-			if (state.neural_adapter_unsupported) {
-				ImGui::TextDisabled("It needs %s or newer. Everything else in AeonSR works here.",
-					neural_arch_name(state.neural_min_architecture));
-			} else if (!state.neural_runtime_serves_card && state.neural_gpu_architecture != 0) {
-				ImGui::TextDisabled("This GPU is %s; this nvngx_dlssnr.dll is built for %s.",
-					neural_arch_name(state.neural_gpu_architecture),
-					state.neural_runtime_cards.empty() ? "other cards" : state.neural_runtime_cards.c_str());
-				if (state.neural_allgpu_build_targets)
-					ImGui::TextDisabled("A build for all GPUs runs here: put it in runtime\\dlss5-allgpu\\.");
-				else
-					ImGui::TextDisabled("No build of nvngx_dlssnr.dll runs on this GPU.");
-			} else if (state.neural_gpu_architecture != 0) {
-				ImGui::TextDisabled("This GPU is %s. Everything else in AeonSR works here.",
-					neural_arch_name(state.neural_gpu_architecture));
-			} else {
-				ImGui::TextDisabled("Everything else in AeonSR works on this GPU.");
-			}
-			if (state.neural_runtime_serves_card)
-				hint("Nothing on this panel changes this.");
-			else if (state.neural_allgpu_build_targets)
-				hint("Put a build of nvngx_dlssnr.dll made for this card in runtime\\dlss5-allgpu\\,\n"
-					"then turn neural rendering off and on. Updates never overwrite that folder.");
-			else
-				hint("This card has no compatible nvngx_dlssnr.dll build. Everything else works.");
-		}
-
-		if (settings.neural_render) {
-			const char *pass_state =
-				state.neural_last == 1 ? "applied"
-				: state.neural_crashed ? "FAILED: the neural rendering runtime faulted; pass disabled until reload"
-				: state.neural_last == -1 && !gpu_refused ? "FAILED (see Detail below and AeonSR.log)"
-				: gpu_refused ? "BLOCKED: the runtime will not run this pass on this GPU"
-				: state.neural_driver_too_old ? "BLOCKED: driver older than the runtime requires"
-				: !state.neural_shim_present ? "BLOCKED: ngxshim\\nvngx.dll missing (see Detail)"
-				: settings.neural_no_motion_vectors ? "idle"
-				: "idle (needs motion vectors)";
-			const bool ok = state.neural_last == 1;
-			ImGui::TextColored(ok ? ImVec4(0.4f, 0.9f, 0.4f, 1.0f) : ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
-				"Neural pass: %s", pass_state);
-			if (state.neural_last == 0 && !settings.neural_no_motion_vectors && !state.flow_note.empty())
-				ImGui::TextWrapped("Why: %s", narrow_lossy(state.flow_note).c_str());
-			if (!state.neural_error.empty())
-				ImGui::TextWrapped("Detail: %s", narrow_lossy(state.neural_error).c_str());
-			if (state.neural_required_driver_major != 0) {
-				const bool old_driver = state.neural_driver_too_old;
-				ImGui::TextColored(old_driver ? ImVec4(0.95f, 0.4f, 0.4f, 1.0f) : ImVec4(0.4f, 0.9f, 0.4f, 1.0f),
-					"Driver: %u.%02u  (runtime requires %u.%u)",
-					state.neural_driver_major, state.neural_driver_minor,
-					state.neural_required_driver_major, state.neural_required_driver_minor);
-			}
-			if (state.neural_gpu_architecture != 0) {
-				if (state.neural_requirement_known && state.neural_min_architecture != 0)
-					ImGui::TextDisabled("GPU: 0x%03X (%s)   runtime minimum: 0x%03X (%s)",
-						state.neural_gpu_architecture,
-						neural_arch_name(state.neural_gpu_architecture),
-						state.neural_min_architecture,
-						neural_arch_name(state.neural_min_architecture));
-				else
-					ImGui::TextDisabled("GPU: 0x%03X (%s)   runtime minimum: not answered",
-						state.neural_gpu_architecture,
-						neural_arch_name(state.neural_gpu_architecture));
-				hint("Your card, and the oldest card this runtime file accepts.");
-			}
-			if (!state.neural_runtime_kernels.empty()) {
-				ImGui::TextDisabled("Runtime built for: %s", state.neural_runtime_kernels.c_str());
-				hint("Which graphics cards this runtime file supports. A card that is not\n"
-					"on the list cannot run this feature.");
-			}
-			ImGui::Text("Evals: %llu%s", static_cast<unsigned long long>(state.neural_eval_count),
-				state.neural_via_bridge ? "   (via D3D11on12 bridge)" : "");
-
-			ImGui::SeparatorText("Detail and stability");
-			{
-				static const RowOption kScaleOptions[] = {
-					{ "Full", "Sharpest, heaviest" },
-					{ "90%", "" },
-					{ "80%", "" },
-					{ "70%", "" },
-					{ "60%", "Good balance" },
-					{ "50%", "" },
-					{ "40%", "Cheapest, softest" },
-				};
-				if (button_row_index<kNeuralModelScaleCount>("Detail", &settings.neural_model_scale,
-						kScaleOptions,
-						"How much detail the effect can add. Higher looks sharper and\n"
-						"costs more performance."))
-					actions.persist = true;
-				if ((settings.neural_model_scale != 0u || clamp_neural_mode(settings.neural_mode) != 0u) &&
-						state.neural_model_width != 0)
-					ImGui::TextDisabled("Working at %ux%u.",
-						state.neural_model_width, state.neural_model_height);
-
-				static const RowOption kModeOptions[] = {
-					{ "Quality", "Full detail everywhere" },
-					{ "Balanced", "Faster; full detail in the middle" },
-					{ "Performance", "Faster still; less detail towards the edges" },
-					{ "Ultra performance", "Fastest; least detail at the edges" },
-				};
-				if (button_row_index<kNeuralModeCount>("DLSS 5 Quality", &settings.neural_mode, kModeOptions,
-						"Every mode updates the whole picture every frame. The faster\n"
-						"ones keep full detail in the middle of the screen and spend\n"
-						"less towards the edges."))
-					actions.persist = true;
-
-				if (ImGui::Checkbox("Smoothing", &settings.neural_smoothing))
-					actions.persist = true;
-				hint("Steadies the effect between frames and removes trails behind\n"
-					"moving objects. Off shows the model's answer raw, which is\n"
-					"sharper and restless.");
-			}
-
-			ImGui::SeparatorText("How much of it lands");
-
-			ImGui::SliderFloat("Detail strength", &settings.neural_detail_strength,
-				0.0f, kNeuralDetailMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			hint("How strong the added detail is. This is the main slider.\n"
-				"If turning it up stops changing dark areas, raise Highlight guard.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
-			ImGui::SliderFloat("Colour strength", &settings.neural_colour_strength,
-				0.0f, kNeuralUnitMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			hint("How much of the effect's colour is used.\n"
-				"0 keeps the game's own colours and changes only brightness.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
-
-			ImGui::SeparatorText("Model");
-
-			static const RowOption kStyleOptions[] = {
-				{ "Standard", "Neutral" },
-				{ "Natural", "Brighter, livelier - can look shiny" },
-				{ "Cinematic", "Softer light" },
-			};
-			if (button_row_index<kNeuralStyleCount>("Look", &settings.neural_style, kStyleOptions,
-					"Overall look of the effect."))
-				actions.persist = true;
-
-			ImGui::SliderFloat("Neural intensity", &settings.neural_intensity, 0.0f, kNeuralUnitMax, "%.2f",
-				ImGuiSliderFlags_AlwaysClamp);
-			hint("Strength of the effect itself. It can only reduce it -\n"
-				"use Detail strength to push further.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
-			ImGui::SliderFloat("Local structure", &settings.neural_local_structure, 0.0f, kNeuralExtendedMax, "%.2f",
-				ImGuiSliderFlags_AlwaysClamp);
-			hint("Amount of fine detail. 1.00 is the default.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
-			ImGui::SliderFloat("Local tone", &settings.neural_local_tone, 0.0f, kNeuralExtendedMax, "%.2f",
-				ImGuiSliderFlags_AlwaysClamp);
-			hint("Local contrast. Lower it if the lighting reacts too strongly.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
-			ImGui::SliderFloat("Skin structure", &settings.neural_skin_structure,
-				kNeuralSkinMin, kNeuralSkinMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			hint("Detail on skin, set separately from the rest of the frame.");
-			if (ImGui::IsItemDeactivatedAfterEdit()) {
-				settings.neural_skin_structure = clamp_neural_skin(settings.neural_skin_structure);
-				actions.persist = true;
-			}
-			if (ImGui::Checkbox("Auto skin mask", &settings.neural_auto_mask))
-				actions.persist = true;
-			hint("Finds skin automatically for the slider above.");
-
-			ImGui::SeparatorText("Colour");
-			{
-				const char *cs =
-					state.neural_color_space == NeuralColorSpace::Pq ? "HDR10 (PQ)"
-					: state.neural_color_space == NeuralColorSpace::ScrgbLinear ? "scRGB (linear)"
-					: "SDR / sRGB";
-				ImGui::Text("Frame colour space: %s", cs);
-				hint("The colour format of the game's image. Detected automatically.");
-			}
-			ImGui::SliderFloat("Paper white", &settings.neural_paper_white,
-				kNeuralPaperWhiteMin, kNeuralPaperWhiteMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
-			hint("Use this if highlights look blown out in HDR.\n"
-				"1.00 changes nothing.");
-			if (ImGui::IsItemDeactivatedAfterEdit())
-				actions.persist = true;
-			if (ImGui::Checkbox("Highlight guard", &settings.neural_highlight_guard_on))
-				actions.persist = true;
-			hint("Limits how much brighter the effect may make a pixel.\n"
-				"Turn it on if bright edges glow; it costs some detail in shadows.");
-
-			ImGui::SeparatorText("Inspect");
-			{
-				static const RowOption kDebugOptions[] = {
-					{ "Off" },
-					{ "Input", "What the effect is given" },
-					{ "Output", "What the effect produces" },
-					{ "Difference", "What it is changing, exaggerated" },
-				};
-
-				button_row_index<kNeuralDebugViewCount>("Neural debug view", &settings.neural_debug_view, kDebugOptions,
-					"Shows one of the effect's internal images instead of the game.\n"
-					"Not saved between sessions.");
-				if (settings.neural_debug_view != 0u)
-					ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
-						"The game image is replaced by an inspection view.");
-			}
-
-			ImGui::SeparatorText("Guides");
-			if (ImGui::Checkbox("Run without depth", &settings.neural_no_depth)) {
-				actions.neural_restart = true;
-				actions.persist = true;
-			}
-			hint("Skips the depth buffer. Slightly faster, no visible difference.");
-
-			if (ImGui::Checkbox("Model without motion vectors", &settings.neural_no_motion_vectors)) {
-				actions.neural_restart = true;
-				actions.persist = true;
-			}
-			hint("Makes the effect judge each frame on its own.\n"
-				"Removes smearing around moving objects, and costs performance.");
-
-			ImGui::SeparatorText("Advanced");
-			{
-				static const RowOption kPassOptions[] = { { "1x" }, { "2x" }, { "3x" } };
-				static const unsigned int kPassValues[] = { 1u, 2u, 3u };
-				static_assert(IM_ARRAYSIZE(kPassValues) == static_cast<int>(kNeuralPassMax),
-					"the row must offer every pass count up to kNeuralPassMax");
-				if (button_row_value("Passes", &settings.neural_passes, kPassOptions, kPassValues,
-						"Runs the effect more than once for stronger detail.\n"
-						"Each extra pass costs as much as the first."))
-					actions.persist = true;
-
-				if (clamp_neural_passes(settings.neural_passes) > 1u &&
-					settings.neural_model_scale > 1u)
-					ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
-						"Extra passes are wasted below 80%% Detail.\n"
-						"Raise Detail, or set Passes back to 1x.");
-
-				{
-					const unsigned int cost_mode = clamp_neural_mode(settings.neural_mode);
-					const float rows = cost_mode == 0u ? 1.0f
-						: (state.neural_area_share > 0.0f ? state.neural_area_share
-							: kNeuralModeKeep[cost_mode] * kNeuralModeKeep[cost_mode]);
-					const float rel = neural_chain_relative_cost(
-						neural_model_scale_factor(settings.neural_model_scale),
-						settings.neural_passes, rows);
-					if (state.neural_gpu_ms > 0.0f) {
-						ImGui::Text("Neural pass: %.2f ms of GPU time per frame", state.neural_gpu_ms);
-						hint("How long this effect takes each frame.\n"
-							"A 60 fps frame has 16.7 ms in total, and the game needs most of it.");
-					}
-					ImGui::TextDisabled("These settings cost about %.2fx one pass at Full detail.", rel);
-
-					const unsigned int built = state.neural_passes_built;
-					if (built != 0 && built < clamp_neural_passes(settings.neural_passes))
-						ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
-							"Only %u pass%s could be created; that is what is running.",
-							built, built == 1u ? "" : "es");
-				}
-			}
-
-			if (ImGui::Checkbox("Reset on camera cut", &settings.neural_reset_on_cut))
-				actions.persist = true;
-			hint("Clears the effect's history on scene changes.\n"
-				"Off by default - it can make the lighting jump.");
-
-			{
-
-				static const RowOption kKeyOptions[] = { { "None" }, { "F5" }, { "F6" }, { "F7" }, { "F8" } };
-				static const unsigned int kKeyCodes[] = { 0u, 0x74u, 0x75u, 0x76u, 0x77u };
-				if (button_row_value("Toggle key", &settings.neural_toggle_key, kKeyOptions, kKeyCodes,
-						"Key that switches this effect on and off while playing."))
-					actions.persist = true;
-			}
-
-			if (ImGui::Button("Restart neural pass")) {
-				actions.neural_restart = true;
-				actions.persist = true;
-			}
-			hint("Reloads the effect. Try this if it stops working.");
-			ImGui::SameLine();
-			if (ImGui::Button("Capture neural frame"))
-				actions.neural_capture = true;
-			hint("Saves a few uncompressed frames to the captures folder beside the\n"
-				"add-on. Use these to compare image quality - a screen recording\n"
-				"adds noise of its own.");
-			if (!state.neural_capture_status.empty())
-				ImGui::TextWrapped("Capture: %s", narrow_lossy(state.neural_capture_status).c_str());
-		}
+		ImGui::TextDisabled("Resolution, mode and passes (Advanced) cost about %.2fx one pass at Full resolution.", rel);
 	}
 
+	ImGui::SeparatorText("Look");
+	{
+		static const RowOption kStyleOptions[] = {
+			{ "Standard", "Neutral" },
+			{ "Natural", "Brighter, livelier - can look shiny" },
+			{ "Cinematic", "Softer light" },
+		};
+		if (button_row_index<kNeuralStyleCount>("Style", &settings.neural_style, kStyleOptions,
+				"Overall look of the effect."))
+			actions.persist = true;
+	}
+	ImGui::SliderFloat("Detail strength", &settings.neural_detail_strength,
+		0.0f, kNeuralDetailMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	hint("How strong the added detail is. This is the main slider.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	ImGui::SliderFloat("Colour strength", &settings.neural_colour_strength,
+		0.0f, kNeuralUnitMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	hint("How much of the effect's colour is used.\n"
+		"0 keeps the game's own colours and changes only brightness.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	ImGui::SliderFloat("Neural intensity", &settings.neural_intensity, 0.0f, kNeuralUnitMax, "%.2f",
+		ImGuiSliderFlags_AlwaysClamp);
+	hint("Strength of the effect itself. It can only reduce it -\n"
+		"use Detail strength to push further.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	ImGui::SliderFloat("Local structure", &settings.neural_local_structure, 0.0f, kNeuralExtendedMax, "%.2f",
+		ImGuiSliderFlags_AlwaysClamp);
+	hint("Amount of fine detail. 1.00 is the default.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	ImGui::SliderFloat("Local tone", &settings.neural_local_tone, 0.0f, kNeuralExtendedMax, "%.2f",
+		ImGuiSliderFlags_AlwaysClamp);
+	hint("Local contrast. Lower it if the lighting reacts too strongly.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	ImGui::SliderFloat("Skin structure", &settings.neural_skin_structure,
+		kNeuralSkinMin, kNeuralSkinMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	hint("Detail on skin, set separately from the rest of the frame.");
+	if (ImGui::IsItemDeactivatedAfterEdit()) {
+		settings.neural_skin_structure = clamp_neural_skin(settings.neural_skin_structure);
+		actions.persist = true;
+	}
+	if (ImGui::Checkbox("Auto skin mask", &settings.neural_auto_mask))
+		actions.persist = true;
+	hint("Finds skin automatically for the slider above.");
+
+	ImGui::SeparatorText("Stability");
+	if (ImGui::Checkbox("Smoothing", &settings.neural_smoothing))
+		actions.persist = true;
+	hint("Steadies the effect between frames and removes trails behind\n"
+		"moving objects. Off shows the model's answer raw, which is\n"
+		"sharper and restless.");
+	if (ImGui::Checkbox("Model without motion vectors", &settings.neural_no_motion_vectors)) {
+		actions.neural_restart = true;
+		actions.persist = true;
+	}
+	hint("Makes the effect judge each frame on its own.\n"
+		"Removes smearing around moving objects, and costs performance.");
+	if (ImGui::Checkbox("Reset on camera cut", &settings.neural_reset_on_cut))
+		actions.persist = true;
+	hint("Clears the effect's history on scene changes.\n"
+		"Off by default - it can make the lighting jump.");
+
+	ImGui::SeparatorText("HDR and highlights");
+	ImGui::SliderFloat("Paper white", &settings.neural_paper_white,
+		kNeuralPaperWhiteMin, kNeuralPaperWhiteMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+	hint("Use this if highlights look blown out in HDR.\n"
+		"1.00 changes nothing.");
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	if (ImGui::Checkbox("Highlight guard", &settings.neural_highlight_guard_on))
+		actions.persist = true;
+	hint("Limits how much brighter the effect may make a pixel.\n"
+		"Turn it on if bright edges glow; it costs some detail in shadows.");
+
+	ImGui::SeparatorText("Tools");
+	{
+		static const RowOption kDebugOptions[] = {
+			{ "Off" },
+			{ "Input", "What the effect is given" },
+			{ "Output", "What the effect produces" },
+			{ "Difference", "What it is changing, exaggerated" },
+		};
+		button_row_index<kNeuralDebugViewCount>("Neural debug view", &settings.neural_debug_view, kDebugOptions,
+			"Shows one of the effect's internal images instead of the game.\n"
+			"Not saved between sessions.");
+		if (settings.neural_debug_view != 0u)
+			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
+				"The game image is replaced by an inspection view.");
+	}
+	{
+		static const RowOption kKeyOptions[] = { { "None" }, { "F5" }, { "F6" }, { "F7" }, { "F8" } };
+		static const unsigned int kKeyCodes[] = { 0u, 0x74u, 0x75u, 0x76u, 0x77u };
+		if (button_row_value("Toggle key", &settings.neural_toggle_key, kKeyOptions, kKeyCodes,
+				"Key that switches this effect on and off while playing."))
+			actions.persist = true;
+	}
+	if (ImGui::Button("Restart neural pass")) {
+		actions.neural_restart = true;
+		actions.persist = true;
+	}
+	hint("Reloads the effect. Try this if it stops working.");
+	if (state.scope_capture_enabled) {
+		ImGui::SameLine();
+		if (ImGui::Button("Capture neural frame"))
+			actions.neural_capture = true;
+		hint("Saves a few uncompressed frames to the captures folder beside the\n"
+			"add-on. Use these to compare image quality - a screen recording\n"
+			"adds noise of its own.");
+		if (!state.neural_capture_status.empty())
+			ImGui::TextWrapped("Capture: %s", narrow_lossy(state.neural_capture_status).c_str());
+	}
+
+	ImGui::SeparatorText("Advanced");
+	{
+		static const RowOption kPassOptions[] = { { "1x" }, { "2x" }, { "3x" } };
+		static const unsigned int kPassValues[] = { 1u, 2u, 3u };
+		static_assert(IM_ARRAYSIZE(kPassValues) == static_cast<int>(kNeuralPassMax),
+			"the row must offer every pass count up to kNeuralPassMax");
+		if (button_row_value("Passes", &settings.neural_passes, kPassOptions, kPassValues,
+				"Runs the effect more than once for stronger detail.\n"
+				"Each extra pass costs as much as the first; the cost under\n"
+				"Performance counts them."))
+			actions.persist = true;
+
+		if (clamp_neural_passes(settings.neural_passes) > 1u &&
+			settings.neural_model_scale > 1u)
+			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
+				"Extra passes are wasted below 80%% Resolution.\n"
+				"Raise Resolution, or set Passes back to 1x.");
+
+		const unsigned int built = state.neural_passes_built;
+		if (built != 0 && built < clamp_neural_passes(settings.neural_passes))
+			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
+				"Only %u pass%s could be created; that is what is running.",
+				built, built == 1u ? "" : "es");
+	}
 }
 
 void draw_experiments_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
-	ImGui::SeparatorText("Vendor profile");
+	ImGui::SeparatorText("Upscaler input");
 	static const RowOption kUpscaleOptions[] = {
 		{ "Native", "Full resolution - anti-aliasing only" },
 		{ "Ultra Quality", "Not offered by every upscaler; falls back to Quality" },
@@ -639,8 +505,8 @@ void draw_experiments_section(const PanelState &state, Settings &settings, Panel
 	};
 	constexpr unsigned int kUpscaleModeCount = static_cast<unsigned int>(UpscaleMode::UltraPerformance) + 1u;
 	if (button_row_index<kUpscaleModeCount>("Mode", &settings.upscale_mode, kUpscaleOptions,
-			"How much the game renders before upscaling.\n"
-			"Lower renders less and runs faster.")) {
+			"The resolution the upscaler works from. The game still renders at full\n"
+			"resolution: lower only makes the upscaler's own work cheaper, and loses detail.")) {
 		actions.reset = true;
 		actions.invalidate_history = true;
 		actions.persist = true;
@@ -662,7 +528,7 @@ void draw_experiments_section(const PanelState &state, Settings &settings, Panel
 			{ "16x" }, { "32x" }, { "64x", "Slowest, and it can look overcooked" },
 		};
 		static const unsigned int kAccumValues[] = { 2u, 4u, 8u, 16u, 32u, 64u };
-		if (button_row_value("Detail passes", &settings.accum_iterations,
+		if (button_row_value("Build passes", &settings.accum_iterations,
 				kAccumOptions, kAccumValues,
 				"How many times to run the effect over its own result."))
 			actions.persist = true;
@@ -677,14 +543,14 @@ void draw_experiments_section(const PanelState &state, Settings &settings, Panel
 			actions.accum_stop = true;
 		}
 		ImGui::EndDisabled();
-		if (state.upscalers_remote)
-			ImGui::TextDisabled("Not available in this game: the neural pass runs in a helper process.");
 		hint("Freezes the picture and keeps running the neural effect over its own\n"
 			"result, one pass per frame, so the image gets as much detail as a long\n"
 			"chain would without costing any extra performance.\n"
 			"\n"
 			"For screenshots only - the game keeps running underneath, but what you\n"
 			"see is held still until you press Release.");
+		if (state.upscalers_remote)
+			ImGui::TextDisabled("Not available in this game: the neural pass runs in a helper process.");
 
 		if (state.accum_running && !state.accum_holding) {
 			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
@@ -696,38 +562,7 @@ void draw_experiments_section(const PanelState &state, Settings &settings, Panel
 		} else if (!can_run) {
 			ImGui::TextDisabled("Needs neural rendering to be on and running.");
 		}
-
-		if (settings.neural_model_scale > 1u)
-			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
-				"Raise Detail to 80%% or Full first - below that the detail this\n"
-				"builds is lost again. It costs nothing extra here:\n"
-				"one pass a frame either way.");
 	}
-
-	ImGui::SeparatorText("Probe");
-	if (ImGui::Checkbox("Probe the motion vectors", &settings.mv_probe)) {
-		if (!settings.mv_probe)
-			actions.probe_reset = true;
-		actions.persist = true;
-	}
-	hint("Checks now and then that motion detection is working.");
-	if (settings.mv_probe) {
-		if (state.probe_unsupported) {
-			ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f),
-				"Probe: format cannot be read back (expected RG16F or RG32F).");
-		} else if (!state.probe_valid) {
-			ImGui::TextDisabled("Probe: waiting for the first sample...");
-		} else {
-			const bool dead = state.probe_nonzero_pct <= 0.0f;
-			ImGui::TextColored(dead ? ImVec4(0.95f, 0.4f, 0.4f, 1.0f) : ImVec4(0.4f, 0.9f, 0.4f, 1.0f),
-				"Probe: %.0f%% non-zero, mean %.2f px, max %.2f px",
-				state.probe_nonzero_pct, state.probe_mean_px, state.probe_max_px);
-			if (dead && state.probe_moving)
-				ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f),
-					"Camera moved and every vector was zero: the provider writes nothing.");
-		}
-	}
-
 }
 
 ImVec4 check_colour(CheckState s)
@@ -800,10 +635,63 @@ void draw_recent_problems()
 	}
 }
 
+void draw_neural_details(const PanelState &state, const Settings &settings)
+{
+	ImGui::SeparatorText("Neural rendering");
+	if (!settings.neural_render) {
+		ImGui::TextDisabled("Off.");
+		return;
+	}
+	if (state.upscalers_remote) {
+		ImGui::TextDisabled(state.host_ready
+			? "Runs in AeonSRHost.exe, beside the game."
+			: "Runs in AeonSRHost.exe, which starts with the first upscaled frame.");
+	} else if (!state.neural_dll_found) {
+		ImGui::TextDisabled("nvngx_dlssnr.dll: missing (supply your own)");
+	} else if (!state.neural_runtime_file.empty()) {
+		const size_t cut = state.neural_runtime_file.find_last_of(L"\\/");
+		const std::string name = narrow_lossy(cut == std::wstring::npos
+			? state.neural_runtime_file : state.neural_runtime_file.substr(cut + 1));
+		ImGui::TextDisabled("Runtime: %s, built for %s", name.c_str(),
+			state.neural_runtime_cards.empty() ? "unknown cards" : state.neural_runtime_cards.c_str());
+		hint("A build in runtime\\dlss5-allgpu\\ is tried first.");
+	}
+	if (state.neural_last == 1 && state.neural_model_width != 0)
+		ImGui::TextDisabled("Working at %ux%u.", state.neural_model_width, state.neural_model_height);
+	if (state.neural_required_driver_major != 0)
+		ImGui::TextDisabled("Driver: %u.%02u  (runtime requires %u.%u)",
+			state.neural_driver_major, state.neural_driver_minor,
+			state.neural_required_driver_major, state.neural_required_driver_minor);
+	if (state.neural_gpu_architecture != 0) {
+		if (state.neural_requirement_known && state.neural_min_architecture != 0)
+			ImGui::TextDisabled("GPU: 0x%03X (%s)   runtime minimum: 0x%03X (%s)",
+				state.neural_gpu_architecture,
+				neural_arch_name(state.neural_gpu_architecture),
+				state.neural_min_architecture,
+				neural_arch_name(state.neural_min_architecture));
+		else
+			ImGui::TextDisabled("GPU: 0x%03X (%s)   runtime minimum: not answered",
+				state.neural_gpu_architecture,
+				neural_arch_name(state.neural_gpu_architecture));
+	}
+	if (!state.neural_runtime_kernels.empty())
+		ImGui::TextDisabled("Runtime built for: %s", state.neural_runtime_kernels.c_str());
+	ImGui::TextDisabled("Frame colour space: %s",
+		state.neural_color_space == NeuralColorSpace::Pq ? "HDR10 (PQ)"
+		: state.neural_color_space == NeuralColorSpace::ScrgbLinear ? "scRGB (linear)"
+		: "SDR / sRGB");
+	ImGui::TextDisabled("Evals: %llu%s", static_cast<unsigned long long>(state.neural_eval_count),
+		state.neural_via_bridge ? "   (via D3D11on12 bridge)" : "");
+}
+
 void draw_diagnostics_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	ImGui::SeparatorText("Health");
 	draw_health(state, settings);
+
+	if (ImGui::Checkbox("Show on-screen status", &settings.show_osd))
+		actions.persist = true;
+	hint("Small status readout drawn over the game.");
 
 	ImGui::SeparatorText("Report");
 	draw_report_tools(state, settings, actions);
@@ -814,40 +702,40 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 	if (!ImGui::CollapsingHeader("Details"))
 		return;
 
-	ImGui::Text("Aeon SR %s   Build: %s   API: %s", state.version, state.build_stamp,
-		state.api_name != nullptr ? state.api_name : "unknown");
-	if (!state.gpu_name.empty())
-		ImGui::Text("GPU: %s   (%s, 0x%04X)", narrow_lossy(state.gpu_name).c_str(),
-			vendor_label(state.gpu_vendor), state.gpu_vendor_id);
-	ImGui::Text("Motion: %s   Depth: %s   Camera: %.2f px",
-		motion_provider_label(state.motion_provider),
-		depth_provider_label(state.depth_provider),
-		state.last_motion_px);
-	if (state.depth_provider == DepthProvider::None) {
-		ImGui::TextDisabled("No depth: pick the game's depth buffer in ReShade's own depth settings.");
-	} else {
-		ImGui::TextDisabled("Depth: %s%s%s, far %.0f%s", state.depth_reversed ? "reversed" : "normal",
-			state.depth_upside_down ? ", upside down" : "", state.depth_mirrored ? ", mirrored" : "",
-			state.depth_far_plane, state.depth_logarithmic ? ", logarithmic" : "");
-		hint("Taken from ReShade's preprocessor definitions; updates when you apply them.");
-		if (!state.depth_overridden.empty())
-			ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f), "Different depth inside: %s",
-				state.depth_overridden.c_str());
+	ImGui::Text("Aeon SR %s   Build: %s", state.version, state.build_stamp);
+	ImGui::Text("Camera motion: %.2f px", state.last_motion_px);
+	if (state.jitter_in_frame && state.jitter_still) {
+		ImGui::TextDisabled("Jitter: on - nothing drawn took it this frame, so the frame is left still.");
+	} else if (state.jitter_in_frame && state.jitter_mixed) {
+		ImGui::TextDisabled("Jitter: drawn into the game - mixed this frame, the upscaler was told none.");
+	} else if (state.jitter_in_frame && state.jitter_aliased_draws != 0) {
+		ImGui::TextDisabled("Jitter: drawn into the game, %u of %u draws moved, %u with another depth buffer.",
+			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws,
+			state.jitter_aliased_draws);
+	} else if (state.jitter_in_frame) {
+		ImGui::TextDisabled("Jitter: drawn into the game, %u of %u draws moved.",
+			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws);
+	} else if (settings.spatial_jitter && !state.jitter_refused && !state.jitter_active) {
+		ImGui::TextDisabled("Jitter: on, idle this frame.");
+	} else if (settings.spatial_jitter && !state.jitter_refused && state.jitter_note[0] != '\0') {
+		ImGui::TextDisabled("Jitter: resampled - %s.", state.jitter_note);
+	} else if (settings.spatial_jitter && !state.jitter_refused) {
+		ImGui::TextDisabled("Jitter: on, waiting for the game to draw a frame.");
 	}
-	{
-		if (state.flow_note.empty()) {
-			ImGui::TextDisabled("Motion: publishing.");
-		} else {
-			ImGui::TextDisabled("Motion: none - %s", narrow_lossy(state.flow_note).c_str());
-			hint("Every upscaler here needs motion to run.");
-		}
-		static const RowOption kFlowQuality[] = { { "Balanced" }, { "High" } };
-		if (button_row_index<2>("Motion quality", &settings.internal_flow_quality, kFlowQuality,
-				"How carefully motion is detected.\n"
-				"High is more accurate and costs a little more.")) {
-			actions.persist = true;
-		}
+	if (state.scope_capture_enabled && state.scope_have && ImGui::TreeNode("Jitter numbers")) {
+		draw_jitter_numbers(state, actions);
+		ImGui::TreePop();
 	}
+	if (ImGui::Checkbox("Probe the motion vectors", &settings.mv_probe)) {
+		if (!settings.mv_probe)
+			actions.probe_reset = true;
+		actions.persist = true;
+	}
+	hint("Checks now and then that motion detection is working; the result is\n"
+		"the Motion vectors row in Health.");
+	if (settings.mv_probe && state.probe_unsupported)
+		ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f),
+			"Probe: format cannot be read back (expected RG16F or RG32F).");
 
 	if (state.active_is_fsr || state.active_is_xess) {
 		const std::string label = !state.upscaler_label.empty() ? state.upscaler_label
@@ -889,30 +777,7 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 			state.ngx_width, state.ngx_height);
 	}
 
-	if (state.bridge_kind != BridgeKind::Native12 && state.bridge_name != nullptr) {
-		ImGui::TextDisabled("%s bridge: %s%s", state.api_name != nullptr ? state.api_name : "graphics",
-			state.bridge_any_ready ? state.bridge_name : "not ready",
-			state.bridge_fsr_adapter_matched ? "" : " (adapter not matched yet)");
-		hint("Every upscaler here is DirectX 12 work. Set up automatically so a\n"
-			"game on any other graphics API can use them, and motion detection.");
-		if (state.bridge_sync != nullptr) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("[%s]", state.bridge_sync);
-		}
-	} else if (state.bridge_name == nullptr && !state.bridge_error.empty()) {
-		ImGui::TextDisabled("No bridge for this graphics API.");
-		hint("The add-on could not reach a DirectX 12 device from this game.");
-	}
-
-	if (!state.game_ngx_modules.empty())
-		ImGui::TextWrapped("The game already uses DLSS (%s); running a second one may be unstable.",
-			narrow_lossy(state.game_ngx_modules).c_str());
-	if (!state.game_fsr_modules.empty())
-		ImGui::TextWrapped("The game already uses FSR (%s); running a second one may be unstable.",
-			narrow_lossy(state.game_fsr_modules).c_str());
-	if (!state.game_xess_modules.empty())
-		ImGui::TextWrapped("The game already uses XeSS (%s); running a second one may be unstable.",
-			narrow_lossy(state.game_xess_modules).c_str());
+	draw_neural_details(state, settings);
 
 	ImGui::Separator();
 	static const RowOption kDebugViewOptions[] = {
@@ -953,7 +818,7 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 
 }
 
-void draw_overlay(const PanelState &state, Settings &settings, PanelActions &actions)
+void draw_taa_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	bool enabled = settings.enabled;
 	if (ImGui::Checkbox("Enable upscaler", &enabled)) {
@@ -980,34 +845,9 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 	if (settings.backend == static_cast<unsigned>(BackendChoice::None)) {
 		ImGui::TextDisabled("Active: none - the frame is left as the game rendered it.");
 	} else if (!state.upscaler_label.empty() || state.active_name != nullptr) {
-		ImGui::Text("Active: %s   Status: %s",
+		ImGui::Text("Active: %s   Status: %s%s",
 			!state.upscaler_label.empty() ? state.upscaler_label.c_str() : state.active_name,
-			status_label(state.active_status));
-	}
-	if (!state.active_error.empty())
-		ImGui::TextWrapped("Detail: %s", narrow_lossy(state.active_error).c_str());
-
-	if (state.native_dlss) {
-		ImGui::TextDisabled("The game loaded NVIDIA's DLSS or Streamline itself (%s).",
-			narrow_lossy(state.native_dlss_modules).c_str());
-		if (state.host_ready)
-			ImGui::TextDisabled("Aeon SR's DLSS runs in AeonSRHost.exe, apart from the game's.");
-		hint("Read from what the game has loaded, not from the files in its folder.\n"
-			"If the game's DLSS is on, use it and set the upscaler here to None:\n"
-			"two upscalers in a row cause trailing.");
-	} else {
-		ImGui::TextDisabled("The game has not loaded DLSS of its own.");
-		hint("Read from what the game has loaded, not from the files in its folder.");
-	}
-	if (!state.ngx_layer.empty() && state.ngx_layer_relevant) {
-		ImGui::TextDisabled("%s is loaded in this game. Aeon SR's DLSS and DLSS neural rendering run in "
-			"AeonSRHost.exe, apart from it%s.", narrow_lossy(state.ngx_layer).c_str(),
-			state.host_ready ? "" : !state.host_error.empty() ? ", which did not start" : " (starting)");
-		if (!state.host_ready && !state.host_error.empty())
-			ImGui::TextDisabled("AeonSRHost.exe: %s", narrow_lossy(state.host_error).c_str());
-		hint("That program answers DLSS calls inside the game. Aeon SR runs its own in a process\n"
-			"of its own, so both work. Found by what the program does, not by its file name,\n"
-			"which it borrows from Windows.");
+			status_label(state.active_status), state.active_error.empty() ? "" : " - see Diagnostics");
 	}
 
 	if (state.active_is_fsr && state.fsr_providers.size() > 1) {
@@ -1031,19 +871,15 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 	if (state.active_is_vsr && !state.vsr_possible)
 		ImGui::TextDisabled("RTX VSR runs through the DirectX 11 video processor, so it is only "
 			"available in a DirectX 11 game. Use DLSS, FSR or XeSS.");
-	else if (state.active_is_vsr)
-		ImGui::TextDisabled("Driver: %s  %s  in use: %s  level %u",
-			state.vsr_capable ? "VSR capable" : "not VSR capable",
-			state.vsr_enabled ? "enhancement on" : "enhancement OFF (Control Panel)",
-			state.vsr_in_use ? "yes" : "no", state.vsr_level);
 
-	if (ImGui::Checkbox("Show on-screen status", &settings.show_osd))
-		actions.persist = true;
-	hint("Small status readout drawn over the game.");
+	draw_quality_section(state, settings, actions);
+}
 
-	if (ImGui::CollapsingHeader("Quality", ImGuiTreeNodeFlags_DefaultOpen))
-		draw_quality_section(state, settings, actions);
-	if (ImGui::CollapsingHeader("Neural rendering (experimental)"))
+void draw_overlay(const PanelState &state, Settings &settings, PanelActions &actions)
+{
+	if (ImGui::CollapsingHeader("Temporal Anti-Aliasing", ImGuiTreeNodeFlags_DefaultOpen))
+		draw_taa_section(state, settings, actions);
+	if (ImGui::CollapsingHeader("Neural Rendering"))
 		draw_neural_section(state, settings, actions);
 	if (ImGui::CollapsingHeader("Experiments"))
 		draw_experiments_section(state, settings, actions);
@@ -1062,11 +898,6 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 			draw_diagnostics_section(state, settings, actions);
 	}
 
-	ImGui::Spacing();
-	if (ImGui::Button("Reset temporal history"))
-		actions.reset = true;
-	hint("Clears what the upscaler remembers from previous frames.\n"
-		"Try this after a glitch.");
 }
 
 void draw_osd(const PanelState &state, const Settings &settings)

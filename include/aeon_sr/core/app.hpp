@@ -2,6 +2,11 @@
 
 #include "aeon_sr/upscalers/upscaler_capture.hpp"
 #include "aeon_sr/core/imgui_reshade.hpp"
+#include "aeon_sr/core/present_drive.hpp"
+
+#include <algorithm>
+#include <mutex>
+#include <vector>
 #include "aeon_sr/upscalers/backend_dlss.hpp"
 #include "aeon_sr/upscalers/backend_fsr.hpp"
 #include "aeon_sr/upscalers/backend_vsr.hpp"
@@ -54,6 +59,9 @@ public:
 		reshade::api::resource_view rtv_srgb);
 	void on_reloaded_effects(reshade::api::effect_runtime *runtime);
 	void on_present(reshade::api::effect_runtime *runtime);
+	void on_init_effect_runtime(reshade::api::effect_runtime *runtime);
+	void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime);
+	void on_game_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain);
 
 	void run_frame(reshade::api::effect_runtime *runtime,
 		reshade::api::command_list *cmd_list, reshade::api::resource_view rtv, bool after_effects);
@@ -200,6 +208,14 @@ private:
 	uint32_t seen_drawn_ = 0, seen_empty_ = 0, seen_other_ = 0, seen_changes_ = 0, seen_split_ = 0;
 	int seen_last_ = -1;
 	void detect_interface(const FrameInputs &inputs);
+	struct RuntimeDrive {
+		reshade::api::effect_runtime *runtime = nullptr;
+		reshade::api::device *device = nullptr;
+		void *hwnd = nullptr;
+		PresentDrive drive;
+	};
+	std::mutex runtimes_lock_;
+	std::vector<RuntimeDrive> runtimes_;
 	UpscalerCaptureD3D12 upscaler_capture_;
 	std::wstring upscaler_capture_logged_;
 	std::wstring scope_logged_;

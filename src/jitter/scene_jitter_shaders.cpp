@@ -570,6 +570,8 @@ void destroy_pipeline(device *device, pipeline pipeline)
 
 void bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline pipeline)
 {
+	if (cmd == nullptr)
+		return;
 	const auto bits = static_cast<uint32_t>(stages);
 	const bool cleared = stages == pipeline_stage::all && pipeline.handle == 0;
 	if (!cleared && (bits & (static_cast<uint32_t>(pipeline_stage::vertex_shader) |
@@ -594,6 +596,8 @@ void bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline pipeline)
 void push_constants(command_list *cmd, shader_stage stages, pipeline_layout, uint32_t param, uint32_t first,
 	uint32_t count, const void *values)
 {
+	if (cmd == nullptr)
+		return;
 	if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(shader_stage::vertex)) == 0 || param != 2u ||
 		values == nullptr || cmd->get_device()->get_api() != device_api::d3d9)
 		return;
@@ -618,6 +622,8 @@ void push_constants(command_list *cmd, shader_stage stages, pipeline_layout, uin
 void bind_stream_output(command_list *cmd, uint32_t first, uint32_t count, const resource *buffers,
 	const uint64_t *, const uint64_t *, const resource *, const uint64_t *)
 {
+	if (cmd == nullptr)
+		return;
 	if (first != 0 || count == 0 || buffers == nullptr || cmd->get_device()->get_api() != device_api::d3d9)
 		return;
 	state_of(cmd).stream_out = buffers[0].handle != 0;
@@ -626,6 +632,8 @@ void bind_stream_output(command_list *cmd, uint32_t first, uint32_t count, const
 void push_descriptors(command_list *cmd, shader_stage stages, pipeline_layout, uint32_t,
 	const descriptor_table_update &update)
 {
+	if (cmd == nullptr)
+		return;
 	if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(shader_stage::vertex)) == 0 ||
 		update.type != descriptor_type::constant_buffer || cmd->get_device()->get_api() != device_api::d3d10)
 		return;
@@ -644,6 +652,8 @@ void forget_game_registers() noexcept
 
 void destroy_command_list(command_list *cmd)
 {
+	if (cmd == nullptr)
+		return;
 	if (cmd->get_private_data<ShaderJitterState>() != nullptr)
 		cmd->destroy_private_data<ShaderJitterState>();
 }

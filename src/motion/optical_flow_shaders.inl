@@ -651,8 +651,9 @@ static const float kPhotoGrad = 0.002;
 static const float kTextureShare = 0.008;
 static const float kExtraPhotoTake = 0.5;
 static const float kPhotoSigma = 4.0;
+static const float kWarmAgree = 0.5;
 static const float kStructFloor = 2e-5;
-static const uint kTerms = 76;
+static const uint kTerms = 80;
 
 float2 norm_of(float2 uv) { return (uv - 0.5) * float2(norm_x, 2.0); }
 
@@ -851,12 +852,17 @@ void CSModelTerms(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi 
 {
 	const bool cold = model_cold();
 	float th[11];
-	load_fit(th, cold && model_iter == 0u);
+	load_fit(th, model_iter == 0u);
+	float carried[11];
+	load_fit(carried, false);
+	const bool probe = model_iter == 0u && !cold;
 	float sigma;
-	if (cold)
-		sigma = (model_iter == 0u) ? 0.0 : ((model_iter == 1u) ? 4.0 : ((model_iter == 2u) ? 2.0 : 1.5));
+	if (model_iter == 0u)
+		sigma = 0.0;
+	else if (cold)
+		sigma = (model_iter == 1u) ? 4.0 : ((model_iter == 2u) ? 2.0 : 1.5);
 	else
-		sigma = (model_iter == 0u) ? 3.0 : ((model_iter == 1u) ? 2.0 : 1.5);
+		sigma = (model_iter == 1u) ? 2.0 : 1.5;
 
 	float acc[kTerms];
 	[unroll]
@@ -909,6 +915,14 @@ void CSModelTerms(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi 
 		acc[71] += base;
 		acc[72] += base * wn * lerp(wt, 1.0, l);
 		acc[73] += st.z * (1.0 - l) * wn * wt;
+		if (probe) {
+			const float2 r = (model_at(carried, x, rho) - xp) * px_per_unit;
+			const float en = dot(r, n) / (3.0 * lerp(kTexTol, kLineTol, l));
+			const float et = dot(r, tg) / (3.0 * kTexTol);
+			const float gn = 1.0 + en * en, gt = 1.0 + et * et;
+			acc[76] += base;
+			acc[77] += base * lerp(1.0 / (gt * gt), 1.0, l) / (gn * gn);
+		}
 		if (st.z > 0.3) {
 			acc[74] += 1.0;
 			acc[75] += (all(abs(f * float2(norm_x, 2.0) * px_per_unit) < 0.01)) ? 1.0 : 0.0;
@@ -1028,7 +1042,7 @@ void CSModelSolve(uint3 tid : SV_GroupThreadID)
 			dmax = max(dmax, system_entry(d, d));
 		gsD[t] = rsqrt(max(system_entry(t, t), dmax * 1e-10 + 1e-30));
 		float cur = Theta.Load(int3(t, 0, 0));
-		if ((cold && model_iter == 0u) || !(cur == cur) || !(abs(cur) < 1e4))
+		if (model_iter == 0u || !(cur == cur) || !(abs(cur) < 1e4))
 			cur = (t == 0u || t == 4u) ? 1.0 : 0.0;
 		gsP[t] = cur;
 	}
@@ -1097,17 +1111,26 @@ void CSModelSolve(uint3 tid : SV_GroupThreadID)
 			abs(th[1]) < 0.5 && abs(th[3]) < 0.5 && abs(th[6]) < 0.5 && abs(th[7]) < 0.5 &&
 			abs(th[2]) < 0.3 * norm_x && abs(th[5]) < 0.6;
 		const float take = (model_iter >= 6u) ? kExtraPhotoTake : 1.0;
+		float carried[11];
+		bool warm = model_iter == 0u && !cold && gsSum[76] > 0.0 && gsSum[77] >= kWarmAgree * gsSum[76];
+		[unroll]
+		for (int c0 = 0; c0 < 11; ++c0) {
+			carried[c0] = Theta.Load(int3(c0, 0, 0));
+			warm = warm && (carried[c0] == carried[c0]) && abs(carried[c0]) < 1e4;
+		}
 		[unroll]
 		for (int o = 0; o < 11; ++o)
-			OutS[uint2(o, 0)] = ok ? lerp(gsP[o], th[o], take) : gsP[o];
+			OutS[uint2(o, 0)] = warm ? carried[o] : (ok ? lerp(gsP[o], th[o], take) : gsP[o]);
 		const bool photo = model_iter >= 4u;
-		OutS[uint2(0, 1)] = ok ? 1.0 : 0.0;
+		OutS[uint2(0, 1)] = (ok || warm) ? 1.0 : 0.0;
 		OutS[uint2(1, 1)] = photo ? Theta.Load(int3(1, 1, 0)) : gsSum[72] / max(gsSum[71], 1e-6);
 		OutS[uint2(2, 1)] = photo ? Theta.Load(int3(2, 1, 0)) : gsSum[71];
-		OutS[uint2(3, 1)] = cold ? 1.0 : 0.0;
+		OutS[uint2(3, 1)] = (model_iter == 0u) ? (warm ? 0.0 : 1.0) : (cold ? 1.0 : 0.0);
 		OutS[uint2(4, 1)] = photo ? gsSum[72] / max(gsSum[71], 1e-6) : 0.0;
 		OutS[uint2(5, 1)] = photo ? Theta.Load(int3(5, 1, 0)) : gsSum[73];
 		OutS[uint2(6, 1)] = photo ? Theta.Load(int3(6, 1, 0)) : gsSum[75] / max(gsSum[74], 1.0);
+		OutS[uint2(7, 1)] = (model_iter == 0u) ? ((gsSum[76] > 0.0) ? gsSum[77] / gsSum[76] : -1.0)
+			: Theta.Load(int3(7, 1, 0));
 	}
 }
 )HLSL"
@@ -1117,8 +1140,14 @@ static const float kPublishSnapPx = 0.35;
 static const float kCrossSwitchPx = 0.20;
 static const float kCrossQuality = 0.5;
 static const float kCrossDistrust = 2.0;
+static const float kVerdictShare = 0.25;
+static const float kLandedReach = 4.0;
+static const float kLandedOff = 0.6;
+static const float kLandedFit = 0.8;
+static const float kLandedEvidence = 0.3;
 static const float kLandingDecay = 0.98;
-
+)HLSL"
+R"HLSL(
 float frame_apart(float a[11], float b[11])
 {
 	float s = 0.0;
@@ -1199,7 +1228,7 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 				switched[k9] = OutS[uint2(k9, 7)];
 				before[k9] = OutS[uint2(3 + k9, 6)];
 			}
-			const bool against = frame_apart(raw, before) < frame_apart(raw, switched);
+			const bool against = frame_apart(raw, before) < kVerdictShare * frame_apart(raw, switched);
 			distrust = against ? min(distrust + 1.0, 8.0) : max(distrust - 1.0, 0.0);
 			OutS[uint2(13, 7)] = against ? 1.0 : -1.0;
 		}
@@ -1230,6 +1259,26 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 			OutS[uint2(15, 6)] = sums.y;
 			OutS[uint2(14, 7)] = sums.z;
 			OutS[uint2(15, 7)] = sums.w;
+			const bool near_x = abs(lm.x) <= kLandedReach * mm.x + tol.x;
+			const bool near_y = abs(lm.y) <= kLandedReach * mm.y + tol.y;
+			const float2 ll = left * left;
+			[unroll]
+			for (int a = 0; a < 2; ++a) {
+				const bool near = (a == 0) ? near_x : near_y;
+				const float3 add = (a == 0) ? float3(lm.x, mm.x, ll.x) : float3(lm.y, mm.y, ll.y);
+				float3 about = float3(OutS[uint2(8 + 3 * a, 1)], OutS[uint2(9 + 3 * a, 1)], OutS[uint2(10 + 3 * a, 1)]);
+				about = (all(about == about) ? about : float3(0.0, 0.0, 0.0)) * kLandingDecay + (near ? add : float3(0.0, 0.0, 0.0));
+				OutS[uint2(8 + 3 * a, 1)] = about.x;
+				OutS[uint2(9 + 3 * a, 1)] = about.y;
+				OutS[uint2(10 + 3 * a, 1)] = about.z;
+			}
+		}
+		bool mislands = false;
+		[unroll]
+		for (int a2 = 0; a2 < 2; ++a2) {
+			const float slm = OutS[uint2(8 + 3 * a2, 1)], smm = OutS[uint2(9 + 3 * a2, 1)], sll = OutS[uint2(10 + 3 * a2, 1)];
+			mislands = mislands || (smm >= kLandedEvidence && abs(slm) > kLandedOff * smm &&
+				slm * slm >= kLandedFit * smm * sll);
 		}
 		if (asks) {
 			[unroll]
@@ -1239,7 +1288,7 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 			}
 			OutS[uint2(11, 7)] = 1.0;
 		}
-		keep = !asks || distrust >= kCrossDistrust;
+		keep = !asks || (distrust >= kCrossDistrust && mislands);
 		n = 0u;
 	}
 	OutS[uint2(12, 7)] = distrust;
@@ -1288,7 +1337,7 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 		OutS[uint2(k6, 0)] = s / float(n);
 	}
 	[unroll]
-	for (int c = 0; c < 16; ++c)
+	for (int c = 0; c < 8; ++c)
 		OutS[uint2(c, 1)] = Theta.Load(int3(c, 1, 0));
 	[unroll]
 	for (int r5 = 0; r5 < 4; ++r5) {
@@ -1460,11 +1509,37 @@ float pixel_rho(float2 uv)
 	return (off > 0.02 * mean + 1e-6) ? near_rho : r[4];
 }
 
+void fuse_kept(uint2 p, float2 uv)
+{
+	if ((model_flags & 4u) == 0u || has_depth == 0u)
+		return;
+	const float2 old = PrevFlow.Load(int3(p, 0));
+	if (invalid_flow(old))
+		return;
+	float alpha = Aux.SampleLevel(LinearClamp, uv, 0);
+	alpha = (alpha == alpha) ? saturate(alpha) : 0.0;
+	if (!(alpha > 0.0))
+		return;
+	float th[11];
+	[unroll]
+	for (int k = 0; k < 11; ++k)
+		th[k] = Theta.Load(int3(k, 0, 0));
+	const float2 x = norm_of(uv);
+	const float2 m = (model_at(th, x, pixel_rho(uv)) - x) / float2(norm_x, 2.0);
+	const float2 flow = lerp(old, m, alpha);
+	if (!invalid_flow(m) && !invalid_flow(flow))
+		OutV[p] = flow;
+}
+
 [numthreads(8, 8, 1)]
 void CSFuse(uint3 id : SV_DispatchThreadID)
 {
-	if (any(id.xy >= dst) || Theta.Load(int3(1, 6, 0)) > 0.5)
+	if (any(id.xy >= dst))
 		return;
+	if (Theta.Load(int3(1, 6, 0)) > 0.5) {
+		fuse_kept(id.xy, uv_of(id.xy));
+		return;
+	}
 	const float2 uv = uv_of(id.xy);
 	float2 flow = SrcFlow.SampleLevel(LinearClamp, uv, 0);
 	float conf = Conf.SampleLevel(LinearClamp, uv, 0);

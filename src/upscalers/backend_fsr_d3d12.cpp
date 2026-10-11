@@ -105,20 +105,6 @@ reshade::api::device_api Fsr4D3D12Backend::api() const
 	return reshade::api::device_api::d3d12;
 }
 
-void Fsr4D3D12Backend::scan_game_fsr_modules()
-{
-	std::wstring found;
-	for (const wchar_t *m : { L"amd_fidelityfx_upscaler_dx12.dll", L"amd_fidelityfx_loader_dx12.dll",
-			L"amd_fidelityfx_dx12.dll", L"OptiScaler.dll", L"libxess_dx11.dll" }) {
-		if (GetModuleHandleW(m) != nullptr) {
-			if (!found.empty())
-				found += L", ";
-			found += m;
-		}
-	}
-	game_fsr_modules = found;
-}
-
 bool Fsr4D3D12Backend::ensure_dll_present()
 {
 	if (fsr_loading())
@@ -367,7 +353,6 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 
 	QueryPerformanceCounter(&t_dll);
 
-	scan_game_fsr_modules();
 	enumerate_providers(device);
 
 	if (build_scale_ > 0.0f) {

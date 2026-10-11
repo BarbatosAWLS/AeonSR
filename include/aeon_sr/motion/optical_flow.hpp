@@ -181,6 +181,7 @@ private:
 	Tex motion_, confidence_;
 	Tex struct_q_, partials_, sums_, theta_[2], alpha_q_;
 	Tex theta_pub_;
+	Tex kept_motion_;
 	bool model_cold_ = true;
 	bool model_ran_ = false;
 	bool model_textures_ = false;

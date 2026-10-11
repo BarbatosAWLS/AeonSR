@@ -124,6 +124,24 @@ NativeDlss classify_native_dlss(const std::vector<std::wstring> &module_paths, c
 		if (kind == DlssModuleKind::None)
 			continue;
 		bool counts = false;
+		const auto own_load = [&]() {
+			if (!own_ngx_started)
+				return false;
+			if (std::find(before.begin(), before.end(), canonical(path)) != before.end())
+				return false;
+			if (dlss_module_from_driver_store(path))
+				return true;
+			if (own_runtime.empty())
+				return false;
+			const std::wstring own = canonical(own_runtime);
+			const size_t slash = own.find_last_of(L'\\');
+			const std::wstring own_dir = slash == std::wstring::npos ? std::wstring() : own.substr(0, slash + 1);
+			const std::wstring here = canonical(path);
+			if (kind == DlssModuleKind::Dlss)
+				return same_module_file(path, own_runtime);
+			const bool beside = here.rfind(own_dir, 0) == 0 && here.find(L'\\', own_dir.size()) == std::wstring::npos;
+			return !own_dir.empty() && (beside || same_module_file(path, own_dir + file_name(here)));
+		};
 		switch (kind) {
 		case DlssModuleKind::Streamline:
 			out.streamline = true;
@@ -132,20 +150,17 @@ NativeDlss classify_native_dlss(const std::vector<std::wstring> &module_paths, c
 		case DlssModuleKind::NgxCore:
 			out.ngx_core = true;
 			break;
-		case DlssModuleKind::Dlss: {
+		case DlssModuleKind::Dlss:
 			out.dlss = true;
-			const bool was_before = std::find(before.begin(), before.end(), canonical(path)) != before.end();
-			counts = !own_ngx_started || was_before ||
-				(!dlss_module_from_driver_store(path) && !same_module_file(path, own_runtime));
+			counts = !own_load();
 			break;
-		}
 		case DlssModuleKind::FrameGeneration:
 			out.frame_generation = true;
-			counts = true;
+			counts = !own_load();
 			break;
 		case DlssModuleKind::RayReconstruction:
 			out.ray_reconstruction = true;
-			counts = true;
+			counts = !own_load();
 			break;
 		default:
 			break;

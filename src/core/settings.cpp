@@ -393,6 +393,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.jitter_scene_rule = v <= 2ul ? static_cast<unsigned int>(v) : 0u;
 		}
 		else if (key == "JitterTestedQuads") out.jitter_tested_quads = parse_bool(val);
+		else if (key == "DepthRegrid") out.depth_regrid = parse_bool(val);
 		else if (key == "UpscalerCapture") out.upscaler_capture = parse_bool(val);
 		else if (key == "ScopeCapture") out.scope_capture = parse_bool(val);
 		else if (key == "ScopeFrames") {
@@ -409,7 +410,6 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 		else if (key == "ForceSystemMemory") out.force_system_memory = parse_bool(val);
 		else if (key == "DebugInfo") out.debug_info = parse_bool(val);
 		else if (key == "VerboseLog") out.verbose_log = parse_bool(val);
-		else if (key == "InternalFlowQuality") out.internal_flow_quality = parse_bool(val) ? 1u : 0u;
 		else if (key == "DebugView") {
 			const unsigned int v = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
 			out.debug_view = (v < kDebugViewCount) ? v : 0u;
@@ -474,6 +474,8 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "JitterSceneRule=" << (in.jitter_scene_rule <= 2u ? in.jitter_scene_rule : 0u) << "\n";
 	if (!in.jitter_tested_quads)
 		out << "JitterTestedQuads=0\n";
+	if (!in.depth_regrid)
+		out << "DepthRegrid=0\n";
 	out << "UpscalerCapture=" << (in.upscaler_capture ? 1 : 0) << "\n";
 	out << "ScopeCapture=" << (in.scope_capture ? 1 : 0) << "\n";
 	out << "ScopeFrames=" << (in.scope_frames >= 1u && in.scope_frames <= kScopeFramesMax
@@ -492,7 +494,6 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "DebugInfo=" << (in.debug_info ? 1 : 0) << "\n";
 	out << "VerboseLog=" << (in.verbose_log ? 1 : 0) << "\n";
 	out << "DebugView=" << (in.debug_view < kDebugViewCount ? in.debug_view : 0u) << "\n";
-	out << "InternalFlowQuality=" << (in.internal_flow_quality != 0u ? 1 : 0) << "\n";
 }
 
 }

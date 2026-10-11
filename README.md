@@ -27,14 +27,15 @@ Author: **Barbatos AWLS**
 ## Download
 
 Ready-to-install packages are on the [Releases](../../releases) page. Each one
-holds the add-on, `AeonSRHost.exe`, `ngxshim\`, `runtime\` with the vendor DLLs
+holds the add-on, `AeonSR.addonfx`, `AeonSRHost.exe`, `ngxshim\`, `runtime\` with the vendor DLLs
 listed below, and `Licenses\` with every vendor's licence.
 
 ## Installing
 
 1. Install ReShade **with add-on support** for the game.
 2. Copy the add-on (`AeonSR.addon64`, or `AeonSR.addon32` for a 32-bit game),
-   `AeonSRHost.exe`, `ngxshim\` and `runtime\` next to the game's executable.
+   `AeonSR.addonfx`, `AeonSRHost.exe`, `ngxshim\` and `runtime\` next to the game's
+   executable.
 3. Open the ReShade overlay and configure Aeon SR in its Add-ons tab.
 
 Do not use Aeon SR in games protected by anti-cheat.
@@ -148,7 +149,7 @@ Vulkan headers. The FidelityFX API and DX11 headers, the OpenGL headers and the
 XeSS declarations the add-on compiles against are in `third_party/`.
 
 The x64 build produces, in `build\x64\Release\`, `AeonSR.addon64`,
-`AeonSRHost.exe` (the 64-bit process that runs DLSS, FSR and XeSS for 32-bit
+`AeonSR.addonfx`, `AeonSRHost.exe` (the 64-bit process that runs DLSS, FSR and XeSS for 32-bit
 games), `ngxshim\nvngx.dll` and `runtime\` with the vendor DLLs. The Win32 build
 produces `AeonSR.addon32`; a 32-bit game also needs `AeonSRHost.exe` and
 `runtime\` from the x64 build next to it.

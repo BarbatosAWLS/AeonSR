@@ -561,7 +561,10 @@ private:
 				return true;
 			if (FAILED(hr) || GetTickCount64() > deadline)
 				return false;
-			Sleep(poll < 256 ? 0 : 1);
+			if (poll < 256)
+				Sleep(0);
+			else
+				bridge_util::short_wait();
 		}
 	}
 
@@ -817,7 +820,10 @@ private:
 				return true;
 			if (FAILED(hr) || GetTickCount64() > deadline)
 				return false;
-			Sleep(poll < 256 ? 0 : 1);
+			if (poll < 256)
+				Sleep(0);
+			else
+				bridge_util::short_wait();
 		}
 	}
 

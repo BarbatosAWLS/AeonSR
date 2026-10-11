@@ -55,6 +55,7 @@ static const uint kRun = 0xFFu;
 static const uint kBudget = 0xFF00u;
 static const uint kMember = 1u << 16;
 static const uint kSame = 1u << 17;
+static const uint kOver = 1u << 18;
 
 float luma(float3 c)
 {
@@ -124,11 +125,11 @@ void CSMask(uint3 id : SV_DispatchThreadID)
 		if (member)
 			budget = (uint)cap;
 	}
-	state_out[p] = (s & (kRun | kSame)) | (budget << 8) | (member ? kMember : 0u);
+	const bool interface_drawn = split > 0.5 && any(frame_now.Load(int3(p, 0)).rgb != frame_before.Load(int3(p, 0)).rgb);
+	state_out[p] = (s & (kRun | kSame)) | (budget << 8) | (member ? kMember : 0u) | (interface_drawn ? kOver : 0u);
 	if ((s & kSame) != 0 && (gain > 0.5 || drawn < 0.5))
 		stable_out[p] = frame_now.Load(int3(p, 0));
 	const bool shown = (s & kSame) != 0 && ((s & kRun) != 0 || drawn < 0.5);
-	const bool interface_drawn = split > 0.5 && any(frame_now.Load(int3(p, 0)).rgb != frame_before.Load(int3(p, 0)).rgb);
 	mask_out[p] = interface_drawn ? 1.0 : !member ? 0.0 : (shown ? 1.0 : 128.0 / 255.0);
 }
 
@@ -157,12 +158,18 @@ float transparency(int2 p)
 	return saturate(m.x / m.y);
 }
 
+bool still_under_interface(int2 p)
+{
+	const uint s = state_in.Load(int3(p, 0));
+	return (s & kMember) != 0 && (s & kOver) == 0;
+}
+
 [numthreads(8, 8, 1)]
 void CSClear(uint3 id : SV_DispatchThreadID)
 {
 	if (id.x >= (uint)size.x || id.y >= (uint)size.y)
 		return;
-	if (mask_in.Load(int3(id.xy, 0)) > 0.25)
+	if (still_under_interface(int2(id.xy)))
 		motion_out[id.xy] = 0.0;
 }
 
@@ -212,7 +219,7 @@ float4 PSRegister(VSOut i) : SV_Target
 
 float4 PSClear(VSOut i) : SV_Target
 {
-	if (mask_in.Load(int3(int2(i.pos.xy), 0)) < 0.25)
+	if (!still_under_interface(int2(i.pos.xy)))
 		discard;
 	return 0.0;
 }
@@ -709,7 +716,7 @@ bool HudRestoreD3D12::draw(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	write_srv(device, slot, 0, frames_[cur_]);
 	write_srv(device, slot, 1, nullptr);
 	write_srv(device, slot, 2, core_);
-	write_srv(device, slot, 3, nullptr);
+	write_srv(device, slot, 3, kind == Clear ? state_[0] : nullptr);
 	write_srv(device, slot, 4, stable_);
 	write_srv(device, slot, 5, frame_.scene != nullptr ? trans_[trans_cur_] : nullptr);
 	write_srv(device, slot, 6, frame_.scene != nullptr ? scenes_[cur_] : nullptr);
@@ -768,7 +775,7 @@ bool HudRestoreD3D12::clear_motion(ID3D12Device *device, ID3D12GraphicsCommandLi
 
 	const Slot slot = next_slot();
 	for (uint32_t i = 0; i < kSrvCount; ++i)
-		write_srv(device, slot, i, i == 2 ? core_ : nullptr);
+		write_srv(device, slot, i, i == 3 ? state_[0] : nullptr);
 	for (uint32_t i = 0; i < kUavCount; ++i)
 		write_uav(device, slot, i, i == 2 ? motion : nullptr);
 	float c[kConstantCount];

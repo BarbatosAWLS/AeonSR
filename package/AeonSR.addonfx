@@ -1,0 +1,4 @@
+texture AeonSRDummy { Width = 1; Height = 1; Format = R8; };
+void AeonSRVS(in uint id : SV_VertexID, out float4 pos : SV_Position) { pos = float4(0.0, 0.0, 0.0, 1.0); }
+float4 AeonSRPS(float4 pos : SV_Position) : SV_Target { return 0.0; }
+technique AeonSR < hidden = true; enabled = false; > { pass { VertexShader = AeonSRVS; PixelShader = AeonSRPS; RenderTarget = AeonSRDummy; } }

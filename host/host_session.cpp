@@ -507,11 +507,8 @@ void HostSession::run_neural(const FrameInputs &inputs, ID3D12Resource *colour,
 	if (!neural_.initialized) {
 		if (neural_init_failed_ || !neural_.init_device(device, inputs.width, inputs.height)) {
 			neural_init_failed_ = true;
-			neural_ran_ = 0xFFFFFFFFu;
-			fail(remote::RemoteStep::Upscaler, "host.neural",
-				neural_.last_error.empty()
-					? std::wstring(L"DLSS neural rendering could not start on this machine.")
-					: neural_.last_error);
+			fail_neural(neural_.last_error.empty()
+				? std::wstring(L"DLSS neural rendering could not start on this machine.") : neural_.last_error);
 			return;
 		}
 	}
@@ -522,12 +519,17 @@ void HostSession::run_neural(const FrameInputs &inputs, ID3D12Resource *colour,
 	const bool ok = neural_.run(inputs.engine.cmd, colour, SharedPlane::kState,
 		motion, want_depth ? depth : nullptr, np, depth_u, depth_v);
 	neural_ran_ = ok ? 1u : 0xFFFFFFFFu;
-	if (!ok) {
-		fail(remote::RemoteStep::Upscaler, "host.neural",
-			neural_.last_error.empty()
-				? std::wstring(L"DLSS neural rendering did not run on this frame.")
-				: neural_.last_error);
-	}
+	if (!ok)
+		fail_neural(neural_.last_error.empty()
+			? std::wstring(L"DLSS neural rendering did not run on this frame.") : neural_.last_error);
+}
+
+void HostSession::fail_neural(const std::wstring &text)
+{
+	neural_ran_ = 0xFFFFFFFFu;
+	if (step_ == remote::RemoteStep::Ok)
+		message_ = text;
+	diag_state("host.neural", DiagLevel::Error, "host", text);
 }
 
 void HostSession::finish_frame(uint64_t frame_index)

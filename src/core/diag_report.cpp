@@ -46,9 +46,8 @@ void append_settings(std::wstring &out, const Settings &s)
 	out += wformat(L"  enabled=%hs  backend=%s  mode=%u  preset=%u  sharpness=%.2f\n",
 		bool_label(s.enabled), backend.c_str(), s.upscale_mode, s.render_preset,
 		static_cast<double>(s.sharpness));
-	out += wformat(L"  upscale_effects=%hs  jitter=%hs  flow_quality=%u  mv_probe=%hs\n",
-		bool_label(s.upscale_effects), bool_label(s.spatial_jitter),
-		s.internal_flow_quality, bool_label(s.mv_probe));
+	out += wformat(L"  upscale_effects=%hs  jitter=%hs  mv_probe=%hs\n",
+		bool_label(s.upscale_effects), bool_label(s.spatial_jitter), bool_label(s.mv_probe));
 	out += wformat(L"  vsr_input_format=%u  fsr_provider=%hs\n", s.vsr_input_format,
 		s.fsr_provider.empty() ? "auto" : s.fsr_provider.c_str());
 	static const wchar_t *const kModeNames[kNeuralModeCount] = {
@@ -113,10 +112,19 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 	};
 
 	add("Graphics API", CheckState::Ok, state.api_name != nullptr ? state.api_name : "unknown");
-	if (state.bridge_name != nullptr)
-		add("Bridge to Direct3D 12", state.bridge_any_ready ? CheckState::Ok : CheckState::Warn,
-			state.bridge_name,
+	if (state.bridge_name != nullptr) {
+		std::string bridge = state.bridge_name;
+		const std::string api = state.api_name != nullptr ? state.api_name : "";
+		if (!api.empty() && bridge.size() > api.size() + 1 && bridge.compare(0, api.size(), api) == 0 &&
+			bridge[api.size()] == ' ')
+			bridge.erase(0, api.size() + 1);
+		if (state.bridge_sync != nullptr)
+			bridge += std::string(", ") + state.bridge_sync;
+		if (state.bridge_any_ready && !state.bridge_fsr_adapter_matched)
+			bridge += ", adapter not matched yet";
+		add("Bridge to Direct3D 12", state.bridge_any_ready ? CheckState::Ok : CheckState::Warn, std::move(bridge),
 			state.bridge_any_ready ? "" : "The add-on could not reach a Direct3D 12 device yet.");
+	}
 	else if (!state.bridge_error.empty())
 		add("Bridge to Direct3D 12", CheckState::Fail, "none",
 			"Every upscaler here is Direct3D 12 work and this game's API could not be bridged.");
@@ -172,10 +180,10 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			"Pick the game's depth buffer in ReShade's own depth settings. "
 			"The add-on works without it, with slightly worse edges.");
 	} else {
-		const std::string depth_line = format("%s, %s%s%s, far %.0f",
+		const std::string depth_line = format("%s, %s%s%s, far %.0f%s",
 			depth_provider_label(state.depth_provider), state.depth_reversed ? "reversed" : "normal",
 			state.depth_upside_down ? ", upside down" : "", state.depth_mirrored ? ", mirrored" : "",
-			static_cast<double>(state.depth_far_plane));
+			static_cast<double>(state.depth_far_plane), state.depth_logarithmic ? ", logarithmic" : "");
 		if (state.depth_overridden.empty())
 			add("Depth buffer", CheckState::Ok, depth_line);
 		else
@@ -262,10 +270,17 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 					: "Aeon SR's DLSS and DLSS neural rendering would run in AeonSRHost.exe, apart from it.");
 	}
 
-	if (state.native_dlss)
-		add("Game's own DLSS", CheckState::Warn,
-			"loaded by the game: " + diag_narrow(state.native_dlss_modules),
-			"Use the game's own setting and set the upscaler here to None. Two in series ghost.");
+	if (state.native_dlss) {
+		const bool dlss_on = settings.enabled && settings.backend == static_cast<unsigned>(BackendChoice::Dlss);
+		if (dlss_on && !state.host_ready && !state.host_error.empty())
+			add("Game's own DLSS", CheckState::Fail, "loaded by the game: " + diag_narrow(state.native_dlss_modules),
+				"Aeon SR's DLSS runs in AeonSRHost.exe, apart from it, and it did not start: " +
+				diag_narrow(state.host_error));
+		else
+			add("Game's own DLSS", CheckState::Ok, "loaded by the game: " + diag_narrow(state.native_dlss_modules),
+				dlss_on ? "Aeon SR's DLSS runs in AeonSRHost.exe, apart from it."
+						: "Aeon SR's DLSS would run in AeonSRHost.exe, apart from it.");
+	}
 
 	if (!settings.neural_render) {
 		add("Neural rendering", CheckState::Off, "turned off");
@@ -282,12 +297,19 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			detail += ", runtime built for " + state.neural_runtime_cards;
 		if (state.neural_reported_architecture != 0u)
 			detail += " (its own card check bypassed)";
-		add("Neural rendering", CheckState::Ok,
-			state.upscalers_remote ? detail + ", in the helper process" : detail);
+		const bool short_chain = state.neural_passes_built != 0 &&
+			state.neural_passes_built < clamp_neural_passes(settings.neural_passes);
+		add("Neural rendering", short_chain ? CheckState::Warn : CheckState::Ok,
+			state.upscalers_remote ? detail + ", in the helper process" : detail,
+			short_chain ? "The runtime would not build every pass; the chain is shorter than asked for." : "");
 	} else if (!vendor_may_be_nvidia(state.gpu_vendor)) {
 		add("Neural rendering", CheckState::Fail,
 			format("needs an NVIDIA GPU (%s detected)", vendor_label(state.gpu_vendor)),
 			"Everything else in Aeon SR works on this card.");
+	} else if (state.neural_host_refused) {
+		add("Neural rendering", CheckState::Fail, "AeonSRHost.exe could not prepare it",
+			"nvngx_dlssnr.dll and ngxshim\\nvngx.dll are both in place; AeonSRHost.log beside the "
+			"add-on says why.");
 	} else if (!state.neural_dll_present) {
 		add("Neural rendering", CheckState::Fail, "nvngx_dlssnr.dll not found",
 			"It is not shipped with Aeon SR and the driver does not install it. "
@@ -327,26 +349,13 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 		add("Neural rendering", CheckState::Fail,
 			state.neural_error.empty() ? std::string("the pass failed this frame")
 				: diag_narrow(state.neural_error));
-	} else if (state.neural_last == 1) {
-		std::string detail = format("running, %u pass%s at %ux%u",
-			state.neural_passes_built, state.neural_passes_built == 1 ? "" : "es",
-			state.neural_model_width, state.neural_model_height);
-		if (state.neural_eval_rows != 0 && state.neural_eval_rows < state.neural_model_height)
-			detail += format(", up to %.0f%% of the model per frame",
-				100.0 * state.neural_eval_rows / state.neural_model_height);
-		if (state.neural_gpu_ms > 0.0f)
-			detail += format(", %.2f ms", static_cast<double>(state.neural_gpu_ms));
-		const bool short_chain = state.neural_passes_built != 0 &&
-			state.neural_passes_built < clamp_neural_passes(settings.neural_passes);
-		add("Neural rendering", short_chain ? CheckState::Warn : CheckState::Ok, std::move(detail),
-			short_chain ? "The runtime would not build every pass; the chain is shorter than asked for." : "");
 	} else {
 		add("Neural rendering", CheckState::Warn, "idle - waiting for a frame to work on");
 	}
 
 	if (settings.debug_view != 0 || settings.neural_debug_view != 0)
 		add("Inspection view", CheckState::Warn, "the frame is being replaced by a debug picture",
-			"Set both Debug view rows to Off to see the game again.");
+			"Set Debug view (Diagnostics) and Neural debug view (Neural Rendering) to Off to see the game again.");
 
 	const uint32_t errors = diag_count(DiagLevel::Error);
 	const uint32_t warnings = diag_count(DiagLevel::Warn);
@@ -434,7 +443,7 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 			elsewhere ? L"  " : L"", elsewhere ? f.path.c_str() : L"");
 	}
 	if (!e.foreign_modules.empty())
-		out += wformat(L"  already loaded by this game: %s\n", e.foreign_modules.c_str());
+		out += wformat(L"  upscaling modules in this process (Aeon SR's own included): %s\n", e.foreign_modules.c_str());
 	out += L"\n";
 
 	out += L"INPUTS\n";
