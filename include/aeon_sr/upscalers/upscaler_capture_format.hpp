@@ -33,7 +33,7 @@ bool parse_captured_frame(const std::string &text, CapturedFrameInfo *out);
 
 std::wstring captured_frame_dir(const std::wstring &root, uint32_t index);
 
-enum class ScopePlane : uint32_t { Drawn, UpscalerIn, Upscaled, Final, Mask, Count };
+enum class ScopePlane : uint32_t { Drawn, UpscalerIn, Upscaled, Final, Mask, Neural, Count };
 inline constexpr uint32_t kScopeStagePlanes = static_cast<uint32_t>(ScopePlane::Count);
 const char *scope_plane_name(ScopePlane p) noexcept;
 

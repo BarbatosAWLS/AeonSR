@@ -21,6 +21,8 @@ bool gl_jitter_bound_as(uint32_t count, const JitterViewport *expect) noexcept;
 void gl_jitter_observe(uint64_t frame) noexcept;
 bool gl_clip_origin_upper_left() noexcept;
 
+JitterVertexClass gl_fixed_function_vertex_class(bool *perspective = nullptr) noexcept;
+
 class GlJitterQuiet {
 public:
 	GlJitterQuiet() noexcept;

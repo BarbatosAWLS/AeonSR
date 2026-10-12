@@ -10,9 +10,12 @@
 #include "aeon_sr/interop/native_d3d.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
+#include "aeon_sr/ngx/ngx_override.hpp"
 #include "aeon_sr/core/runtime_search.hpp"
 #include "aeon_sr/ngx/neural_hardware.hpp"
+#include "aeon_sr/upscalers/runtime_load_check.hpp"
 
+#include <limits>
 #include <d3d11.h>
 #include <d3d12.h>
 
@@ -72,14 +75,22 @@ App::App(HMODULE module)
 	load_settings(settings_, ini_path_);
 	diag_set_verbose(settings_.verbose_log);
 	set_jitter_shaders_wanted(settings_.spatial_jitter);
+	flight_.set_log([](const std::wstring &line) { diag_info("flight", line); });
+	flight_.set_dir(join_path(addon_dir, L"AeonSR_flight"));
+	if (!parse_flight_fault(settings_.flight_fault, &flight_fault_))
+		diag_logf(DiagLevel::Warn, "flight", L"FlightFault=%hs is not a fault this build knows; none injected",
+			settings_.flight_fault.c_str());
+	else if (flight_fault_.count != 0)
+		diag_logf(DiagLevel::Warn, "flight", L"FlightFault: %hs fired on purpose", settings_.flight_fault.c_str());
 }
 
 namespace {
 
 FrameSignals signals_of(const FrameInputs &inputs, NeuralColorSpace color_space,
-	const JitterFrame &drawn) noexcept
+	const JitterFrame &drawn, bool jitter_withheld, bool camera_moving) noexcept
 {
 	FrameSignals s;
+	s.camera_moving = camera_moving;
 	s.color_space = color_space;
 	s.jitter_drawn = drawn.valid;
 	s.jitter_drawn_index = drawn.index;
@@ -87,6 +98,7 @@ FrameSignals signals_of(const FrameInputs &inputs, NeuralColorSpace color_space,
 	s.jitter_drawn_y = drawn.input_y;
 	s.jitter_drawn_ambiguous = drawn.ambiguous;
 	s.jitter_drawn_empty = drawn.empty;
+	s.jitter_withheld = jitter_withheld;
 	s.have_motion_vectors = inputs.have_motion_vectors;
 	s.have_depth = inputs.have_depth;
 	s.have_global_flow = inputs.have_global_flow;
@@ -99,6 +111,10 @@ FrameSignals signals_of(const FrameInputs &inputs, NeuralColorSpace color_space,
 
 void App::persist_settings()
 {
+	if (!settings_.spatial_jitter) {
+		landing_.clear_absorbed();
+		flow_.reset_landing();
+	}
 
 	invalidate_temporal_history();
 	save_settings(settings_, ini_path_);
@@ -109,8 +125,29 @@ void App::invalidate_temporal_history() noexcept
 	history_.temporal_history_valid = false;
 }
 
+void App::keep_game_jitter_memory() noexcept
+{
+	if (!memory_unsaved_ || game_memory_path_.empty())
+		return;
+	try {
+		if (save_game_jitter_memory(game_memory_path_, game_memory_))
+			memory_unsaved_ = false;
+	} catch (...) {
+	}
+}
+
 void App::shutdown()
 {
+	keep_game_jitter_memory();
+	flight_.shutdown();
+	{
+		const FlightRecorder::Cost c = flight_.cost();
+		if (c.frames != 0)
+			diag_logf(DiagLevel::Info, "flight", L"flight recorder: %llu frames recorded at %.2f us a frame on average, "
+				L"%.1f us at most; %u dumps, the largest copy into one %.3f ms",
+				static_cast<unsigned long long>(c.frames), c.total_us / static_cast<double>(c.frames), c.max_us, c.dumps,
+				c.copy_ms_max);
+	}
 	engine_.wait_cpu(engine_.last_submitted());
 	dlss11_.shutdown();
 	dlss12_.shutdown();
@@ -123,6 +160,7 @@ void App::shutdown()
 	probes_.release();
 	debug_view_.release();
 	flow_.release();
+	game_probe_.release();
 	depth_.release();
 	shutdown_neural();
 	ngx_.shutdown_device();
@@ -322,22 +360,29 @@ bool App::active_is_vsr() const noexcept
 	return active_ == static_cast<const UpscalerBackend *>(&vsr11_);
 }
 
+void App::restore_interface(const FrameInputs &inputs)
+{
+	if (!hud_detected_ || interface_restored_)
+		return;
+	interface_restored_ = true;
+	const StageScope restore_time(stage_times_, StageTimings::Stage::Restore, inputs);
+	engine_journal_note(L"interface");
+	(void)hud_restore_.composite(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
+		inputs.engine.color_state);
+}
+
 void App::run_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 	const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params)
 {
 	scope_list_lost_ = false;
+	interface_restored_ = false;
 	bool registered = false;
 	if (hud_detected_ && !interface_split_ && backend != nullptr && backend != &fsr11_ && backend != &vsr11_)
 		registered = hud_restore_.register_input(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state);
 	trace_cur_.set(ScopeColumn::Register, registered ? 1.0 : 0.0);
 	run_engine_passes(runtime, inputs, plan, backend, params);
-	const StageScope restore_time(stage_times_, StageTimings::Stage::Restore, inputs);
-	if (hud_detected_) {
-		engine_journal_note(L"interface");
-		(void)hud_restore_.composite(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
-			inputs.engine.color_state);
-	}
+	restore_interface(inputs);
 	if (observed_)
 		observer_.end(inputs.engine.device, inputs.engine.cmd, inputs.engine.color, inputs.engine.color_state,
 			hud_detected_ ? hud_restore_.mask() : nullptr, HudRestoreD3D12::kMaskState,
@@ -358,15 +403,19 @@ void App::detect_interface(const FrameInputs &inputs)
 		inputs.engine.color == nullptr)
 		return;
 	const JitterFrame &drawn = jitter_.drawn();
-	HudRestoreFrame f;
-	f.drawn = drawn.valid;
-	f.x = drawn.valid ? drawn.x : 0.0f;
-	f.y = drawn.valid ? drawn.y : 0.0f;
-	f.scene = inputs.engine.scene;
-	f.scene_state = inputs.engine.scene_state;
-	engine_journal_note(L"interface detect");
-	hud_detected_ = hud_restore_.detect(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
-		inputs.engine.color_state, f);
+	if (settings_.spatial_jitter) {
+		HudRestoreFrame f;
+		f.drawn = drawn.valid;
+		f.x = drawn.valid ? drawn.x : 0.0f;
+		f.y = drawn.valid ? drawn.y : 0.0f;
+		f.scene = inputs.engine.scene;
+		f.scene_state = inputs.engine.scene_state;
+		engine_journal_note(L"interface detect");
+		hud_detected_ = hud_restore_.detect(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
+			inputs.engine.color_state, f);
+	} else {
+		hud_restore_.reset();
+	}
 	interface_split_ = false;
 	if (hud_detected_ && inputs.engine.scene != nullptr) {
 		const D3D12_RESOURCE_DESC cd = inputs.engine.color->GetDesc(), sd = inputs.engine.scene->GetDesc();
@@ -379,6 +428,7 @@ void App::detect_interface(const FrameInputs &inputs)
 			barrier12(cmd, inputs.engine.scene, D3D12_RESOURCE_STATE_COPY_SOURCE, inputs.engine.scene_state);
 			barrier12(cmd, inputs.engine.color, D3D12_RESOURCE_STATE_COPY_DEST, inputs.engine.color_state);
 			interface_split_ = true;
+			flight_.cur().hud |= kFlightSplit;
 		}
 	}
 	const SceneSnapshot::Census census = scene_snapshot().take_census();
@@ -431,7 +481,7 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 	engine_journal_note(L"engine frame");
 	upscaler_capture_.begin_frame(inputs.engine.device, inputs.engine.queue);
 	const bool capturing = upscaler_capture_.recording() && backend != nullptr && backend != &fsr11_ &&
-		backend != &vsr11_ && inputs.engine.ready() && !(remote_.ready() && runs_remote(backend));
+		backend != &vsr11_ && inputs.engine.ready();
 	bool split_moved = false;
 	float split_u = 0.0f, split_v = 0.0f;
 	StageTimings::Stage upscaler_stage = StageTimings::Stage::Upscaler;
@@ -471,34 +521,7 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 			trace_cur_.set(ScopeColumn::RenderH, rh);
 		}
 	}
-	if (remote_.ready() && runs_remote(backend)) {
-		if (scope)
-			upscaler_capture_.scope_copy(ScopePlane::UpscalerIn, inputs.engine.device, inputs.engine.cmd,
-				inputs.engine.color, inputs.engine.color_state);
-		run_remote_engine_work(runtime, inputs, plan, backend, params,
-			sizeof(void *) != 4 && !engine_route_now().all_in_host);
-		stage_times_.cancel(upscaler_stage);
-		stage_times_.cancel(StageTimings::Stage::Total);
-		stage_times_.note_remote_frame();
-		if (scope_list_lost_)
-			stage_times_.abandon_frame();
-		return;
-	}
-	if (backend == &dlss12_ && dlss_needs_host()) {
-		dlss12_.status = UpscalerStatus::InitFailed;
-		const wchar_t *const why = sizeof(void *) == 4
-			? L"a 32-bit game runs its upscaler in AeonSRHost.exe"
-			: !ngx_layers_.empty()
-			? L"another program answers DLSS calls in this game, so Aeon SR's DLSS runs in AeonSRHost.exe, apart from it"
-			: L"the game runs its own DLSS, so Aeon SR's runs in AeonSRHost.exe";
-		dlss12_.last_error = remote_.last_error.empty()
-			? std::wstring(why) + L", which is starting"
-			: std::wstring(why) + L", which could not start: " + remote_.last_error;
-		backend = nullptr;
-	}
-	if (backend != nullptr)
-		engine_journal_note(L"upscaler");
-	if (capturing) {
+	const auto capture_input = [&]() {
 		CapturedFrameInfo info;
 		info.upscaler = backend->name();
 		info.fsr_provider = fsr12_.want_provider;
@@ -514,7 +537,39 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 			inputs.engine.color, inputs.engine.color_state, inputs.engine.motion, inputs.engine.motion_state,
 			inputs.depth_provider == DepthProvider::Normalized ? inputs.engine.depth : nullptr,
 			inputs.engine.depth_state, std::move(info));
+	};
+	if (remote_.ready() && runs_remote(backend)) {
+		if (capturing)
+			capture_input();
+		if (scope)
+			upscaler_capture_.scope_copy(ScopePlane::UpscalerIn, inputs.engine.device, inputs.engine.cmd,
+				inputs.engine.color, inputs.engine.color_state);
+		run_remote_engine_work(runtime, inputs, plan, backend, params,
+			sizeof(void *) != 4 && !engine_route_now().all_in_host);
+		stage_times_.cancel(upscaler_stage);
+		stage_times_.cancel(StageTimings::Stage::Total);
+		stage_times_.note_remote_frame();
+		if (scope_list_lost_)
+			stage_times_.abandon_frame();
+		return;
 	}
+	if (backend != nullptr && must_run_in_host(backend)) {
+		backend->status = UpscalerStatus::InitFailed;
+		const wchar_t *const why = sizeof(void *) == 4
+			? L"a 32-bit game runs its upscaler in AeonSRHost.exe"
+			: upscaler_layer_seen()
+			? L"another program answers upscaler calls in this game (OptiScaler), so Aeon SR's upscaler runs in "
+			  L"AeonSRHost.exe, apart from it"
+			: L"the game runs its own DLSS, so Aeon SR's runs in AeonSRHost.exe";
+		backend->last_error = remote_.last_error.empty()
+			? std::wstring(why) + L", which is starting"
+			: std::wstring(why) + L", which could not start: " + remote_.last_error;
+		backend = nullptr;
+	}
+	if (backend != nullptr)
+		engine_journal_note(L"upscaler");
+	if (capturing && backend != nullptr)
+		capture_input();
 	if (scope && backend != nullptr)
 		upscaler_capture_.scope_copy(ScopePlane::UpscalerIn, inputs.engine.device, inputs.engine.cmd,
 			inputs.engine.color, inputs.engine.color_state);
@@ -530,6 +585,7 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		jitter_.note_waiting();
 	float depth_u = 0.0f, depth_v = 0.0f;
 	jitter_.depth_uv(&depth_u, &depth_v);
+	restore_interface(inputs);
 	engine_journal_note(L"neural pass");
 	const StageScope neural_time(stage_times_, StageTimings::Stage::Neural, inputs);
 	run_neural_render(runtime, inputs, plan.neural, depth_u, depth_v);
@@ -564,6 +620,15 @@ void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 	RemoteEngine::Reply rp;
 	(void)remote_.run(engine_, rq, rp);
 	const bool ok = rp.step == remote::RemoteStep::Ok;
+	{
+		FlightRecord &fr = flight_.cur();
+		fr.host = rp.host_busy ? FlightHost::Busy
+			: rp.step == remote::RemoteStep::Timeout ? FlightHost::Timeout
+			: rp.step == remote::RemoteStep::Lost ? FlightHost::Lost
+			: rp.step == remote::RemoteStep::NoHost || rp.step == remote::RemoteStep::Share ? FlightHost::Failed
+			: FlightHost::Answered;
+		fr.host_ms = rp.wait_ms;
+	}
 	if (!rp.list_recording) {
 		hud_detected_ = false;
 		scope_list_lost_ = true;
@@ -609,6 +674,7 @@ void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 		jitter_.note_upscaled();
 	if (!neural_here)
 		return;
+	restore_interface(inputs);
 	float depth_u = 0.0f, depth_v = 0.0f;
 	jitter_.depth_uv(&depth_u, &depth_v);
 	run_neural_render(runtime, inputs, plan.neural, depth_u, depth_v);
@@ -624,16 +690,20 @@ bool App::remote_wanted() const noexcept
 
 EngineRoute App::engine_route_now() const noexcept
 {
-	return engine_route(sizeof(void *) == 4, native_dlss_seen_, !ngx_layers_.empty(),
-		settings_.enabled && settings_.backend == static_cast<unsigned>(BackendChoice::Dlss),
+	const unsigned b = settings_.backend;
+	const EngineRoute r = engine_route(sizeof(void *) == 4, native_dlss_seen_, upscaler_layer_seen(),
+		settings_.enabled && b == static_cast<unsigned>(BackendChoice::Dlss),
+		settings_.enabled && (b == static_cast<unsigned>(BackendChoice::Dlss) ||
+			b == static_cast<unsigned>(BackendChoice::Fsr) || b == static_cast<unsigned>(BackendChoice::Xess)),
 		settings_.neural_render && gpu_.may_be_nvidia());
+	return with_ngx_override(r, dlss_override());
 }
 
-bool App::dlss_needs_host() const noexcept
+bool App::dlss_override() const noexcept
 {
 	if constexpr (sizeof(void *) == 4)
-		return true;
-	return engine_route_now().dlss_in_host;
+		return false;
+	return !ngx_override_path(ngx12_.addon_dir).empty();
 }
 
 bool App::runs_remote(const UpscalerBackend *backend) const noexcept
@@ -643,6 +713,21 @@ bool App::runs_remote(const UpscalerBackend *backend) const noexcept
 	if (backend != nullptr && !crosses(backend))
 		return false;
 	return backend == static_cast<const UpscalerBackend *>(&dlss12_) || engine_route_now().all_in_host;
+}
+
+bool App::must_run_in_host(const UpscalerBackend *backend) const noexcept
+{
+	if (backend == nullptr || !crosses(backend))
+		return false;
+	if constexpr (sizeof(void *) == 4)
+		return backend == static_cast<const UpscalerBackend *>(&dlss12_);
+	const EngineRoute r = engine_route_now();
+	return backend == static_cast<const UpscalerBackend *>(&dlss12_) ? r.dlss_in_host : r.all_in_host;
+}
+
+bool App::upscaler_layer_seen() const noexcept
+{
+	return !ngx_layers_.empty() || runtime_load_redirected();
 }
 
 bool App::crosses(const UpscalerBackend *backend) const noexcept
@@ -665,6 +750,7 @@ void App::ensure_remote()
 	if (remote_tried_ || remote_.ready() || !engine_.ready())
 		return;
 	remote_tried_ = true;
+	remote_.host_gpu_priority_high = settings_.host_gpu_priority;
 	if (!remote_.start(engine_, module_, last_api_))
 		diag_state("remote", DiagLevel::Error, "remote", remote_.last_error);
 	else
@@ -754,6 +840,9 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 	neural_last_ = neural12_.run(inputs.engine.cmd, inputs.engine.color, inputs.engine.color_state,
 		inputs.engine.motion, want_depth ? inputs.engine.depth : nullptr, np,
 		depth_jitter_u, depth_jitter_v) ? 1 : -1;
+	if (neural_last_ > 0 && upscaler_capture_.scope_recording())
+		upscaler_capture_.scope_copy(ScopePlane::Neural, inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
+			inputs.engine.color_state);
 }
 
 void App::refresh_depth_convention(reshade::api::effect_runtime *runtime)
@@ -882,13 +971,18 @@ void App::update_ngx_layers()
 		return;
 	ngx_layers_scanned_ms_ = now;
 	ngx_layers_ = scan_ngx_layers(module_);
+	if (dlss_override()) {
+		const std::wstring &own = ngx_override_path(ngx12_.addon_dir);
+		std::erase_if(ngx_layers_, [&own](const NgxLayer &l) { return ngx_same_file(l.path, own); });
+	}
 	if (ngx_layers_.empty())
 		return;
 	std::wstring names;
 	for (const NgxLayer &l : ngx_layers_)
 		names += (names.empty() ? L"" : L", ") + ngx_layer_label(l) + L" at " + l.path;
-	diag_state("ngx-layer", DiagLevel::Info, "aeonsr", names + L" is loaded in this game and answers DLSS calls in "
-		L"it; Aeon SR's DLSS and DLSS neural rendering run in AeonSRHost.exe, apart from it, whenever they are on.");
+	diag_state("ngx-layer", DiagLevel::Info, "aeonsr", names + L" is loaded in this game and answers upscaler "
+		L"calls in it; Aeon SR's DLSS, FSR, XeSS and DLSS neural rendering run in AeonSRHost.exe, apart from it, "
+		L"whenever they are on.");
 }
 
 void App::update_native_dlss()
@@ -901,7 +995,12 @@ void App::update_native_dlss()
 	if (native_dlss_.queried && !deciding && now - native_dlss_scanned_ms_ < 1000)
 		return;
 	native_dlss_scanned_ms_ = now;
-	const std::wstring dir = find_ngx_runtime_dir(ngx12_.addon_dir);
+	std::wstring dir = find_ngx_runtime_dir(ngx12_.addon_dir);
+	if (dlss_override()) {
+		const std::wstring own = ngx_override_dlss_dir(ngx_override_path(ngx12_.addon_dir));
+		if (!own.empty())
+			dir = own;
+	}
 	native_dlss_ = scan_native_dlss(dir.empty() ? std::wstring() : ngx_dll_path(dir));
 	native_dlss_seen_ = native_dlss_.native;
 	if (native_dlss_seen_) {
@@ -965,6 +1064,121 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 		return;
 	}
 
+	game_depth_ = depth12 != nullptr;
+	if (depth12 != nullptr && settings_.spatial_jitter && !game_probe_failed_) {
+		if (!game_probe_.ensure(dev12, inputs.width, inputs.height, &game_probe_error_)) {
+			game_probe_failed_ = true;
+			diag_logf(DiagLevel::Warn, "jitter", L"jitter: whether the game jitters its own frame cannot be measured: %ls",
+				game_probe_error_.c_str());
+		} else if (game_probe_.record(cmd12, inputs.engine.color, inputs.engine.color_state, depth12,
+				inputs.engine.depth_state, flow_.motion(), OpticalFlowD3D12::kPublishedState, &game_probe_error_)) {
+			const JitterFrame &d = jitter_.drawn();
+			const float nan = std::numeric_limits<float>::quiet_NaN();
+			probe_drawn_[game_probe_.serial() % 8u] = { game_probe_.serial(), d.valid ? d.x : d.ambiguous ? nan : 0.0f,
+				d.valid ? d.y : d.ambiguous ? nan : 0.0f, d.valid && d.moved != 0 };
+		}
+	}
+	{
+		GameJitterFit gf;
+		if (game_probe_.take(&gf)) {
+			++game_fits_;
+			game_fits_seen_at_ = trace_presents_;
+			if (gf.motion_px >= 0.0f)
+				camera_moving_ = camera_gate_.step(gf.motion_px);
+			if (!gf.depth_ok) {
+				if (gf.depth_pixels < GameJitterProbeD3D12::kMinPixels)
+					++game_depth_few_;
+				else
+					++game_depth_one_way_;
+			}
+			const ProbeDrawn &a = probe_drawn_[gf.serial % 8u], &b = probe_drawn_[(gf.serial - 1u) % 8u];
+			const ProbeDrawn &c = probe_drawn_[(gf.serial - 2u) % 8u];
+			const bool same = a.serial == gf.serial && b.serial + 1u == gf.serial && a.x == b.x && a.y == b.y;
+			const bool have_before = c.serial + 2u == gf.serial;
+			game_jitter_.moving = !fault_.game_jitter_still;
+			const GameJitterDetector::Change change = game_jitter_.feed(gf, same, have_before ? b.x - c.x : 0.0f,
+				have_before ? b.y - c.y : 0.0f);
+			if (a.serial == gf.serial && b.serial + 1u == gf.serial && a.scene && b.scene && !move_all_) {
+				const float dx = a.x - b.x, dy = a.y - b.y;
+				const bool still = gf.color_ok && gf.motion_px >= 0.0f &&
+					gf.motion_px <= 0.5f + std::sqrt(dx * dx + dy * dy);
+				const bool carried = !still && gf.carried_color_ok && gf.motion_px <= GameJitterDetector::kMaxMovingMotion &&
+					std::fabs(gf.carried_color_x) <= 2.0f && std::fabs(gf.carried_color_y) <= 2.0f;
+				if (landing_.note_response(still ? gf.color_x : gf.carried_color_x, still ? gf.color_y : gf.carried_color_y,
+						dx, dy, still || carried) == JitterLanding::Verdict::Absorbed) {
+					flow_.reset_landing();
+					diag_logf(DiagLevel::Info, "jitter", L"jitter: the picture held still while the offset drawn into it "
+						L"moved (%.2f of it across, %.2f down); the game's frame does not move with it",
+						landing_.response_x(), landing_.response_y());
+				}
+			}
+			{
+				FlightRecord &fr = flight_.cur();
+				if (gf.depth_ok) {
+					fr.game_depth_x = gf.depth_x;
+					fr.game_depth_y = gf.depth_y;
+				}
+				if (gf.color_ok) {
+					fr.game_color_x = gf.color_x;
+					fr.game_color_y = gf.color_y;
+				}
+				fr.game_rms = game_jitter_.last_rms();
+			}
+			if (game_jitter_.jitters() != verdict_jitters_ || game_jitter_.confirmed() != verdict_confirmed_) {
+				verdict_jitters_ = game_jitter_.jitters();
+				verdict_confirmed_ = game_jitter_.confirmed();
+				verdict_since_ = GetTickCount64();
+			}
+			const bool settled = GetTickCount64() >= verdict_since_ + kVerdictSettleMs;
+			if (!fault_.game_jitter_forget && game_jitter_.confirmed() && settled && memory_w_ != 0 &&
+					(!game_jitter_.jitters() || depth_withholds(true, landing_.lands(), landing_.takes_out())) &&
+					game_memory_.remember(game_exe_, memory_w_, memory_h_, game_jitter_.jitters())) {
+				memory_unsaved_ = true;
+				diag_logf(DiagLevel::Info, "jitter", game_jitter_.jitters()
+					? L"jitter: kept for the next launch: the game jitters its own frame at %ux%u"
+					: L"jitter: kept for the next launch: the game does not jitter its own frame at %ux%u",
+					memory_w_, memory_h_);
+			}
+			const int overruled = !game_jitter_.measured() || !game_jitter_.jitters() || depth_withholds_offset() ? 0
+				: landing_.lands() ? 1 : 2;
+			if (overruled != overruled_said_) {
+				overruled_said_ = overruled;
+				if (overruled == 1)
+					diag_logf(DiagLevel::Info, "jitter", L"jitter: the game's depth reads as jittering (%.2f px), but its "
+						L"picture moves with the offset drawn into it (%.2f of it across, %.2f down): drawn on, not kept",
+						game_jitter_.last_rms(), landing_.response_x(), landing_.response_y());
+				else if (overruled == 2)
+					diag_logf(DiagLevel::Info, "jitter", L"jitter: the game's depth reads as jittering (%.2f px); drawn on "
+						L"until the picture shows whether the offset is taken out of it", game_jitter_.last_rms());
+			}
+			if (memory_unsaved_ && GetTickCount64() >= memory_retry_at_) {
+				keep_game_jitter_memory();
+				memory_retry_at_ = GetTickCount64() + 250u;
+				if (memory_unsaved_)
+					diag_state("game_jitter_memory", DiagLevel::Warn, "jitter",
+						L"jitter: what was measured of the game's own jitter could not be written for the next launch yet");
+			}
+			if (gf.serial % 120u == 0u)
+				diag_logf(DiagLevel::Trace, "jitter", L"jitter: game jitter probe: depth %ls (%.3f, %.3f) on %u px, "
+					L"colour %ls (%.3f, %.3f) on %u px, camera %.2f px, same offset %d; %u windows, last %.3f px, %u frames "
+					L"not measured", gf.depth_ok ? L"fit" : L"no fit", gf.depth_x, gf.depth_y, gf.depth_pixels,
+					gf.color_ok ? L"fit" : L"no fit", gf.color_x, gf.color_y, gf.color_pixels, gf.motion_px, same ? 1 : 0,
+					game_jitter_.windows(), game_jitter_.last_rms(), game_jitter_.skipped());
+			if (change != GameJitterDetector::Change::None) {
+				landing_.clear_absorbed();
+				if (change != GameJitterDetector::Change::StartsJittering)
+					landing_.forget_response();
+				flow_.reset_landing();
+				diag_logf(DiagLevel::Info, "jitter", change == GameJitterDetector::Change::StartsJittering
+					? L"jitter: the game jitters its own frame (%.2f px from frame to frame)"
+					: change == GameJitterDetector::Change::StopsJittering
+					? L"jitter: the game no longer jitters its own frame (%.2f px from frame to frame)"
+					: L"jitter: the game does not jitter its own frame (%.2f px from frame to frame)",
+					game_jitter_.last_rms());
+			}
+		}
+	}
+
 	if (!flow_.has_history()) {
 		flow_note_benign_ = true;
 		flow_note_ = L"warming up: the estimator needs two frames of the same size";
@@ -974,7 +1188,7 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 
 	{
 		float sums[4];
-		const JitterLanding::Verdict verdict = flow_.landing(sums) ? landing_.update(sums)
+		const JitterLanding::Verdict verdict = flow_.landing(sums) ? landing_.update(sums, !move_all_)
 			: JitterLanding::Verdict::None;
 		if (verdict != JitterLanding::Verdict::None)
 			flow_.reset_landing();
@@ -993,6 +1207,52 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 				: landing_.flip_x() ? L"across" : landing_.flip_y() ? L"down" : L"on neither axis");
 			diag_info("jitter", text);
 		}
+		if (verdict == JitterLanding::Verdict::Absorbed) {
+			wchar_t text[200]{};
+			_snwprintf_s(text, _TRUNCATE, L"jitter: the picture moved %.2f times the offset across and %.2f down; "
+				L"the game's frame does not move with it", landing_.factor_x(), landing_.factor_y());
+			diag_info("jitter", text);
+		}
+	}
+
+	if (settings_.spatial_jitter && GetTickCount64() >= jitter_measure_logged_at_ + 10000u) {
+		jitter_measure_logged_at_ = GetTickCount64();
+		const uint32_t measured = game_fits_ - (game_jitter_.skipped() - game_skipped_at_);
+		diag_logf(DiagLevel::Info, "jitter", L"jitter: last 10 s %u reading(s) of which way the picture moves, %u "
+			L"with too little change of offset to judge, the last %.2f across and %.2f down; the game's own jitter "
+			L"%ls, measured on %u of %u frames (the last window %.3f px); the depth fitted on %u, too few of its pixels in "
+			L"a plane on %u, all sloping one way on %u; %u reading(s) of the colour against the offset, the last %.2f "
+			L"across and %.2f down",
+			landing_.readings() - landing_reads_at_, landing_.short_readings() - landing_short_at_, landing_.factor_x(),
+			landing_.factor_y(), !game_depth_ && !game_jitter_.measured() ? L"cannot be measured: no depth"
+				: !game_jitter_.measured() ? L"not measured yet"
+				: !game_jitter_.confirmed() && game_jitter_.jitters() ? L"taken as there (remembered or one window), not confirmed yet"
+				: !game_jitter_.confirmed() ? L"taken as not there (remembered or one window), not confirmed yet"
+				: game_jitter_.jitters() ? L"is there" : L"is not there",
+			measured, game_fits_, game_jitter_.last_rms(), game_fits_ - game_depth_few_ - game_depth_one_way_,
+			game_depth_few_, game_depth_one_way_, landing_.responses() - responses_at_, landing_.response_x(),
+			landing_.response_y());
+		responses_at_ = landing_.responses();
+		game_depth_few_ = game_depth_one_way_ = 0;
+		{
+			const JitterFrame &f = jitter_.drawn();
+			const JitterShaderCounts c = jitter_shader_counts();
+			diag_logf(DiagLevel::Info, "jitter", L"jitter: last frame %u scene draws at the offset, %u on the grid (%u "
+				L"with another depth buffer of the scene's size), %u left on the grid as interface by their depth test "
+				L"(%u of those outside the window), %u with the scene's depth bound, %u outside the window; %u quads "
+				L"over the scene at the offset, %u left on the grid as passes over the whole screen or as interface "
+				L"into the window; most other "
+				L"draws into %ux%u (%u), most with another depth buffer with one of %ux%u (%u); vertex shaders rewritten %u, left as they were %u, draws kept on the grid by an "
+				L"indexed shader %u, already in screen space %u",
+				f.moved, f.plain, f.plain_aliased, f.interface_kept, f.interface_kept_outside, f.depth_draws,
+				f.outside_draws, f.quads_moved, f.quads_kept, f.other_w, f.other_h, f.other_draws, f.other_depth_w,
+				f.other_depth_h, f.other_depth_draws, c.rewritten, c.kept, c.indexed_held,
+				c.pretransformed);
+		}
+		landing_reads_at_ = landing_.readings();
+		landing_short_at_ = landing_.short_readings();
+		game_skipped_at_ = game_jitter_.skipped();
+		game_fits_ = 0;
 	}
 
 	if (flow_.model_failed())
@@ -1158,6 +1418,10 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 		static_cast<UpscaleMode>(settings_.upscale_mode) == UpscaleMode::Dlaa ? 8u : kJitterPhases);
 	if (!settings_.spatial_jitter) {
 		jitter_note_ = "";
+		if (landing_.absorbed()) {
+			landing_.clear_absorbed();
+			flow_.reset_landing();
+		}
 		return;
 	}
 	if (active_ == nullptr) {
@@ -1220,14 +1484,14 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 			const JitterFrame &f = jitter_.drawn();
 			const JitterShaderCounts c = jitter_shader_counts();
 			const JitterPromotions pr = scene_jitter().take_promotions();
-			diag_logf(DiagLevel::Info, "jitter", L"jitter paused: last frame %u scene draws moved, %u on the "
+			diag_logf(DiagLevel::Info, "jitter", L"jitter paused (%hs): last frame %u scene draws moved, %u on the "
 				L"grid (%u of those with the other depth buffer, of %u drawn with it), %u replayed; offsets "
 				L"reaching the recording since the last pause: %u at a frame boundary, %u between frames, "
 				L"%u mid-frame; vertex shaders rewritten %u (%u indexing through a0), left as they were "
 				L"%u; draws kept on the grid so far: %u by an indexed shader whose register the game writes, "
 				L"%u already in screen space",
-				f.moved, f.plain, f.plain_aliased, f.aliased, f.replayed, pr.at_boundary, pr.between_frames,
-				pr.forced, c.rewritten, c.indexed, c.kept, c.indexed_held, c.pretransformed);
+				jitter_.pause_reason(), f.moved, f.plain, f.plain_aliased, f.aliased, f.replayed, pr.at_boundary,
+				pr.between_frames, pr.forced, c.rewritten, c.indexed, c.kept, c.indexed_held, c.pretransformed);
 		}
 		return;
 	}
@@ -1270,6 +1534,54 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 		jitter_note_ = "waiting for the game's depth buffer";
 		return;
 	}
+	{
+		FlightRecord &fr = flight_.cur();
+		fr.depth_id = scene_depth;
+		fr.depth_w = static_cast<uint16_t>(std::min<uint32_t>(tw, 0xFFFFu));
+		fr.depth_h = static_cast<uint16_t>(std::min<uint32_t>(th, 0xFFFFu));
+		fr.scene = scene_depth != 0 ? FlightScene::Depth : FlightScene::Size;
+	}
+	if (tw != memory_w_ || th != memory_h_) {
+		memory_w_ = tw;
+		memory_h_ = th;
+		game_jitter_.unconfirm();
+		if (!game_memory_loaded_) {
+			game_memory_loaded_ = true;
+			game_exe_ = game_jitter_exe_path();
+			const std::wstring dir = local_appdata_dir_w();
+			if (!dir.empty()) {
+				game_memory_path_ = join_path(dir, L"game_jitter.txt");
+				(void)load_game_jitter_memory(game_memory_path_, &game_memory_);
+			}
+		}
+		bool remembered = false;
+		if (!fault_.game_jitter_forget && game_memory_.find(game_exe_, tw, th, &remembered)) {
+			game_jitter_.seed(remembered);
+			diag_logf(DiagLevel::Info, "jitter", remembered
+				? L"jitter: an earlier launch measured that the game jitters its own frame at %ux%u; starting from that, "
+					L"and measuring on"
+				: L"jitter: an earlier launch measured that the game does not jitter its own frame at %ux%u; starting "
+					L"from that, and measuring on", tw, th);
+		}
+	}
+	{
+		if (landing_.note_scene(tw, th, scene_depth)) {
+			flow_.reset_landing();
+			game_jitter_.restart_window();
+			game_probe_.reset();
+		}
+		const bool withheld = offset_withheld();
+		if (withheld != withheld_said_) {
+			withheld_said_ = withheld;
+			diag_info("jitter", withheld
+				? L"jitter: not drawn: the game jitters its own frame"
+				: L"jitter: drawn into the game's frame again");
+		}
+		if (withheld) {
+			jitter_note_ = "the game jitters its own frame";
+			return;
+		}
+	}
 	diag_state("jitter_scene", DiagLevel::Info, "jitter", scene_depth != 0
 		? std::wstring(L"jitter: the scene is the depth buffer ReShade selected")
 		: L"jitter: no depth buffer selected; the scene is what the game draws at " + std::to_wstring(tw) + L"x" +
@@ -1298,9 +1610,21 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 		arm.target_x = -arm.target_x;
 	if (landing_.flip_y())
 		arm.target_y = -arm.target_y;
+	const bool moved_all = move_all_;
 	move_all_ = jitter_move_all(move_all_, jitter_.drawn());
+	if (move_all_ && !moved_all) {
+		const JitterFrame &f = jitter_.drawn();
+		diag_logf(DiagLevel::Info, "jitter", L"jitter: the frame that showed no scene: %u draws seen in all, %u at the "
+			L"offset, %u on the grid, %u left on the grid as interface by their depth test, %u with the scene's depth "
+			L"(%ux%u) bound; most other draws into %ux%u (%u), most with another depth buffer with one of %ux%u (%u)",
+			f.all_draws, f.moved, f.plain, f.interface_kept, f.depth_draws, tw, th, f.other_w, f.other_h, f.other_draws,
+			f.other_depth_w, f.other_depth_h, f.other_depth_draws);
+	}
 	scene_rules(settings_.jitter_scene_rule, move_all_, &arm.size_targets, &arm.move_window);
+	if (arm.move_window)
+		flight_.cur().scene = FlightScene::Everything;
 	arm.tested_quads = settings_.jitter_tested_quads;
+	arm.scene_quads = settings_.jitter_scene_quads;
 	arm.depth_regrid = settings_.depth_regrid;
 	diag_state("jitter_move_all", DiagLevel::Info, "jitter", arm.move_window
 		? std::wstring(L"jitter: no draw shows the scene by its depth; everything of the scene's size takes the offset")
@@ -1449,7 +1773,12 @@ void App::adopt_device(reshade::api::device *device)
 			query_gpu_info(native_d3d12_device(device), &gpu_);
 		else if (api == reshade::api::device_api::d3d11)
 			query_gpu_info(native_d3d11_device(device), &gpu_);
-		if (gpu_.queried)
+		if (gpu_.queried && gpu_.spoofed)
+			diag_logf(DiagLevel::Info, "gpu", L"render device: %s (vendor 0x%04X, device 0x%04X) on %hs - DXGI "
+				L"describes it as %s (vendor 0x%04X), a spoofed identity (OptiScaler, DXVK); the card is the "
+				L"driver's own answer", gpu_.name.c_str(), gpu_.vendor_id, gpu_.device_id, api_label(api),
+				gpu_.reported_name.c_str(), gpu_.reported_vendor_id);
+		else if (gpu_.queried)
 			diag_logf(DiagLevel::Info, "gpu", L"render device: %s (vendor 0x%04X, device 0x%04X) on %hs%s",
 				gpu_.name.c_str(), gpu_.vendor_id, gpu_.device_id, api_label(api),
 				gpu_.vendor_id_disputed
@@ -1462,10 +1791,12 @@ void App::adopt_device(reshade::api::device *device)
 		if (!gpu_.may_be_nvidia()) {
 
 			dlss11_.status = UpscalerStatus::UnsupportedGpu;
-			dlss12_.status = UpscalerStatus::UnsupportedGpu;
 			vsr11_.status = UpscalerStatus::UnsupportedGpu;
 			ngx_.status = UpscalerStatus::UnsupportedGpu;
-			ngx12_.status = UpscalerStatus::UnsupportedGpu;
+			if (!dlss_override()) {
+				dlss12_.status = UpscalerStatus::UnsupportedGpu;
+				ngx12_.status = UpscalerStatus::UnsupportedGpu;
+			}
 		}
 	}
 	history_.reset_pending = true;
@@ -1490,6 +1821,7 @@ void App::on_destroy_device(reshade::api::device *device)
 	probes_.release();
 	debug_view_.release();
 	flow_.release();
+	game_probe_.release();
 	depth_.release();
 
 	neural12_.shutdown_device();
@@ -1614,9 +1946,12 @@ void App::on_present(reshade::api::effect_runtime *runtime)
 	if (runtime != nullptr) {
 		RuntimeJitterCounts counts(runtime);
 		jitter_.present(reinterpret_cast<uintptr_t>(runtime), counts);
-		if (reinterpret_cast<uintptr_t>(runtime) == trace_runtime_)
+		if (reinterpret_cast<uintptr_t>(runtime) == trace_runtime_) {
+			flight_commit();
 			trace_close();
+		}
 	}
+	service_report();
 }
 
 void App::on_begin_effects(
@@ -1767,11 +2102,13 @@ void App::on_game_present(reshade::api::command_queue *queue, reshade::api::swap
 	reshade::api::effect_runtime *runtime = nullptr;
 	{
 		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		present_keys_.clear();
 		for (const RuntimeDrive &d : runtimes_)
-			if (d.device == device && d.hwnd == hwnd) {
-				runtime = d.runtime;
-				break;
-			}
+			present_keys_.push_back({ d.runtime->get_native(), d.device, d.hwnd });
+		const size_t i = runtime_of_present(present_keys_.data(), present_keys_.size(),
+			{ swapchain->get_native(), device, hwnd });
+		if (i < runtimes_.size())
+			runtime = runtimes_[i].runtime;
 	}
 	if (runtime == nullptr)
 		return;
@@ -1820,6 +2157,7 @@ void App::run_frame(
 	jitter_note_ = jitter_.note();
 
 	if (d3d9_device_lost(runtime->get_device())) {
+		flight_.cur().blocked = FlightBlocked::DeviceLost;
 		note_frame_blocked(L"the game's Direct3D 9 device is lost (switched away from fullscreen, or "
 			L"changing mode); frames resume when the game resets it");
 		return;
@@ -1860,6 +2198,10 @@ void App::run_frame(
 	}
 	if (settings_.scope_capture && settings_.scope_key != 0 && runtime->is_key_pressed(settings_.scope_key))
 		request_scope_capture();
+	if (settings_.report_key != 0 && runtime->is_key_pressed(settings_.report_key)) {
+		diag_collect_environment(module_);
+		start_report(panel_state(true));
+	}
 	if (!upscaler_capture_.scope_recording()) {
 		const std::wstring st = upscaler_capture_.scope_status();
 		if (st != scope_logged_ && st.rfind(L"writing", 0) != 0) {
@@ -1921,6 +2263,7 @@ void App::run_frame(
 		}
 		ngx_.status = UpscalerStatus::UnsupportedApi;
 		ngx12_.status = UpscalerStatus::UnsupportedApi;
+		flight_.cur().blocked = FlightBlocked::NoBridge;
 		note_frame_blocked(why);
 		return;
 	}
@@ -1940,6 +2283,7 @@ void App::run_frame(
 			b->status = UpscalerStatus::EvaluateFailed;
 			b->last_error = std::wstring(L"the frame never reached the upscaler: ") + why;
 		}
+		flight_.cur().blocked = FlightBlocked::NoBackBuffer;
 		note_frame_blocked(why);
 		return;
 	}
@@ -1968,6 +2312,7 @@ void App::run_frame(
 			b->last_error = why;
 		}
 		engine_.abandon_list();
+		flight_.cur().blocked = FlightBlocked::BridgeFailed;
 		note_frame_blocked(why);
 		return;
 	}
@@ -2045,6 +2390,7 @@ void App::run_frame(
 	const bool vsr_possible = (api == reshade::api::device_api::d3d11);
 
 	const bool nv = gpu_.may_be_nvidia();
+	const bool dlss_ok = nv || dlss_override();
 	BackendSlots slots;
 	slots.is_d3d12 = is12;
 	slots.vendor = gpu_.vendor;
@@ -2054,23 +2400,33 @@ void App::run_frame(
 		: BackendAvailability{ false, false, UpscalerStatus::UnsupportedGpu };
 	const float frame_time_ms = clock_.frame_time_ms();
 	if (inputs.have_motion_vectors) {
-		slots.dlss = nv
+		slots.dlss = dlss_ok
 			? availability_of(dlss, BackendChoice::Dlss)
 			: BackendAvailability{ false, false, UpscalerStatus::UnsupportedGpu };
 		slots.fsr = availability_of(fsr, BackendChoice::Fsr);
 		if (xess != nullptr)
 			slots.xess = availability_of(xess, BackendChoice::Xess);
 		if (api == reshade::api::device_api::d3d11 &&
-			fsr12_.status == UpscalerStatus::InitFailed) {
+			fsr12_.status == UpscalerStatus::InitFailed && !must_run_in_host(&fsr12_)) {
 			slots.fsr_bridge_failed = true;
 			slots.fsr11 = BackendAvailability{ fsr11_.runtime_present(), fsr11_.crashed, fsr11_.status };
 		}
 	}
 
-	const FramePlan plan = plan_frame(settings_, signals_of(inputs, color_space_, jitter_.drawn()),
-		slots, history_, frame_time_ms);
+	if (game_fits_seen_at_ + 30u < trace_presents_) {
+		camera_gate_.reset();
+		camera_moving_ = false;
+	}
+	const FramePlan plan = plan_frame(settings_, signals_of(inputs, color_space_, jitter_.drawn(), offset_withheld(),
+		camera_moving_), slots, history_, frame_time_ms);
 	history_ = plan.next;
 	last_plan_ = plan;
+	{
+		FlightRecord &fr = flight_.cur();
+		fr.plan = static_cast<uint8_t>(plan.jitter_decision);
+		fr.width = static_cast<uint16_t>(std::min<uint32_t>(inputs.width, 0xFFFFu));
+		fr.height = static_cast<uint16_t>(std::min<uint32_t>(inputs.height, 0xFFFFu));
+	}
 	if (plan.use_fsr11)
 		fsr = &fsr11_;
 	trace_cur_.plan = jitter_decision_name(plan.jitter_decision);
@@ -2085,7 +2441,7 @@ void App::run_frame(
 
 	if (plan.outcome == UpscalerOutcome::NoMotionVectors) {
 
-		UpscalerBackend *const waiting = nv ? dlss : fsr;
+		UpscalerBackend *const waiting = dlss_ok ? dlss : fsr;
 		waiting->status = UpscalerStatus::NeedMotionVectors;
 		jitter_.note_waiting();
 		waiting->last_error = flow_note_;
@@ -2097,7 +2453,7 @@ void App::run_frame(
 	}
 
 	if (plan.outcome == UpscalerOutcome::NoBackend) {
-		active_ = nv ? dlss : fsr;
+		active_ = dlss_ok ? dlss : fsr;
 		if (plan.no_upscaler_wanted)
 			active_->status = UpscalerStatus::Idle;
 
@@ -2109,7 +2465,7 @@ void App::run_frame(
 	active_ = plan.backend_index == 0 ? dlss
 		: (plan.backend_index == 1 ? fsr : (plan.backend_index == 2 ? xess : vsr));
 
-	if (!nv && (plan.backend_index == 0 || plan.backend_index == 3)) {
+	if ((!dlss_ok && plan.backend_index == 0) || (!nv && plan.backend_index == 3)) {
 		active_->status = UpscalerStatus::UnsupportedGpu;
 		active_->last_error = plan.backend_index == 0
 			? L"DLSS needs an NVIDIA GPU. Pick FSR or XeSS, or leave the upscaler on Auto."
@@ -2136,6 +2492,8 @@ void App::run_frame(
 	}
 
 	run_engine_work(runtime, inputs, plan, active_, params);
+	if (jitter_fault_hit(fault_.upscale_drop_every, fault_clock(0)))
+		jitter_.drop_upscaled();
 
 	if (finish_frame(runtime, cmd_list, inputs))
 		jitter_.note_reached_game();
@@ -2158,6 +2516,7 @@ bool App::finish_frame(reshade::api::effect_runtime *runtime,
 	if (step == BridgeStep::Ok)
 		return true;
 	engine_.abandon_list();
+	flight_.cur().blocked = FlightBlocked::BridgeFailed;
 	diag_state("interop", DiagLevel::Warn, "interop",
 		L"the upscaled frame did not reach the game: " + widen(bridge_step_label(step)) +
 		(bridge_->last_error.empty() ? L"" : L" - " + bridge_->last_error));
@@ -2198,8 +2557,11 @@ PanelState App::panel_state(bool for_overlay)
 	s.d3d12 = d3d12;
 	s.build_stamp = __DATE__ " " __TIME__;
 	s.version = AEONSR_VERSION_STR;
-	s.report_path = report_path_;
-	s.report_error = report_error_;
+	{
+		const std::lock_guard<std::mutex> lock(report_lock_);
+		s.report_path = report_shown_.empty() ? report_path_ : report_shown_;
+		s.report_error = report_shown_error_.empty() ? report_error_ : report_shown_error_;
+	}
 	s.log_path = diag_log_path();
 
 	s.native_dlss = native_dlss_seen_;
@@ -2207,9 +2569,12 @@ PanelState App::panel_state(bool for_overlay)
 	s.ngx_layer.clear();
 	for (const NgxLayer &l : ngx_layers_)
 		s.ngx_layer += (s.ngx_layer.empty() ? L"" : L", ") + ngx_layer_label(l);
-	s.ngx_layer_nvidia = gpu_.may_be_nvidia();
-	s.ngx_layer_relevant = s.ngx_layer_nvidia &&
-		((settings_.enabled && settings_.backend == static_cast<unsigned>(BackendChoice::Dlss)) || settings_.neural_render);
+	if (s.ngx_layer.empty() && runtime_load_redirected())
+		s.ngx_layer = L"a program that hooks upscaler runtimes";
+	{
+		const EngineRoute r = engine_route_now();
+		s.ngx_layer_relevant = sizeof(void *) != 4 && upscaler_layer_seen() && (r.all_in_host || r.dlss_in_host);
+	}
 	s.gpu_vendor = gpu_.vendor;
 	s.gpu_vendor_id = gpu_.vendor_id;
 	s.gpu_name = gpu_.name;
@@ -2386,6 +2751,7 @@ PanelState App::panel_state(bool for_overlay)
 	s.jitter_in_frame = last_plan_.params.jitter_in_frame;
 	s.jitter_mixed = jitter_.drawn().ambiguous;
 	s.jitter_still = jitter_.drawn().empty;
+	s.jitter_withheld = offset_withheld();
 	s.jitter_moved_draws = jitter_.drawn().moved;
 	s.jitter_plain_draws = jitter_.drawn().plain;
 	s.jitter_elsewhere_draws = jitter_.drawn().elsewhere;
@@ -2550,9 +2916,243 @@ void App::write_report(const PanelState &state, bool to_clipboard)
 		ImGui::SetClipboardText(diag_narrow(diag_report_text(state, settings_)).c_str());
 		report_path_ = L"copied to the clipboard";
 		report_error_.clear();
+		const std::lock_guard<std::mutex> lock(report_lock_);
+		report_shown_.clear();
+		report_shown_error_.clear();
 		return;
 	}
+	start_report(state);
+}
+
+namespace {
+
+FlightApi flight_api_of(reshade::api::device_api api) noexcept
+{
+	switch (api) {
+	case reshade::api::device_api::d3d9: return FlightApi::D3D9;
+	case reshade::api::device_api::d3d10: return FlightApi::D3D10;
+	case reshade::api::device_api::d3d11: return FlightApi::D3D11;
+	case reshade::api::device_api::d3d12: return FlightApi::D3D12;
+	case reshade::api::device_api::opengl: return FlightApi::OpenGL;
+	case reshade::api::device_api::vulkan: return FlightApi::Vulkan;
+	default: return FlightApi::Unknown;
+	}
+}
+
+uint16_t flight_u16(double v) noexcept
+{
+	return v > 0.0 ? static_cast<uint16_t>(std::min(v, 65535.0)) : 0u;
+}
+
+std::wstring widen_utf8(const std::string &s)
+{
+	const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+	std::wstring w(n > 0 ? static_cast<size_t>(n) : 0u, L'\0');
+	if (n > 0)
+		MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), w.data(), n);
+	return w;
+}
+
+void remove_staging(const std::wstring &dir)
+{
+	for (const std::wstring &sub : { join_path(dir, L"frame"), dir }) {
+		WIN32_FIND_DATAW fd{};
+		const HANDLE h = FindFirstFileW(join_path(sub, L"*").c_str(), &fd);
+		if (h != INVALID_HANDLE_VALUE) {
+			do {
+				if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+					DeleteFileW(join_path(sub, fd.cFileName).c_str());
+			} while (FindNextFileW(h, &fd));
+			FindClose(h);
+		}
+		RemoveDirectoryW(sub.c_str());
+	}
+}
+
+}
+
+void App::flight_commit()
+{
+	FlightRecord &r = flight_.cur();
+	LARGE_INTEGER now{}, freq{};
+	QueryPerformanceCounter(&now);
+	QueryPerformanceFrequency(&freq);
+	const char *note = nullptr, *pause = nullptr;
+	if (trace_open_) {
+		const ScopeTraceRow &t = trace_cur_;
+		r.api = flight_api_of(last_api_);
+		if (t.has(ScopeColumn::ToldX)) {
+			r.told_x = static_cast<float>(t.get(ScopeColumn::ToldX));
+			r.told_y = static_cast<float>(t.get(ScopeColumn::ToldY));
+		}
+		if (t.has(ScopeColumn::Ran))
+			r.ran = t.get(ScopeColumn::Ran) == 1.0 ? 1 : 0;
+		if (t.has(ScopeColumn::RenderW)) {
+			r.render_w = flight_u16(t.get(ScopeColumn::RenderW));
+			r.render_h = flight_u16(t.get(ScopeColumn::RenderH));
+		}
+		if (t.get(ScopeColumn::Restore) == 1.0)
+			r.hud |= kFlightRestore;
+		if (t.get(ScopeColumn::Register) == 1.0)
+			r.hud |= kFlightRegistered;
+		const JitterFrame &d = jitter_.drawn();
+		if (d.valid) {
+			r.drawn_x = d.x;
+			r.drawn_y = d.y;
+			r.drawn_index = static_cast<uint16_t>(d.index);
+		}
+		r.moved = flight_u16(d.moved);
+		r.plain = flight_u16(d.plain);
+		if (r.plan != 0xFFu && active_ != nullptr) {
+			const UpscalerBackend *const a = active_;
+			r.upscaler = a == &dlss12_ ? FlightUpscaler::Dlss : a == &dlss11_ ? FlightUpscaler::DlssD3D11
+				: a == &fsr12_ ? FlightUpscaler::Fsr : a == &fsr11_ ? FlightUpscaler::FsrD3D11
+				: a == &xess12_ ? FlightUpscaler::Xess : a == &vsr11_ ? FlightUpscaler::Vsr : FlightUpscaler::None;
+			r.status = static_cast<uint8_t>(a->status);
+		}
+		if (settings_.neural_render) {
+			r.neural = static_cast<int8_t>(neural_last_);
+			if (neural_last_ == 1)
+				r.neural_ms = static_cast<float>(neural12_.timer.last_ms);
+		}
+		if (r.plan == 0xFFu)
+			r.jitter = FlightJitter::Idle;
+		else if (!settings_.spatial_jitter)
+			r.jitter = FlightJitter::Off;
+		else if (offset_withheld())
+			r.jitter = FlightJitter::Withheld;
+		else if (!jitter_.gate_open())
+			r.jitter = FlightJitter::Paused;
+		else switch (static_cast<JitterDecision>(r.plan)) {
+			case JitterDecision::Drawn: r.jitter = FlightJitter::Drawn; break;
+			case JitterDecision::Split: r.jitter = FlightJitter::Split; break;
+			case JitterDecision::Ambiguous: r.jitter = FlightJitter::Ambiguous; break;
+			case JitterDecision::Empty: r.jitter = FlightJitter::Empty; break;
+			case JitterDecision::Resampled: r.jitter = FlightJitter::Resampled; break;
+			case JitterDecision::Off: r.jitter = FlightJitter::NotDrawn; break;
+		}
+		note = jitter_note_;
+		if (r.jitter == FlightJitter::Paused)
+			pause = jitter_.pause_reason();
+	}
+	if (landing_.readings() != flight_landing_reads_) {
+		flight_landing_reads_ = landing_.readings();
+		r.landing_x = landing_.factor_x();
+		r.landing_y = landing_.factor_y();
+	}
+	r.game_jitter = !game_jitter_.measured() ? FlightGameJitter::Unmeasured
+		: game_jitter_.jitters() ? FlightGameJitter::Yes : FlightGameJitter::No;
+	flight_.commit(now.QuadPart, freq.QuadPart, flight_fault_.at(trace_presents_), note, pause);
+}
+
+void App::start_report(const PanelState &state)
+{
 	report_path_ = diag_write_report(state, settings_, &report_error_);
+	{
+		const std::lock_guard<std::mutex> lock(report_lock_);
+		if (report_phase_ != ReportPhase::None)
+			return;
+		report_phase_ = ReportPhase::Frame;
+	}
+	SYSTEMTIME t{};
+	GetLocalTime(&t);
+	wchar_t stamp[64]{};
+	_snwprintf_s(stamp, _TRUNCATE, L"AeonSR_report-%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour,
+		t.wMinute, t.wSecond);
+	const std::wstring dir = module_directory(module_);
+	report_job_ = ReportJob{};
+	report_job_.zip_path = join_path(dir, (std::wstring(stamp) + L".zip").c_str());
+	report_job_.staging = join_path(dir, (std::wstring(stamp) + L".tmp").c_str());
+	report_job_.flight_csv = flight_.csv_now(0.0);
+	if (upscaler_capture_.scope_busy())
+		report_job_.frame_note = "a jitter scope capture was already recording";
+	else
+		report_job_.frame_dir = join_path(report_job_.staging, L"frame");
+	{
+		const std::lock_guard<std::mutex> lock(report_lock_);
+		report_shown_ = L"writing " + report_job_.zip_path;
+		report_shown_error_.clear();
+	}
+	diag_info("report", L"report: writing " + report_job_.zip_path);
+}
+
+void App::service_report()
+{
+	{
+		const std::lock_guard<std::mutex> lock(report_lock_);
+		if (report_phase_ != ReportPhase::Frame)
+			return;
+	}
+	ReportJob &j = report_job_;
+	if (!j.frame_dir.empty() && !j.frame_asked) {
+		upscaler_capture_.request_scope(j.frame_dir, 1u, 1ull << 30,
+			(1u << static_cast<uint32_t>(ScopePlane::Drawn)) | (1u << static_cast<uint32_t>(ScopePlane::Final)));
+		j.frame_asked = true;
+		j.deadline = GetTickCount64() + 3000u;
+		return;
+	}
+	if (j.frame_asked && upscaler_capture_.scope_busy()) {
+		const unsigned long long now = GetTickCount64();
+		if (now >= j.deadline && upscaler_capture_.scope_recording()) {
+			upscaler_capture_.scope_cancel();
+			j.frame_note = "no frame reached the add-on within 3 s";
+		}
+		if (now < j.deadline + 10000u)
+			return;
+		if (j.frame_note.empty())
+			j.frame_note = "the frame was still being written after 13 s";
+	}
+	const bool pictures = j.frame_asked && j.frame_note.empty();
+	const bool remove = !j.frame_asked || !upscaler_capture_.scope_busy();
+	ReportBundle b;
+	b.zip_path = j.zip_path;
+	const std::wstring dir = module_directory(module_);
+	std::wstring base = widen_utf8(reshade_base_path());
+	if (base.empty())
+		base = dir;
+	b.files = {
+		{ "AeonSR.log", diag_log_path() },
+		{ "AeonSRHost.log", join_path(dir, L"AeonSRHost.log") },
+		{ "ReShade.log", join_path(base, L"ReShade.log") },
+		{ "AeonSR.ini", ini_path_ },
+		{ "ReShade.ini", join_path(base, L"ReShade.ini") },
+	};
+	if (report_error_.empty() && !report_path_.empty())
+		b.files.push_back({ "AeonSR_report.txt", report_path_ });
+	b.flight_csv = std::move(j.flight_csv);
+	b.frame_dir = pictures ? j.frame_dir : std::wstring();
+	b.frame_note = j.frame_note;
+	SYSTEMTIME t{};
+	GetLocalTime(&t);
+	char summary[256]{};
+	std::snprintf(summary, sizeof(summary), "Aeon SR %s report, %04u-%02u-%02u %02u:%02u:%02u.\n"
+		"Attach this file when you report a problem.\n", AEONSR_VERSION_STR, t.wYear, t.wMonth, t.wDay, t.wHour,
+		t.wMinute, t.wSecond);
+	b.summary = summary;
+	const std::wstring staging = remove ? j.staging : std::wstring();
+	{
+		const std::lock_guard<std::mutex> lock(report_lock_);
+		report_phase_ = ReportPhase::Writing;
+	}
+	flight_.post([this, b = std::move(b), staging]() {
+		uint64_t bytes = 0;
+		std::wstring error;
+		const bool ok = write_report_bundle(b, &bytes, &error);
+		if (!staging.empty())
+			remove_staging(staging);
+		{
+			const std::lock_guard<std::mutex> lock(report_lock_);
+			report_phase_ = ReportPhase::None;
+			report_shown_ = ok ? b.zip_path : std::wstring();
+			report_shown_error_ = ok ? std::wstring() : L"the report could not be written: " + error;
+		}
+		if (ok)
+			diag_logf(DiagLevel::Info, "report", L"report: wrote %ls (%.1f MB)", b.zip_path.c_str(),
+				static_cast<double>(bytes) / (1024.0 * 1024.0));
+		else
+			diag_logf(DiagLevel::Warn, "report", L"report: %ls could not be written: %ls", b.zip_path.c_str(),
+				error.c_str());
+	});
 }
 
 void App::draw_osd(reshade::api::effect_runtime *)

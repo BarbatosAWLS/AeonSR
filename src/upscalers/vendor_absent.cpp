@@ -83,8 +83,7 @@ void VsrD3D11Backend::shutdown() {}
 bool VsrD3D11Backend::run(reshade::api::effect_runtime *, const FrameInputs &, const UpscalerParams &)
 {
 	status = UpscalerStatus::UnsupportedApi;
-	last_error = L"RTX VSR is not offered in a 32-bit game: it has never been run in one, and an "
-		L"upscaler that quietly does nothing is worse than one that says so.";
+	last_error = L"RTX VSR is not offered in a 32-bit game. Pick DLSS, FSR or XeSS.";
 	return false;
 }
 

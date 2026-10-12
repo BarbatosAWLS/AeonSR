@@ -1,4 +1,5 @@
 #include "aeon_sr/upscalers/ffx_loader.hpp"
+#include "aeon_sr/upscalers/runtime_load_check.hpp"
 
 #include <cstring>
 
@@ -37,6 +38,11 @@ bool ffx_load(FfxApi &out, const std::wstring &dll_path, std::wstring &error)
 		error = buf;
 		return false;
 	}
+	std::wstring got;
+	if (!loaded_module_is(module, dll_path, &got)) {
+		error = runtime_load_redirect_error(dll_path, got);
+		return false;
+	}
 
 	FfxApi api{};
 	api.module = module;
@@ -48,6 +54,13 @@ bool ffx_load(FfxApi &out, const std::wstring &dll_path, std::wstring &error)
 		!resolve_export(module, "ffxDispatch", api.Dispatch, error)) {
 		FreeLibrary(module);
 		return false;
+	}
+	for (const char *name : { "ffxCreateContext", "ffxDispatch" }) {
+		if (export_patched(module, name)) {
+			error = runtime_hooked_error(dll_path, name);
+			FreeLibrary(module);
+			return false;
+		}
 	}
 
 	out = api;

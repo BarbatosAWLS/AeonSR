@@ -76,6 +76,34 @@ inline bool vendor_may_be_nvidia(GpuVendor v) noexcept
 	return v == GpuVendor::Nvidia || v == GpuVendor::Unknown;
 }
 
+struct KernelAdapterIds {
+	bool known = false;
+	uint32_t vendor_id = 0;
+	uint32_t device_id = 0;
+	std::wstring name;
+};
+
+struct VendorVerdict {
+	GpuVendor vendor = GpuVendor::Unknown;
+	bool id_disputed = false;
+	bool spoofed = false;
+};
+
+inline VendorVerdict resolve_vendor_with_kernel(uint32_t dxgi_vendor_id, const std::wstring &dxgi_name,
+	const KernelAdapterIds &kernel) noexcept
+{
+	VendorVerdict v;
+	const GpuVendor by_kernel = kernel.known ? vendor_from_id(kernel.vendor_id) : GpuVendor::Unknown;
+	if (by_kernel == GpuVendor::Unknown) {
+		v.vendor = resolve_vendor(dxgi_vendor_id, dxgi_name, &v.id_disputed);
+		return v;
+	}
+	v.vendor = by_kernel;
+	const GpuVendor by_name = vendor_from_name(dxgi_name);
+	v.spoofed = dxgi_vendor_id != kernel.vendor_id || (by_name != GpuVendor::Unknown && by_name != by_kernel);
+	return v;
+}
+
 struct GpuInfo {
 	GpuVendor vendor = GpuVendor::Unknown;
 	uint32_t vendor_id = 0;
@@ -83,9 +111,14 @@ struct GpuInfo {
 	std::wstring name;
 	bool queried = false;
 	bool vendor_id_disputed = false;
+	bool spoofed = false;
+	uint32_t reported_vendor_id = 0;
+	std::wstring reported_name;
 
 	bool may_be_nvidia() const noexcept { return vendor_may_be_nvidia(vendor); }
 };
+
+KernelAdapterIds kernel_adapter_ids(uint32_t luid_low, int32_t luid_high);
 
 bool query_gpu_info(ID3D11Device *device, GpuInfo *out);
 bool query_gpu_info(ID3D12Device *device, GpuInfo *out);

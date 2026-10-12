@@ -1,5 +1,8 @@
 #include "aeon_sr/core/runtime_search.hpp"
 
+#include <Windows.h>
+
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -33,8 +36,25 @@ std::wstring path_under(const std::wstring &dir, const wchar_t *file_name)
 	return out;
 }
 
-std::vector<std::wstring> runtime_search_dirs(const std::wstring &addon_dir,
-	const std::wstring &exe_dir)
+bool optiscaler_folder(const std::wstring &dir)
+{
+	if (dir.empty())
+		return false;
+	const DWORD a = GetFileAttributesW(path_under(dir, L"OptiScaler.ini").c_str());
+	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::vector<std::wstring> demote_dirs(std::vector<std::wstring> dirs,
+	const std::function<bool(const std::wstring &)> &foreign)
+{
+	if (foreign)
+		std::stable_partition(dirs.begin(), dirs.end(), [&](const std::wstring &d) { return !foreign(d); });
+	return dirs;
+}
+
+namespace {
+
+std::vector<std::wstring> stock_dirs(const std::wstring &addon_dir, const std::wstring &exe_dir)
 {
 	std::vector<std::wstring> out;
 	out.reserve(4u);
@@ -47,19 +67,27 @@ std::vector<std::wstring> runtime_search_dirs(const std::wstring &addon_dir,
 	return out;
 }
 
+}
+
+std::vector<std::wstring> runtime_search_dirs(const std::wstring &addon_dir,
+	const std::wstring &exe_dir)
+{
+	return demote_dirs(stock_dirs(addon_dir, exe_dir), optiscaler_folder);
+}
+
 std::vector<std::wstring> preferred_search_dirs(const std::wstring &addon_dir,
 	const std::wstring &exe_dir, const wchar_t *preferred_subdir)
 {
-	const std::vector<std::wstring> stock = runtime_search_dirs(addon_dir, exe_dir);
+	const std::vector<std::wstring> stock = stock_dirs(addon_dir, exe_dir);
 	if (preferred_subdir == nullptr || *preferred_subdir == L'\0')
-		return stock;
+		return demote_dirs(stock, optiscaler_folder);
 	std::vector<std::wstring> out;
 	out.reserve(stock.size() * 2u);
 	for (const std::wstring &d : stock)
 		add_unique(out, path_under(d, preferred_subdir));
 	for (const std::wstring &d : stock)
 		add_unique(out, d);
-	return out;
+	return demote_dirs(std::move(out), optiscaler_folder);
 }
 
 std::vector<std::wstring> fsr_search_dirs(const std::wstring &addon_dir,

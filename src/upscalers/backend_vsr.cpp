@@ -135,8 +135,7 @@ bool VsrD3D11Backend::ensure_device(reshade::api::device *device, ID3D11DeviceCo
 	ID3D11Device *const dev = native_d3d11_device(device);
 	if (dev == nullptr || ctx == nullptr) {
 		status = UpscalerStatus::UnsupportedApi;
-		last_error = L"RTX VSR runs through the D3D11 video processor and is unavailable on this "
-			L"API. Use DLSS on a D3D12 game.";
+		last_error = L"RTX VSR needs a Direct3D 11 game. Pick DLSS, FSR or XeSS.";
 		return false;
 	}
 	if (device_ == dev && video_device_ != nullptr && video_context_ != nullptr) {

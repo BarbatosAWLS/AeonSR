@@ -1,5 +1,6 @@
 #include "aeon_sr/ngx/ngx_session_ngx.hpp"
 #include "aeon_sr/core/runtime_search.hpp"
+#include "aeon_sr/ngx/ngx_override.hpp"
 
 #include <Windows.h>
 
@@ -10,7 +11,9 @@ namespace aeon_sr {
 
 bool NgxSession::ensure_dll_present()
 {
-	const std::wstring dir = find_ngx_runtime_dir(addon_dir);
+	std::wstring dir = find_ngx_runtime_dir(addon_dir);
+	if (dir.empty())
+		dir = ngx_override_dlss_dir(ngx_override_path(addon_dir));
 	dll_present = !dir.empty();
 	if (dll_present)
 		dll_dir = dir;

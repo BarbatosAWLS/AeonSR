@@ -1,4 +1,5 @@
 #include "aeon_sr/upscalers/ffx_dx11_loader.hpp"
+#include "aeon_sr/upscalers/runtime_load_check.hpp"
 
 #include <cstring>
 
@@ -35,6 +36,11 @@ bool ffx_dx11_load(FfxDx11Api &out, const std::wstring &dll_path, std::wstring &
 		wchar_t buf[64]{};
 		_snwprintf_s(buf, _TRUNCATE, L"LoadLibraryW failed (0x%08X)", err);
 		error = buf;
+		return false;
+	}
+	std::wstring got;
+	if (!loaded_module_is(module, dll_path, &got)) {
+		error = runtime_load_redirect_error(dll_path, got);
 		return false;
 	}
 

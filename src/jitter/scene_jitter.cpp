@@ -183,6 +183,7 @@ JitterArm disarmed(const JitterArm &arm) noexcept
 	kept.scene_targets = arm.scene_targets;
 	kept.move_window = arm.move_window;
 	kept.tested_quads = arm.tested_quads;
+	kept.scene_quads = arm.scene_quads;
 	kept.depth_regrid = arm.depth_regrid;
 	kept.back_buffer = arm.back_buffer;
 	kept.back_buffer_count = arm.back_buffer_count;
@@ -246,25 +247,40 @@ void count_scene_draw(JitterDrawCounts &c, uint64_t bound_serial, bool aliased) 
 		++c.aliased;
 }
 
-void count_other_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n) noexcept
+namespace {
+
+void tally_size(uint32_t *ws, uint32_t *hs, uint32_t *ns, uint32_t *overflow, uint32_t w, uint32_t h,
+	uint32_t n) noexcept
 {
 	if (w == 0 || h == 0 || n == 0)
 		return;
 	for (uint32_t i = 0; i < kJitterOtherSizes; ++i) {
-		if (c.other_draws[i] != 0 && c.other_w[i] == w && c.other_h[i] == h) {
-			c.other_draws[i] += n;
+		if (ns[i] != 0 && ws[i] == w && hs[i] == h) {
+			ns[i] += n;
 			return;
 		}
 	}
 	for (uint32_t i = 0; i < kJitterOtherSizes; ++i) {
-		if (c.other_draws[i] == 0) {
-			c.other_w[i] = w;
-			c.other_h[i] = h;
-			c.other_draws[i] = n;
+		if (ns[i] == 0) {
+			ws[i] = w;
+			hs[i] = h;
+			ns[i] = n;
 			return;
 		}
 	}
-	c.other_overflow += n;
+	*overflow += n;
+}
+
+}
+
+void count_other_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n) noexcept
+{
+	tally_size(c.other_w, c.other_h, c.other_draws, &c.other_overflow, w, h, n);
+}
+
+void count_other_depth_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n) noexcept
+{
+	tally_size(c.other_depth_w, c.other_depth_h, c.other_depth_draws, &c.other_depth_overflow, w, h, n);
 }
 
 void add_draw_counts(JitterDrawCounts &into, const JitterDrawCounts &from) noexcept
@@ -277,13 +293,21 @@ void add_draw_counts(JitterDrawCounts &into, const JitterDrawCounts &from) noexc
 	into.by_target += from.by_target;
 	into.depth_draws += from.depth_draws;
 	into.outside_draws += from.outside_draws;
+	into.interface_kept += from.interface_kept;
+	into.interface_kept_outside += from.interface_kept_outside;
+	into.all_draws += from.all_draws;
+	into.quads_moved += from.quads_moved;
+	into.quads_kept += from.quads_kept;
 	for (uint32_t i = 0; i < kJitterCountedArms; ++i) {
 		if (from.serial[i] != 0 && from.moved[i] != 0)
 			count_moved_draws(into, from.serial[i], from.moved[i]);
 	}
-	for (uint32_t i = 0; i < kJitterOtherSizes; ++i)
+	for (uint32_t i = 0; i < kJitterOtherSizes; ++i) {
 		count_other_draw(into, from.other_w[i], from.other_h[i], from.other_draws[i]);
+		count_other_depth_draw(into, from.other_depth_w[i], from.other_depth_h[i], from.other_depth_draws[i]);
+	}
 	into.other_overflow += from.other_overflow;
+	into.other_depth_overflow += from.other_depth_overflow;
 }
 
 JitterDrawCounts replayed_draw_counts(const JitterDrawCounts &c) noexcept
@@ -295,6 +319,10 @@ JitterDrawCounts replayed_draw_counts(const JitterDrawCounts &c) noexcept
 	r.by_target = c.by_target;
 	r.depth_draws = c.depth_draws;
 	r.outside_draws = c.outside_draws;
+	r.interface_kept = c.interface_kept;
+	r.interface_kept_outside = c.interface_kept_outside;
+	r.all_draws = c.all_draws;
+	r.quads_kept = c.quads_kept;
 	r.replayed = c.replayed + c.overflow;
 	for (uint32_t i = 0; i < kJitterCountedArms; ++i)
 		r.replayed += c.moved[i];
@@ -302,14 +330,18 @@ JitterDrawCounts replayed_draw_counts(const JitterDrawCounts &c) noexcept
 		r.other_w[i] = c.other_w[i];
 		r.other_h[i] = c.other_h[i];
 		r.other_draws[i] = c.other_draws[i];
+		r.other_depth_w[i] = c.other_depth_w[i];
+		r.other_depth_h[i] = c.other_depth_h[i];
+		r.other_depth_draws[i] = c.other_depth_draws[i];
 	}
 	r.other_overflow = c.other_overflow;
+	r.other_depth_overflow = c.other_depth_overflow;
 	return r;
 }
 
 bool any_draw_counts(const JitterDrawCounts &c) noexcept
 {
-	if (c.plain != 0 || c.other_overflow != 0 || any_moved_draws(c))
+	if (c.plain != 0 || c.other_overflow != 0 || c.all_draws != 0 || any_moved_draws(c))
 		return true;
 	for (uint32_t i = 0; i < kJitterOtherSizes; ++i) {
 		if (c.other_draws[i] != 0)
@@ -454,6 +486,11 @@ void jitter_on_cleared(JitterListState &s) noexcept
 	s.target_scene = false;
 	s.target_window = false;
 	s.depth_test = true;
+	s.depth_pipe_known = false;
+	s.depth_pipe_enable = s.depth_pipe_func = -1;
+	s.depth_dyn_enable = s.depth_dyn_func = -1;
+	s.vertex_class = JitterVertexClass::Unknown;
+	s.perspective = false;
 }
 
 void jitter_on_reset(JitterListState &s) noexcept
@@ -469,6 +506,70 @@ bool jitter_rebind_expected(const JitterRebind &r, uint32_t count, const JitterV
 bool jitter_is_fullscreen_draw(uint32_t vertices, uint32_t instances) noexcept
 {
 	return vertices != 0u && vertices <= 6u && instances <= 1u;
+}
+
+namespace {
+
+int8_t tri_state(int v) noexcept
+{
+	return static_cast<int8_t>(v < 0 ? -1 : v != 0 ? 1 : 0);
+}
+
+}
+
+void jitter_on_depth_pipeline(JitterListState &s, bool known, int enable, int compares) noexcept
+{
+	s.depth_pipe_known = known;
+	s.depth_pipe_enable = known ? tri_state(enable) : int8_t(-1);
+	s.depth_pipe_func = known ? tri_state(compares) : int8_t(-1);
+}
+
+void jitter_on_depth_dynamic(JitterListState &s, int enable, int compares) noexcept
+{
+	if (enable >= 0)
+		s.depth_dyn_enable = tri_state(enable);
+	if (compares >= 0)
+		s.depth_dyn_func = tri_state(compares);
+}
+
+bool jitter_depth_compares(const JitterListState &s, bool *known) noexcept
+{
+	*known = false;
+	if (!s.depth_pipe_known)
+		return false;
+	const int enable = s.depth_pipe_enable >= 0 ? s.depth_pipe_enable : s.depth_dyn_enable;
+	if (enable < 0)
+		return false;
+	if (enable == 0) {
+		*known = true;
+		return false;
+	}
+	const int compares = s.depth_pipe_func >= 0 ? s.depth_pipe_func : s.depth_dyn_func;
+	if (compares < 0)
+		return false;
+	*known = true;
+	return compares != 0;
+}
+
+bool jitter_quad_is_scene(const JitterListState &s, const JitterArm &arm) noexcept
+{
+	if (!arm.scene_quads || s.vertex_class != JitterVertexClass::Transformed || jitter_draw_into_window(s, arm) ||
+		!scene_depth_bound(s, arm))
+		return false;
+	if (s.projection == 0 && s.scene_perspective)
+		return false;
+	bool known = false;
+	return jitter_depth_compares(s, &known) && known;
+}
+
+bool jitter_window_quad_is_scene(const JitterListState &s, const JitterArm &arm) noexcept
+{
+	if (!arm.scene_quads || !s.perspective || !jitter_draw_into_window(s, arm) || !scene_depth_bound(s, arm))
+		return false;
+	if (arm.serial != 0 && s.depth_cleared_serial == arm.serial)
+		return false;
+	bool known = false;
+	return jitter_depth_compares(s, &known) && known;
 }
 
 void SceneJitter::arm(JitterArm arm) noexcept
@@ -888,12 +989,22 @@ JitterFrame SceneJitter::take_frame() noexcept
 	f.by_target = c.by_target;
 	f.depth_draws = c.depth_draws;
 	f.outside_draws = c.outside_draws;
+	f.interface_kept = c.interface_kept;
+	f.interface_kept_outside = c.interface_kept_outside;
+	f.all_draws = c.all_draws;
+	f.quads_moved = c.quads_moved;
+	f.quads_kept = c.quads_kept;
 
 	for (uint32_t i = 0; i < kJitterOtherSizes; ++i) {
 		if (c.other_draws[i] > f.other_draws) {
 			f.other_w = c.other_w[i];
 			f.other_h = c.other_h[i];
 			f.other_draws = c.other_draws[i];
+		}
+		if (c.other_depth_draws[i] > f.other_depth_draws) {
+			f.other_depth_w = c.other_depth_w[i];
+			f.other_depth_h = c.other_depth_h[i];
+			f.other_depth_draws = c.other_depth_draws[i];
 		}
 	}
 	f.moved = c.overflow;
@@ -1041,8 +1152,14 @@ void JitterSchedule::earn(uintptr_t swapchain, const JitterArm &arm) noexcept
 
 JitterSchedule::Present JitterSchedule::present(uintptr_t swapchain, JitterArm *arm) noexcept
 {
-	if (owner_ == 0 || swapchain != owner_)
+	if (owner_ == 0)
 		return Present::Ignore;
+	if (swapchain != owner_) {
+		if (++others_ >= kReleaseAfter)
+			forget();
+		return Present::Ignore;
+	}
+	others_ = 0;
 	if (pending_set_) {
 		*arm = pending_;
 		pending_set_ = false;
@@ -1061,6 +1178,7 @@ void JitterSchedule::forget() noexcept
 	owner_ = 0;
 	pending_set_ = false;
 	stops_ = 0;
+	others_ = 0;
 }
 
 void JitterDriver::begin_frame(uintptr_t swapchain, JitterCounts &counts) noexcept
@@ -1083,7 +1201,10 @@ void JitterDriver::begin_frame(uintptr_t swapchain, JitterCounts &counts) noexce
 	drawn_ = counts.take();
 	drawn_.empty = armed_ && drawn_.moved == 0 && drawn_.replayed == 0;
 	jitter_.disarm();
+	const bool was_open = gate_.open();
 	gate_.note(drawn_);
+	if (was_open && !gate_.open())
+		pause_reason_ = "frames put part of the scene where the upscaler was not told";
 	frame_open_ = true;
 	note_ = !armed_ || drawn_.valid || drawn_.ambiguous ? ""
 		: drawn_.plain != 0 ? "the game drew the scene without it"
@@ -1135,11 +1256,16 @@ void JitterDriver::present(uintptr_t swapchain, JitterCounts &counts) noexcept
 		raw_history_ <<= 1;
 		if (frame_open_ && drawn_.moved != 0 && !(upscaled_ && reached_) && !waiting_) {
 			raw_history_ |= 1u;
+			const uint32_t window = jitter_.present_lags() ? kRawMovedWindow : kRawMovedAloneWindow;
+			const uint32_t mask = window >= 32u ? ~0u : (1u << window) - 1u;
 			uint32_t raw = 0;
-			for (uint32_t bits = raw_history_ & ((1u << kRawMovedWindow) - 1u); bits != 0; bits >>= 1)
+			for (uint32_t bits = raw_history_ & mask; bits != 0; bits >>= 1)
 				raw += bits & 1u;
-			if (!jitter_.present_lags() || raw >= kRawMovedInWindow)
+			if (raw >= (jitter_.present_lags() ? kRawMovedInWindow : kRawMovedAlone)) {
+				pause_reason_ = !upscaled_ ? "frames drawn at the offset reached the screen raw: the upscaler did not run"
+					: "frames drawn at the offset reached the screen raw: the upscaled picture did not reach the game";
 				gate_.note_failed();
+			}
 		}
 		armed_ = false;
 		frame_open_ = false;
@@ -1236,10 +1362,17 @@ bool parse_jitter_fault(const std::string &text, JitterFault *out)
 			f.told_drop_at = static_cast<int32_t>(v);
 		else if (name == "draw_drop_every" && fault_number(value, &v) && v >= 1.0 && v == std::floor(v) && v < 4294967295.0)
 			f.draw_drop_every = static_cast<uint32_t>(v);
+		else if (name == "upscale_drop_every" && fault_number(value, &v) && v >= 1.0 && v == std::floor(v) &&
+			v < 4294967295.0)
+			f.upscale_drop_every = static_cast<uint32_t>(v);
 		else if (name == "odd_told_scale" && fault_number(value, &v) && std::fabs(v) <= 8.0)
 			f.odd_told_scale = static_cast<float>(v);
 		else if (name == "draw_scale" && fault_number(value, &v) && std::fabs(v) <= 8.0)
 			f.draw_scale = static_cast<float>(v);
+		else if (name == "game_jitter_still" && value.empty())
+			f.game_jitter_still = true;
+		else if (name == "game_jitter_forget" && value.empty())
+			f.game_jitter_forget = true;
 		else if (name == "told_sign_x" && value.empty())
 			f.told_sign_x = -1.0f;
 		else if (name == "told_sign_x" && fault_number(value, &v) && std::fabs(v) <= 8.0)
@@ -1267,19 +1400,26 @@ std::string jitter_fault_text(const JitterFault &f)
 		add("told_drop_at", "=%.0f", f.told_drop_at);
 	if (f.draw_drop_every != 0)
 		add("draw_drop_every", "=%.0f", f.draw_drop_every);
+	if (f.upscale_drop_every != 0)
+		add("upscale_drop_every", "=%.0f", f.upscale_drop_every);
 	if (f.odd_told_scale != 1.0f)
 		add("odd_told_scale", "=%g", f.odd_told_scale);
 	if (f.draw_scale != 1.0f)
 		add("draw_scale", "=%g", f.draw_scale);
 	if (f.told_sign_x != 1.0f)
 		add("told_sign_x", "=%g", f.told_sign_x);
+	if (f.game_jitter_still)
+		add("game_jitter_still", "", 0.0);
+	if (f.game_jitter_forget)
+		add("game_jitter_forget", "", 0.0);
 	return s.empty() ? "none" : s;
 }
 
 bool jitter_fault_any(const JitterFault &f) noexcept
 {
-	return f.told_lag || f.told_drop_at >= 0 || f.draw_drop_every != 0 || f.odd_told_scale != 1.0f ||
-		f.draw_scale != 1.0f || f.told_sign_x != 1.0f;
+	return f.told_lag || f.told_drop_at >= 0 || f.draw_drop_every != 0 || f.upscale_drop_every != 0 ||
+		f.odd_told_scale != 1.0f ||
+		f.draw_scale != 1.0f || f.told_sign_x != 1.0f || f.game_jitter_still || f.game_jitter_forget;
 }
 
 bool jitter_fault_hit(uint32_t every, uint32_t frame) noexcept

@@ -35,4 +35,6 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 std::wstring diag_write_report(const PanelState &state, const Settings &settings,
 	std::wstring *error);
 
+std::string diag_player_text(const std::string &raw, std::string *tech);
+
 }

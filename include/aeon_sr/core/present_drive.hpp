@@ -29,6 +29,14 @@ private:
 	uint64_t driven_ = 0;
 };
 
+struct PresentRuntime {
+	uint64_t native = 0;
+	const void *device = nullptr;
+	const void *hwnd = nullptr;
+};
+
+size_t runtime_of_present(const PresentRuntime *runtimes, size_t count, const PresentRuntime &presenting) noexcept;
+
 bool effect_paths_reach(const std::vector<std::string> &paths, const std::string &addon_dir,
 	const std::string &base_dir);
 

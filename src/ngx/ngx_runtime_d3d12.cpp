@@ -1,4 +1,5 @@
 #include "aeon_sr/ngx/ngx_runtime_d3d12.hpp"
+#include "aeon_sr/ngx/ngx_api12.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
 #include "aeon_sr/ngx/ngx_session_ngx.hpp"
 #include "aeon_sr/ngx/ngx_shared_d3d12.hpp"
@@ -33,6 +34,12 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 
 	if (!ensure_dll_present())
 		return false;
+	api = &ngx12_api(addon_dir);
+	if (!api->usable()) {
+		status = UpscalerStatus::InitFailed;
+		last_error = L"DLSS was to run through " + api->path + L", but " + api->error;
+		return false;
+	}
 	if (device == nullptr) {
 		status = UpscalerStatus::InitFailed;
 		last_error = L"null D3D12 device";
@@ -62,7 +69,7 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 			: (L"pre-init NGX modules in process: " + found));
 	}
 
-	const std::wstring search_dir = !dll_dir.empty() ? dll_dir : addon_dir;
+	const std::wstring search_dir = ngx12_feature_dir(*api, !dll_dir.empty() ? dll_dir : addon_dir);
 	const wchar_t *path_list[] = { search_dir.c_str() };
 	NVSDK_NGX_FeatureCommonInfo feature_info{};
 	feature_info.PathListInfo.Path = path_list;
@@ -71,7 +78,7 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 	feature_info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
 	feature_info.LoggingInfo.DisableOtherLoggingSinks = false;
 
-	const NVSDK_NGX_Result init_res = ngx12_acquire(device, data_dir.c_str(), &feature_info, log_tag);
+	const NVSDK_NGX_Result init_res = ngx12_acquire(*api, device, data_dir.c_str(), &feature_info, log_tag);
 	if (NVSDK_NGX_FAILED(init_res)) {
 		status = UpscalerStatus::InitFailed;
 		last_error = ngx_format_result(L"NGX D3D12 Init failed", init_res);
@@ -83,13 +90,15 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 	ngx_initialized = true;
 
 	NVSDK_NGX_Parameter *p = nullptr;
-	const NVSDK_NGX_Result cap_res = NVSDK_NGX_D3D12_GetCapabilityParameters(&p);
+	const NVSDK_NGX_Result cap_res = api->capability_parameters(&p);
 	diag_info("dlss", ngx_format_result(L"D3D12 GetCapabilityParameters", cap_res));
 	if (NVSDK_NGX_FAILED(cap_res) || p == nullptr) {
+		if (p != nullptr)
+			api->destroy_parameters(p);
 		status = UpscalerStatus::InitFailed;
 		last_error = ngx_format_result(L"D3D12 GetCapabilityParameters", cap_res);
 		wait_gpu();
-		ngx12_release(device, log_tag);
+		ngx12_release(*api, device, log_tag);
 		ngx_initialized = false;
 		return false;
 	}
@@ -101,10 +110,10 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 	if (!available) {
 		status = UpscalerStatus::InitFailed;
 		last_error = L"DLSS SuperSampling not available (driver/GPU/DLL)";
-		NVSDK_NGX_D3D12_DestroyParameters(p);
+		api->destroy_parameters(p);
 		params = nullptr;
 		wait_gpu();
-		ngx12_release(device, log_tag);
+		ngx12_release(*api, device, log_tag);
 		ngx_initialized = false;
 		return false;
 	}
@@ -121,12 +130,12 @@ void NgxRuntimeD3D12::shutdown_device()
 	destroy_feature();
 	blit_.release();
 	if (params != nullptr) {
-		NVSDK_NGX_D3D12_DestroyParameters(reinterpret_cast<NVSDK_NGX_Parameter *>(params));
+		api->destroy_parameters(reinterpret_cast<NVSDK_NGX_Parameter *>(params));
 		params = nullptr;
 	}
 	if (ngx_initialized && device != nullptr) {
 		wait_gpu();
-		ngx12_release(device, log_tag);
+		ngx12_release(*api, device, log_tag);
 		ngx_initialized = false;
 	}
 	init_list.release();
@@ -145,7 +154,7 @@ void NgxRuntimeD3D12::destroy_feature()
 		wait_gpu();
 	}
 	if (feature_handle != nullptr && ngx_initialized) {
-		NVSDK_NGX_D3D12_ReleaseFeature(reinterpret_cast<NVSDK_NGX_Handle *>(feature_handle));
+		api->release_feature(reinterpret_cast<NVSDK_NGX_Handle *>(feature_handle));
 		feature_handle = nullptr;
 	}
 	release_scratch();
@@ -162,23 +171,23 @@ void NgxRuntimeD3D12::release_scratch()
 
 namespace {
 
-NVSDK_NGX_Result create_dlss_guarded(ID3D12GraphicsCommandList *cmd,
+NVSDK_NGX_Result create_dlss_guarded(const Ngx12Api &api, ID3D12GraphicsCommandList *cmd,
 	NVSDK_NGX_Handle **handle, NVSDK_NGX_Parameter *params,
 	NVSDK_NGX_DLSS_Create_Params *create, unsigned long *seh_code)
 {
 	__try {
-		return NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, handle, params, create);
+		return api.create_dlss(cmd, handle, params, create);
 	} __except ((*seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
 		return NVSDK_NGX_Result_Fail;
 	}
 }
 
-NVSDK_NGX_Result evaluate_dlss_guarded(ID3D12GraphicsCommandList *cmd,
+NVSDK_NGX_Result evaluate_dlss_guarded(const Ngx12Api &api, ID3D12GraphicsCommandList *cmd,
 	NVSDK_NGX_Handle *handle, NVSDK_NGX_Parameter *params,
 	NVSDK_NGX_D3D12_DLSS_Eval_Params *eval, unsigned long *seh_code)
 {
 	__try {
-		return NGX_D3D12_EVALUATE_DLSS_EXT(cmd, handle, params, eval);
+		return api.evaluate_dlss(cmd, handle, params, eval);
 	} __except ((*seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
 		return NVSDK_NGX_Result_Fail;
 	}
@@ -209,7 +218,7 @@ bool NgxRuntimeD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w,
 		return false;
 
 	NVSDK_NGX_Parameter *create_params = nullptr;
-	if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_AllocateParameters(&create_params)) || create_params == nullptr)
+	if (NVSDK_NGX_FAILED(api->allocate_parameters(&create_params)) || create_params == nullptr)
 		create_params = p;
 
 	ngx_dlss::set_preset_hints(create_params, cfg);
@@ -231,7 +240,7 @@ bool NgxRuntimeD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w,
 
 	NVSDK_NGX_Handle *handle = nullptr;
 	unsigned long seh_code = 0;
-	const NVSDK_NGX_Result cr = create_dlss_guarded(create_cmd, &handle, create_params, &create, &seh_code);
+	const NVSDK_NGX_Result cr = create_dlss_guarded(*api, create_cmd, &handle, create_params, &create, &seh_code);
 	if (seh_code != 0) {
 		crashed = true;
 		status = UpscalerStatus::InitFailed;
@@ -244,14 +253,14 @@ bool NgxRuntimeD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w,
 		if (own_list)
 			init_list.end(device, queue, gpu_fence, false);
 		if (create_params != p && create_params != nullptr)
-			NVSDK_NGX_D3D12_DestroyParameters(create_params);
+			api->destroy_parameters(create_params);
 		return false;
 	}
 	diag_info("dlss", ngx_format_result(L"D3D12 CreateFeature", cr));
 	if (own_list)
 		init_list.end(device, queue, gpu_fence, !NVSDK_NGX_FAILED(cr) && handle != nullptr);
 	if (create_params != p && create_params != nullptr)
-		NVSDK_NGX_D3D12_DestroyParameters(create_params);
+		api->destroy_parameters(create_params);
 	if (NVSDK_NGX_FAILED(cr) || handle == nullptr) {
 		status = UpscalerStatus::InitFailed;
 		last_error = ngx_format_result(L"D3D12 CreateFeature failed", cr);
@@ -415,7 +424,7 @@ bool NgxRuntimeD3D12::evaluate_inputs(ID3D12GraphicsCommandList *cmd, ID3D12Reso
 	barrier12(cmd, output_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
 	NVSDK_NGX_Parameter *eval_params = nullptr;
-	if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_AllocateParameters(&eval_params)) || eval_params == nullptr)
+	if (NVSDK_NGX_FAILED(api->allocate_parameters(&eval_params)) || eval_params == nullptr)
 		eval_params = reinterpret_cast<NVSDK_NGX_Parameter *>(params);
 
 	NVSDK_NGX_D3D12_DLSS_Eval_Params eval{};
@@ -427,11 +436,11 @@ bool NgxRuntimeD3D12::evaluate_inputs(ID3D12GraphicsCommandList *cmd, ID3D12Reso
 	eval.pInBiasCurrentColorMask = bias_input;
 
 	unsigned long seh_code = 0;
-	const NVSDK_NGX_Result er = evaluate_dlss_guarded(cmd,
+	const NVSDK_NGX_Result er = evaluate_dlss_guarded(*api, cmd,
 		reinterpret_cast<NVSDK_NGX_Handle *>(feature_handle), eval_params, &eval, &seh_code);
 	++eval_count;
 	if (eval_params != params && eval_params != nullptr)
-		NVSDK_NGX_D3D12_DestroyParameters(eval_params);
+		api->destroy_parameters(eval_params);
 
 	barrier12(cmd, output_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 

@@ -894,7 +894,7 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 			dispatch(cmd, kPhotoTerms, t, srvs, kSrvCount, uavs, kUavCount, t.terms_gx, t.terms_gy);
 		} else {
 			const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
-				none, none, none, srv_of(dense_[1]), none, none,
+				none, none, none, srv_of(dense_[1]), none, srv_of(global_),
 				staging(kSlotDepth), srv_of(conf_quarter_), srv_of(struct_q_), srv_of(cur), none
 			};
 			const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, uav_of(partials_), none };
@@ -913,7 +913,7 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 		to_state(cmd, next, write_state);
 		{
 			const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
-				none, none, none, none, none, none, none, none, none, srv_of(cur), srv_of(sums_)
+				none, none, none, none, none, srv_of(global_), none, none, none, srv_of(cur), srv_of(sums_)
 			};
 			const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, uav_of(next), none };
 			dispatch(cmd, kModelSolve, t, srvs, kSrvCount, uavs, kUavCount, 1, 1);
@@ -926,7 +926,7 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 		Constants p = m;
 		p.pad_colour = kPublishedFits;
 		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
-			none, none, none, none, none, none, staging(kSlotDepth), none, none, srv_of(theta_[0]), none
+			none, none, none, none, none, srv_of(global_), staging(kSlotDepth), none, none, srv_of(theta_[0]), none
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, uav_of(theta_pub_), none };
 		dispatch(cmd, kThetaPublish, p, srvs, kSrvCount, uavs, kUavCount, 1, 1);
@@ -1174,7 +1174,7 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 			srv_of(prev_flow_), srv_of(global_), staging(kSlotDepth), D3D12_CPU_DESCRIPTOR_HANDLE{}
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[2] = { uav_of(l4_), D3D12_CPU_DESCRIPTOR_HANDLE{} };
-		dispatch(cmd, kCoarseTop, t, srvs, 8, uavs, 2, groups(l4_.w, 8), groups(l4_.h, 8));
+		dispatch(cmd, kCoarseTop, t, srvs, 8, uavs, 2, l4_.w, l4_.h);
 	}
 
 	level(cmd, l4_, l3_[0], l3_[1], 4u, 4u, first);

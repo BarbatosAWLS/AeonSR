@@ -97,6 +97,8 @@ inline constexpr float kNeuralRejectDefault = 0.7f;
 
 inline constexpr float kNeuralInputDetail = 0.2f;
 
+inline constexpr float kNeuralDetailTransfer = 0.5f;
+
 float neural_blend_alpha(float blend) noexcept;
 float neural_steady_weight(float band, float blend) noexcept;
 float neural_reject_threshold(float reject) noexcept;
@@ -129,6 +131,7 @@ struct Settings {
 	bool mv_probe = true;
 
 	bool gpu_timings = false;
+	bool host_gpu_priority = false;
 
 	bool spatial_jitter = true;
 
@@ -143,7 +146,9 @@ struct Settings {
 
 	unsigned int jitter_scene_rule = 0;
 	bool jitter_tested_quads = true;
+	bool jitter_scene_quads = true;
 	bool depth_regrid = true;
+	bool split_pairs = false;
 	bool split_catmull_rom = false;
 	bool upscaler_capture = false;
 	bool scope_capture = false;
@@ -151,6 +156,8 @@ struct Settings {
 	std::string scope_dir;
 	unsigned int scope_key = kScopeKeyDefault;
 	std::string jitter_fault;
+	unsigned int report_key = 0;
+	std::string flight_fault;
 	bool keep_interface = true;
 	bool force_system_memory = false;
 

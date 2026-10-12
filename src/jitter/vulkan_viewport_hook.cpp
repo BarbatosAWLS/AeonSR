@@ -10,10 +10,13 @@
 
 #include <MinHook.h>
 
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <type_traits>
+#include <utility>
 
 namespace aeon_sr {
 namespace {
@@ -21,12 +24,33 @@ namespace {
 static_assert(sizeof(VkViewportFields) == sizeof(VkViewport), "VkViewportFields has to stay VkViewport");
 
 using PfnSetViewportWithCount = void(VKAPI_PTR *)(VkCommandBuffer, uint32_t, const VkViewport *);
+using PfnSetFlag = void(VKAPI_PTR *)(VkCommandBuffer, VkBool32);
+using PfnSetCompare = void(VKAPI_PTR *)(VkCommandBuffer, VkCompareOp);
 
 std::mutex g_lock;
-PfnSetViewportWithCount g_original = nullptr;
 
 bool g_minhook_up = false;
 
+enum HookKind : uint32_t { kViewport, kDepthTest, kDepthWrite, kDepthOp, kHookKinds };
+
+constexpr uint32_t kHookSlots = 16u;
+
+struct HookSlot {
+	std::atomic<void *> target{ nullptr };
+	std::atomic<void *> original{ nullptr };
+};
+HookSlot g_slots[kHookKinds][kHookSlots];
+
+std::atomic<uint32_t> g_enables_before_refusal{ 0 };
+std::atomic<uint32_t> g_refused_enables{ 0 };
+
+template <uint32_t Kind, uint32_t Slot, typename Pfn>
+Pfn original_of() noexcept
+{
+	return reinterpret_cast<Pfn>(g_slots[Kind][Slot].original.load(std::memory_order_acquire));
+}
+
+template <uint32_t Slot>
 void VKAPI_CALL set_viewport_with_count(VkCommandBuffer cmd, uint32_t count, const VkViewport *viewports)
 {
 	if (count != 0 && viewports != nullptr) {
@@ -41,10 +65,121 @@ void VKAPI_CALL set_viewport_with_count(VkCommandBuffer cmd, uint32_t count, con
 		}
 		vulkan_viewport_hook().note_viewports(cmd, 0u, n, seen, flipped);
 	}
-	if (g_original != nullptr)
-		g_original(cmd, count, viewports);
+	if (const auto original = original_of<kViewport, Slot, PfnSetViewportWithCount>())
+		original(cmd, count, viewports);
 }
 
+template <uint32_t Kind, uint32_t Slot>
+void VKAPI_CALL set_depth_flag(VkCommandBuffer cmd, VkBool32 on)
+{
+	const int value = on != VK_FALSE ? 1 : 0;
+	vulkan_viewport_hook().note_depth(cmd, Kind == kDepthTest ? value : -1, Kind == kDepthWrite ? value : -1, -1);
+	if (const auto original = original_of<Kind, Slot, PfnSetFlag>())
+		original(cmd, on);
+}
+
+template <uint32_t Slot>
+void VKAPI_CALL set_depth_op(VkCommandBuffer cmd, VkCompareOp op)
+{
+	vulkan_viewport_hook().note_depth(cmd, -1, -1, static_cast<int>(op));
+	if (const auto original = original_of<kDepthOp, Slot, PfnSetCompare>())
+		original(cmd, op);
+}
+
+template <size_t... S>
+std::array<void *, kHookSlots> viewport_detours(std::index_sequence<S...>) noexcept
+{
+	return { { reinterpret_cast<void *>(&set_viewport_with_count<static_cast<uint32_t>(S)>)... } };
+}
+
+template <uint32_t Kind, size_t... S>
+std::array<void *, kHookSlots> flag_detours(std::index_sequence<S...>) noexcept
+{
+	return { { reinterpret_cast<void *>(&set_depth_flag<Kind, static_cast<uint32_t>(S)>)... } };
+}
+
+template <size_t... S>
+std::array<void *, kHookSlots> op_detours(std::index_sequence<S...>) noexcept
+{
+	return { { reinterpret_cast<void *>(&set_depth_op<static_cast<uint32_t>(S)>)... } };
+}
+
+void *detour_of(uint32_t kind, uint32_t slot) noexcept
+{
+	static const std::array<void *, kHookSlots> detours[kHookKinds] = {
+		viewport_detours(std::make_index_sequence<kHookSlots>()),
+		flag_detours<kDepthTest>(std::make_index_sequence<kHookSlots>()),
+		flag_detours<kDepthWrite>(std::make_index_sequence<kHookSlots>()),
+		op_detours(std::make_index_sequence<kHookSlots>()),
+	};
+	return detours[kind][slot];
+}
+
+HookSlot *slot_of(uint32_t kind, void *target) noexcept
+{
+	for (HookSlot &s : g_slots[kind]) {
+		if (s.target.load(std::memory_order_acquire) == target)
+			return &s;
+	}
+	return nullptr;
+}
+
+MH_STATUS enable(void *target) noexcept
+{
+	if (g_refused_enables.load() != 0) {
+		if (g_enables_before_refusal.load() != 0) {
+			g_enables_before_refusal.fetch_sub(1u);
+		} else {
+			g_refused_enables.fetch_sub(1u);
+			return MH_ERROR_MEMORY_PROTECT;
+		}
+	}
+	const MH_STATUS st = MH_EnableHook(target);
+	return st == MH_ERROR_ENABLED ? MH_OK : st;
+}
+
+void *hook_at(uint32_t kind, void *target, const char **why) noexcept
+{
+	*why = "the device has no such call";
+	if (target == nullptr)
+		return nullptr;
+	HookSlot *slot = slot_of(kind, target);
+	if (slot == nullptr) {
+		for (uint32_t k = 0; k < kHookKinds; ++k) {
+			if (k != kind && slot_of(k, target) != nullptr) {
+				*why = "its address is another call's";
+				return nullptr;
+			}
+		}
+		uint32_t empty = 0;
+		while (empty < kHookSlots && g_slots[kind][empty].target.load(std::memory_order_acquire) != nullptr)
+			++empty;
+		if (empty == kHookSlots) {
+			*why = "it has been hooked at sixteen other addresses already";
+			return nullptr;
+		}
+		void *made = nullptr;
+		if (MH_CreateHook(target, detour_of(kind, empty), &made) != MH_OK || made == nullptr) {
+			*why = "the hooking library would not hook it";
+			return nullptr;
+		}
+		slot = &g_slots[kind][empty];
+		slot->original.store(made, std::memory_order_release);
+		slot->target.store(target, std::memory_order_release);
+	}
+	if (enable(target) != MH_OK) {
+		*why = "the hooking library would not enable it";
+		return nullptr;
+	}
+	return slot->original.load(std::memory_order_acquire);
+}
+
+}
+
+void VulkanViewportHook::refuse_enables(uint32_t after, uint32_t n) noexcept
+{
+	g_enables_before_refusal.store(after);
+	g_refused_enables.store(n);
 }
 
 JitterViewport jitter_viewport_from_vk(const VkViewportFields &v) noexcept
@@ -93,13 +228,8 @@ const VulkanViewportHook::Slot *VulkanViewportHook::find(void *cmd) const noexce
 	return nullptr;
 }
 
-void VulkanViewportHook::note_viewports(void *cmd, uint32_t first, uint32_t count,
-	const JitterViewport *vp, const bool *flipped) noexcept
+VulkanViewportHook::Slot *VulkanViewportHook::claim(void *cmd) noexcept
 {
-	if (cmd == nullptr || vp == nullptr || first != 0u || count == 0u || count > kJitterViewportSlots)
-		return;
-	const std::lock_guard<std::mutex> lock(g_lock);
-	saw_ = true;
 	Slot *slot = find(cmd);
 	if (slot == nullptr) {
 		slot = &slots_[0];
@@ -108,12 +238,25 @@ void VulkanViewportHook::note_viewports(void *cmd, uint32_t first, uint32_t coun
 				slot = &s;
 				break;
 			}
-			if (s.stamp < slot->stamp)
+			if (s.used < slot->used)
 				slot = &s;
 		}
+		*slot = Slot{};
 		slot->cmd = cmd;
 	}
-	slot->stamp = ++stamp_;
+	slot->used = ++stamp_;
+	return slot;
+}
+
+void VulkanViewportHook::note_viewports(void *cmd, uint32_t first, uint32_t count,
+	const JitterViewport *vp, const bool *flipped) noexcept
+{
+	if (cmd == nullptr || vp == nullptr || first != 0u || count == 0u || count > kJitterViewportSlots)
+		return;
+	const std::lock_guard<std::mutex> lock(g_lock);
+	saw_ = true;
+	Slot *const slot = claim(cmd);
+	slot->stamp = slot->used;
 	slot->count = count;
 	for (uint32_t i = 0; i < count; ++i) {
 		slot->vp[i] = vp[i];
@@ -128,6 +271,35 @@ void VulkanViewportHook::forget_list(void *cmd) noexcept
 	const std::lock_guard<std::mutex> lock(g_lock);
 	if (Slot *const slot = find(cmd))
 		*slot = Slot{};
+}
+
+void VulkanViewportHook::note_depth(void *cmd, int enable, int write, int op) noexcept
+{
+	if (cmd == nullptr)
+		return;
+	const std::lock_guard<std::mutex> lock(g_lock);
+	Slot *const slot = claim(cmd);
+	if (enable >= 0)
+		slot->depth_enable = static_cast<int8_t>(enable != 0 ? 1 : 0);
+	if (write >= 0)
+		slot->depth_write = static_cast<int8_t>(write != 0 ? 1 : 0);
+	if (op >= 0 && op <= VK_COMPARE_OP_ALWAYS)
+		slot->depth_op = static_cast<int8_t>(op);
+}
+
+bool VulkanViewportHook::depth_of(void *cmd, int *enable, int *write, int *op) const noexcept
+{
+	*enable = *write = *op = -1;
+	if (cmd == nullptr)
+		return false;
+	const std::lock_guard<std::mutex> lock(g_lock);
+	const Slot *const slot = find(cmd);
+	if (slot == nullptr)
+		return false;
+	*enable = slot->depth_enable;
+	*write = slot->depth_write;
+	*op = slot->depth_op;
+	return *enable >= 0 || *write >= 0 || *op >= 0;
 }
 
 uint64_t VulkanViewportHook::stamp_of(void *cmd) const noexcept
@@ -162,7 +334,7 @@ bool VulkanViewportHook::set(void *cmd, uint32_t first, uint32_t count, const Ji
 	bool flipped[kJitterViewportSlots];
 	{
 		const std::lock_guard<std::mutex> lock(g_lock);
-		call = g_original;
+		call = reinterpret_cast<PfnSetViewportWithCount>(original_);
 		const Slot *const slot = find(cmd);
 		for (uint32_t i = 0; i < count; ++i)
 			flipped[i] = slot == nullptr || i >= slot->count || slot->flipped[i];
@@ -212,30 +384,58 @@ bool VulkanViewportHook::install(void *device, void *get_device_proc) noexcept
 		g_minhook_up = true;
 	}
 
-	void *original = nullptr;
-	MH_STATUS st = MH_CreateHook(use, reinterpret_cast<void *>(&set_viewport_with_count), &original);
-	if (st == MH_ERROR_ALREADY_CREATED) {
-		st = MH_OK;
-	}
-	if (st != MH_OK) {
+	const char *why = nullptr;
+	void *const original = hook_at(kViewport, use, &why);
+	if (original == nullptr) {
 		note_ = "vkCmdSetViewportWithCount could not be hooked";
-		return false;
-	}
-	if (MH_EnableHook(use) != MH_OK) {
-		MH_RemoveHook(use);
-		note_ = "vkCmdSetViewportWithCount could not be hooked";
+		diag_logf(DiagLevel::Warn, "jitter", L"vkCmdSetViewportWithCount could not be hooked: %hs", why);
 		return false;
 	}
 	{
 		const std::lock_guard<std::mutex> lock(g_lock);
-		if (original != nullptr)
-			g_original = reinterpret_cast<PfnSetViewportWithCount>(original);
 		original_ = original;
 	}
 	installed_ = true;
 	note_ = "";
 	diag_info("jitter", L"hooked vkCmdSetViewportWithCount: this game sets its viewport where ReShade "
 		L"does not report it, so the add-on reads it here instead");
+
+	struct DepthCall {
+		const char *name;
+		uint32_t kind;
+	};
+	const DepthCall calls[] = {
+		{ "vkCmdSetDepthTestEnable", kDepthTest },
+		{ "vkCmdSetDepthTestEnableEXT", kDepthTest },
+		{ "vkCmdSetDepthWriteEnable", kDepthWrite },
+		{ "vkCmdSetDepthWriteEnableEXT", kDepthWrite },
+		{ "vkCmdSetDepthCompareOp", kDepthOp },
+		{ "vkCmdSetDepthCompareOpEXT", kDepthOp },
+	};
+	void *hooked[6] = {};
+	uint32_t enabled = 0, test_calls = 0;
+	for (uint32_t i = 0; i < 6u; ++i) {
+		void *const call = reinterpret_cast<void *>(gdpa(static_cast<VkDevice>(device), calls[i].name));
+		if (call == nullptr || call == use)
+			continue;
+		bool same = false;
+		for (uint32_t k = 0; k < i; ++k)
+			same = same || hooked[k] == call;
+		if (same)
+			continue;
+		if (hook_at(calls[i].kind, call, &why) != nullptr) {
+			hooked[i] = call;
+			++enabled;
+			test_calls += calls[i].kind == kDepthTest ? 1u : 0u;
+		} else {
+			diag_logf(DiagLevel::Info, "jitter", L"%hs could not be hooked: %hs", calls[i].name, why);
+		}
+	}
+	depth_hooked_ = test_calls != 0u;
+	if (depth_hooked_)
+		diag_logf(DiagLevel::Info, "jitter", L"hooked %u of the calls that set the depth test dynamically: "
+			L"ReShade does not report them, and they tell the interface and the quads over the scene apart",
+			enabled);
 	return true;
 }
 
@@ -245,8 +445,8 @@ void VulkanViewportHook::forget() noexcept
 		MH_DisableHook(MH_ALL_HOOKS);
 	}
 	const std::lock_guard<std::mutex> lock(g_lock);
-	g_original = nullptr;
 	installed_ = false;
+	depth_hooked_ = false;
 	saw_ = false;
 	note_ = "";
 	device_ = nullptr;

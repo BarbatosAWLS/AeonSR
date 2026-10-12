@@ -15,12 +15,16 @@
 #include "aeon_sr/core/frame_clock.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/core/frame_plan.hpp"
+#include "aeon_sr/core/flight_recorder.hpp"
+#include "aeon_sr/core/report_bundle.hpp"
 #include "aeon_sr/jitter/scene_snapshot.hpp"
 #include "aeon_sr/jitter/frame_shift.hpp"
 #include "aeon_sr/core/gpu_vendor.hpp"
 #include "aeon_sr/core/frame_observer.hpp"
 #include "aeon_sr/jitter/hud_restore.hpp"
 #include "aeon_sr/jitter/jitter_landing.hpp"
+#include "aeon_sr/motion/game_jitter_memory.hpp"
+#include "aeon_sr/motion/game_jitter_probe.hpp"
 #include "aeon_sr/motion/guide_builder.hpp"
 #include "aeon_sr/core/input_probes.hpp"
 #include "aeon_sr/interop/interop.hpp"
@@ -84,6 +88,11 @@ public:
 	void request_reset() noexcept { history_.reset_pending = true; history_.temporal_history_valid = false; }
 	void persist_settings();
 	void shutdown();
+	void at_process_exit() noexcept
+	{
+		keep_game_jitter_memory();
+		flight_.dump_at_exit();
+	}
 
 private:
 	HMODULE module_ = nullptr;
@@ -113,9 +122,11 @@ private:
 	uint32_t remote_in_width_ = 0, remote_in_height_ = 0;
 	bool remote_wanted() const noexcept;
 	bool runs_remote(const UpscalerBackend *backend) const noexcept;
-	bool dlss_needs_host() const noexcept;
 	EngineRoute engine_route_now() const noexcept;
+	bool dlss_override() const noexcept;
 	bool crosses(const UpscalerBackend *backend) const noexcept;
+	bool must_run_in_host(const UpscalerBackend *backend) const noexcept;
+	bool upscaler_layer_seen() const noexcept;
 	void ensure_remote();
 	void run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 		const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params,
@@ -203,6 +214,7 @@ private:
 	bool observed_ = false;
 	bool hud_detected_ = false;
 	bool interface_split_ = false;
+	bool interface_restored_ = false;
 	unsigned long long census_logged_at_ = 0;
 	SplitGate split_gate_;
 	uint32_t seen_drawn_ = 0, seen_empty_ = 0, seen_other_ = 0, seen_changes_ = 0, seen_split_ = 0;
@@ -216,6 +228,7 @@ private:
 	};
 	std::mutex runtimes_lock_;
 	std::vector<RuntimeDrive> runtimes_;
+	std::vector<PresentRuntime> present_keys_;
 	UpscalerCaptureD3D12 upscaler_capture_;
 	std::wstring upscaler_capture_logged_;
 	std::wstring scope_logged_;
@@ -257,6 +270,45 @@ private:
 	uint32_t learned_scene_dw_ = 0, learned_scene_dh_ = 0;
 	bool move_all_ = false;
 	JitterLanding landing_;
+	GameJitterProbeD3D12 game_probe_;
+	GameJitterDetector game_jitter_;
+	struct ProbeDrawn {
+		uint64_t serial = 0;
+		float x = 0.0f, y = 0.0f;
+		bool scene = false;
+	};
+	ProbeDrawn probe_drawn_[8]{};
+	std::wstring game_probe_error_;
+	bool game_probe_failed_ = false;
+	bool game_depth_ = false;
+	bool withheld_said_ = false;
+	GameJitterMemory game_memory_;
+	std::wstring game_memory_path_;
+	std::string game_exe_;
+	bool game_memory_loaded_ = false;
+	uint32_t memory_w_ = 0, memory_h_ = 0;
+	bool memory_unsaved_ = false;
+	unsigned long long memory_retry_at_ = 0;
+	void keep_game_jitter_memory() noexcept;
+	unsigned long long jitter_measure_logged_at_ = 0;
+	uint32_t landing_reads_at_ = 0, landing_short_at_ = 0, game_fits_ = 0, game_skipped_at_ = 0;
+	uint32_t game_depth_few_ = 0, game_depth_one_way_ = 0, responses_at_ = 0;
+	bool camera_moving_ = false;
+	CameraMotionGate camera_gate_;
+	uint64_t game_fits_seen_at_ = 0;
+	static constexpr unsigned long long kVerdictSettleMs = 5000u;
+	unsigned long long verdict_since_ = 0;
+	bool verdict_jitters_ = false, verdict_confirmed_ = false;
+	int overruled_said_ = 0;
+	bool depth_withholds_offset() const noexcept
+	{
+		return depth_withholds(game_jitter_.jitters(), landing_.lands(),
+			game_jitter_.remembered() || landing_.takes_out());
+	}
+	bool offset_withheld() const noexcept
+	{
+		return withhold_offset(landing_.absorbed(), game_jitter_.measured(), depth_withholds_offset());
+	}
 	BlitPipelineD3D12 frame_shift_blit_;
 	Gpu12Fence frame_shift_fence_;
 	StageTimings stage_times_;
@@ -264,6 +316,7 @@ private:
 		const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params);
 	void run_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 		const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params);
+	void restore_interface(const FrameInputs &inputs);
 	void run_neural_render(reshade::api::effect_runtime *runtime,
 		const FrameInputs &inputs, const NeuralPlan &neural,
 		float depth_jitter_u, float depth_jitter_v);
@@ -278,12 +331,29 @@ private:
 	void write_report(const PanelState &state, bool to_clipboard);
 	std::wstring report_path_;
 	std::wstring report_error_;
+	void start_report(const PanelState &state);
+	void service_report();
+	enum class ReportPhase { None, Frame, Writing };
+	struct ReportJob {
+		std::wstring zip_path, staging, frame_dir;
+		std::string flight_csv, frame_note;
+		bool frame_asked = false;
+		unsigned long long deadline = 0;
+	} report_job_;
+	std::mutex report_lock_;
+	ReportPhase report_phase_ = ReportPhase::None;
+	std::wstring report_shown_, report_shown_error_;
+	void flight_commit();
+	FlightFault flight_fault_;
+	uint32_t flight_landing_reads_ = 0;
 	void invalidate_temporal_history() noexcept;
 	const UpscalerBackend &backend_for_api(reshade::api::device_api api) const noexcept;
 	bool active_is_dlss() const noexcept;
 	bool active_is_fsr() const noexcept;
 	bool active_is_xess() const noexcept;
 	bool active_is_vsr() const noexcept;
+
+	FlightRecorder flight_;
 };
 
 App *app() noexcept;

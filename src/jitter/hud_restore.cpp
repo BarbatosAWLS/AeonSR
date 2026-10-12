@@ -15,7 +15,7 @@ namespace aeon_sr {
 
 namespace {
 
-constexpr uint32_t kConstantCount = 16;
+constexpr uint32_t kConstantCount = 20;
 static_assert(kHudRestoreCap <= 255u && kHudRestoreNeed <= 255u, "each fits a byte of the state");
 
 constexpr const char kHudHlsl[] = R"(
@@ -34,6 +34,8 @@ cbuffer C : register(b0)
 	float drawn;
 	float split;
 	float history;
+	float bounded;
+	float3 pad_;
 };
 
 Texture2D<float4> frame_now : register(t0);
@@ -150,12 +152,30 @@ void CSTrans(uint3 id : SV_DispatchThreadID)
 	trans_out[id.xy] = trans_in.Load(p) * kTransDecay + float4(dot(df, ds), dot(ds, ds), dot(df, df), 0.0);
 }
 
-float transparency(int2 p)
+float transparency_bound(float3 f, float3 s)
+{
+	if (bounded < 0.5 || all(f == s))
+		return 0.0;
+	const float h = 0.5 / 255.0;
+	float t = 1.0;
+	[unroll] for (int c = 0; c < 3; ++c) {
+		if (s[c] > h)
+			t = min(t, (f[c] + h) / s[c]);
+		if (s[c] < 1.0 - h)
+			t = min(t, (1.0 - f[c] + h) / (1.0 - s[c]));
+	}
+	return saturate(t);
+}
+
+float transparency(int2 p, float3 f, float3 s)
 {
 	const float4 m = trans_in.Load(int3(p, 0));
-	if (m.y <= 2e-4 || m.x <= 0.0 || m.x * m.x < 0.81 * m.y * m.z)
-		return 0.0;
-	return saturate(m.x / m.y);
+	const float b = transparency_bound(f, s);
+	const float w = saturate((m.y - 2e-4) / 6e-4);
+	if (w <= 0.0)
+		return b;
+	const float r = m.x <= 0.0 || m.x * m.x < 0.81 * m.y * m.z ? 0.0 : saturate(m.x / m.y);
+	return lerp(b, min(r, b), w);
 }
 
 bool still_under_interface(int2 p)
@@ -197,8 +217,9 @@ float4 PSComposite(VSOut i) : SV_Target
 	const float3 f = frame_now.Load(int3(p, 0)).rgb;
 	if (split < 0.5)
 		return float4(f, 0.0);
-	const float t = transparency(p);
-	return float4(f - t * scene_now.Load(int3(p, 0)).rgb, t);
+	const float3 s = scene_now.Load(int3(p, 0)).rgb;
+	const float t = transparency(p, f, s);
+	return float4(f - t * s, t);
 }
 
 float4 PSRegister(VSOut i) : SV_Target
@@ -295,6 +316,22 @@ bool is_srgb(DXGI_FORMAT f) noexcept
 {
 	return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
 		f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
+
+bool bounded_format(DXGI_FORMAT f) noexcept
+{
+	switch (view_format_for(f)) {
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+	case DXGI_FORMAT_R32G32B32A32_FLOAT:
+	case DXGI_FORMAT_R32G32B32_FLOAT:
+	case DXGI_FORMAT_R11G11B10_FLOAT:
+	case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+		return false;
+	default:
+		return true;
+	}
 }
 
 DXGI_FORMAT stable_format(DXGI_FORMAT f) noexcept
@@ -579,7 +616,7 @@ void HudRestoreD3D12::constants(float *c) const noexcept
 		static_cast<float>(std::clamp(tuning.need, 1u, 255u)), static_cast<float>(tuning.cost),
 		static_cast<float>(std::min(tuning.cap, 255u)), tuning.flat,
 		tuning.register_ring ? 1.0f : 0.0f, frame_.drawn ? 1.0f : 0.0f, frame_.scene != nullptr ? 1.0f : 0.0f,
-		trans_history_ ? 1.0f : 0.0f };
+		trans_history_ ? 1.0f : 0.0f, bounded_format(format_) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
 	std::memcpy(c, v, sizeof(v));
 }
 

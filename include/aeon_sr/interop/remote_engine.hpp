@@ -12,6 +12,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace aeon_sr {
@@ -43,6 +44,8 @@ public:
 		float neural_gpu_ms = 0.0f;
 		std::wstring message;
 		bool list_recording = true;
+		float wait_ms = std::numeric_limits<float>::quiet_NaN();
+		bool host_busy = false;
 	};
 
 	bool start(EngineDevice &engine, HMODULE module, reshade::api::device_api game_api);
@@ -70,6 +73,8 @@ public:
 	uint32_t host_gpu_vendor() const noexcept { return host_gpu_vendor_; }
 
 	~RemoteEngine();
+
+	bool host_gpu_priority_high = false;
 
 private:
 	struct SharedTexture {
@@ -118,6 +123,13 @@ private:
 	uint64_t last_wait_value_ = 0;
 	uint64_t outstanding_signal_ = 0;
 	bool frame_outstanding_ = false;
+
+	struct Stats {
+		uint32_t frames = 0, answered = 0, timeouts = 0, busy = 0;
+		double wait_ms = 0.0, wait_max_ms = 0.0;
+		ULONGLONG since = 0;
+	} stats_;
+	void note_stats() noexcept;
 };
 
 }

@@ -93,7 +93,21 @@ struct Args {
 	uint32_t pid = 0;
 	std::wstring log;
 	bool verbose = false;
+	bool gpu_priority_high = false;
 };
+
+void raise_gpu_priority(HostSession &session)
+{
+	session.set_queue_priority(D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+	using SetClass = LONG(APIENTRY *)(HANDLE, int);
+	const HMODULE gdi = GetModuleHandleW(L"gdi32.dll") != nullptr ? GetModuleHandleW(L"gdi32.dll")
+		: LoadLibraryW(L"gdi32.dll");
+	const auto set_class = gdi != nullptr
+		? reinterpret_cast<SetClass>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass")) : nullptr;
+	const LONG status = set_class != nullptr ? set_class(GetCurrentProcess(), 4) : -1;
+	diag_logf(DiagLevel::Info, "host", L"GPU priority raised: queue HIGH, scheduling class HIGH %ls (0x%08X)",
+		status == 0 ? L"set" : L"refused", static_cast<unsigned>(status));
+}
 
 Args parse_args()
 {
@@ -109,6 +123,8 @@ Args parse_args()
 			args.log = argv[++i];
 		else if (wcscmp(argv[i], L"--verbose") == 0)
 			args.verbose = true;
+		else if (wcscmp(argv[i], L"--gpu-priority") == 0 && i + 1 < argc)
+			args.gpu_priority_high = wcscmp(argv[++i], L"high") == 0;
 	}
 	LocalFree(argv);
 	return args;
@@ -221,6 +237,8 @@ int run(const Args &args, const std::wstring &host_dir)
 
 	note_foreign_modules(L"before the engine");
 	HostSession session;
+	if (args.gpu_priority_high)
+		raise_gpu_priority(session);
 	const bool started = session.start(args.pid, block, host_dir);
 	note_foreign_modules(L"with the engine up");
 	if (!started) {

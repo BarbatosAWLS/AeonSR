@@ -1,5 +1,7 @@
 #include "aeon_sr/jitter/gl_jitter.hpp"
 
+#include "aeon_sr/jitter/shader_position.hpp"
+
 #include <windows.h>
 
 #include <atomic>
@@ -17,12 +19,26 @@ typedef void(WINAPI *PfnGetIntegerv)(unsigned int, int *);
 typedef void(WINAPI *PfnViewportIndexedf)(unsigned int, float, float, float, float);
 typedef void(WINAPI *PfnGetFloati)(unsigned int, unsigned int, float *);
 typedef const unsigned char *(WINAPI *PfnGetString)(unsigned int);
+typedef const unsigned char *(WINAPI *PfnGetStringi)(unsigned int, unsigned int);
+typedef void(WINAPI *PfnGetFloatv)(unsigned int, float *);
+typedef unsigned char(WINAPI *PfnIsEnabled)(unsigned int);
 
 constexpr unsigned int kGlVersion = 0x1F02u;
 constexpr unsigned int kGlViewport = 0x0BA2u;
 constexpr unsigned int kGlViewportSubpixelBits = 0x825Cu;
 constexpr unsigned int kGlClipOrigin = 0x935Cu;
 constexpr int kGlUpperLeft = 0x8CA2;
+constexpr unsigned int kGlExtensions = 0x1F03u;
+constexpr unsigned int kGlNumExtensions = 0x821Du;
+constexpr unsigned int kGlContextFlags = 0x821Eu;
+constexpr unsigned int kGlContextProfileMask = 0x9126u;
+constexpr int kGlContextForwardCompatible = 0x1;
+constexpr int kGlContextCoreProfile = 0x1;
+constexpr unsigned int kGlCurrentProgram = 0x8B8Du;
+constexpr unsigned int kGlProgramPipelineBinding = 0x825Au;
+constexpr unsigned int kGlVertexProgram = 0x8620u;
+constexpr unsigned int kGlModelviewMatrix = 0x0BA6u;
+constexpr unsigned int kGlProjectionMatrix = 0x0BA7u;
 
 struct GlEntry {
 	HMODULE gl32 = nullptr;
@@ -30,6 +46,8 @@ struct GlEntry {
 	PfnWglGetCurrentContext current = nullptr;
 	PfnGetIntegerv get_integerv = nullptr;
 	PfnGetString get_string = nullptr;
+	PfnGetFloatv get_floatv = nullptr;
+	PfnIsEnabled is_enabled = nullptr;
 };
 
 struct GlContext {
@@ -40,6 +58,8 @@ struct GlContext {
 	int bits = 0;
 	const char *note = "";
 	uint64_t observed = ~0ull;
+	int version = 0;
+	bool ff_known = false, fixed_function = false, vertex_programs = false;
 };
 
 std::atomic<bool> g_upper_left{ false };
@@ -66,6 +86,8 @@ const GlEntry &entry() noexcept
 		g_entry.current = reinterpret_cast<PfnWglGetCurrentContext>(GetProcAddress(g_entry.gl32, "wglGetCurrentContext"));
 		g_entry.get_integerv = reinterpret_cast<PfnGetIntegerv>(GetProcAddress(g_entry.gl32, "glGetIntegerv"));
 		g_entry.get_string = reinterpret_cast<PfnGetString>(GetProcAddress(g_entry.gl32, "glGetString"));
+		g_entry.get_floatv = reinterpret_cast<PfnGetFloatv>(GetProcAddress(g_entry.gl32, "glGetFloatv"));
+		g_entry.is_enabled = reinterpret_cast<PfnIsEnabled>(GetProcAddress(g_entry.gl32, "glIsEnabled"));
 	});
 	return g_entry;
 }
@@ -90,6 +112,7 @@ const GlContext *resolved() noexcept
 				minor = std::atoi(dot + 1);
 		}
 		const int version = major * 10 + minor;
+		c.version = version;
 		if (version >= 41) {
 			c.viewport_indexed = reinterpret_cast<PfnViewportIndexedf>(proc_of(e.get_proc, "glViewportIndexedf"));
 			c.get_floati = reinterpret_cast<PfnGetFloati>(proc_of(e.get_proc, "glGetFloati_v"));
@@ -195,6 +218,89 @@ void gl_jitter_observe(uint64_t frame) noexcept
 bool gl_clip_origin_upper_left() noexcept
 {
 	return g_upper_left.load();
+}
+
+namespace {
+
+bool has_extension(const GlContext &c, const char *name) noexcept
+{
+	const GlEntry &e = entry();
+	const size_t len = std::strlen(name);
+	if (c.version >= 30) {
+		const auto get_stringi = reinterpret_cast<PfnGetStringi>(proc_of(e.get_proc, "glGetStringi"));
+		if (get_stringi == nullptr)
+			return false;
+		int n = 0;
+		e.get_integerv(kGlNumExtensions, &n);
+		for (int i = 0; i < n; ++i) {
+			const unsigned char *s = get_stringi(kGlExtensions, static_cast<unsigned int>(i));
+			if (s != nullptr && std::strcmp(reinterpret_cast<const char *>(s), name) == 0)
+				return true;
+		}
+		return false;
+	}
+	const unsigned char *list = e.get_string(kGlExtensions);
+	if (list == nullptr)
+		return false;
+	for (const char *p = reinterpret_cast<const char *>(list); (p = std::strstr(p, name)) != nullptr; p += len) {
+		const bool starts = p == reinterpret_cast<const char *>(list) || p[-1] == ' ';
+		if (starts && (p[len] == ' ' || p[len] == '\0'))
+			return true;
+	}
+	return false;
+}
+
+}
+
+JitterVertexClass gl_fixed_function_vertex_class(bool *perspective) noexcept
+{
+	if (perspective != nullptr)
+		*perspective = false;
+	GlContext *const g = const_cast<GlContext *>(resolved());
+	const GlEntry &e = entry();
+	if (g == nullptr || e.get_floatv == nullptr || e.is_enabled == nullptr)
+		return JitterVertexClass::Unknown;
+	if (!g->ff_known) {
+		g->ff_known = true;
+		bool fixed = true;
+		if (g->version >= 32) {
+			int mask = 0;
+			e.get_integerv(kGlContextProfileMask, &mask);
+			fixed = (mask & kGlContextCoreProfile) == 0;
+		} else if (g->version == 31) {
+			fixed = has_extension(*g, "GL_ARB_compatibility");
+		}
+		if (fixed && g->version >= 30) {
+			int flags = 0;
+			e.get_integerv(kGlContextFlags, &flags);
+			fixed = (flags & kGlContextForwardCompatible) == 0;
+		}
+		g->fixed_function = fixed;
+		g->vertex_programs = fixed && (has_extension(*g, "GL_ARB_vertex_program") || has_extension(*g, "GL_NV_vertex_program"));
+	}
+	if (!g->fixed_function)
+		return JitterVertexClass::Unknown;
+	if (g->version >= 20) {
+		int program = 0;
+		e.get_integerv(kGlCurrentProgram, &program);
+		if (program != 0)
+			return JitterVertexClass::Unknown;
+	}
+	if (g->version >= 41) {
+		int pipeline = 0;
+		e.get_integerv(kGlProgramPipelineBinding, &pipeline);
+		if (pipeline != 0)
+			return JitterVertexClass::Unknown;
+	}
+	if (g->vertex_programs && e.is_enabled(kGlVertexProgram) != 0)
+		return JitterVertexClass::Unknown;
+	float projection[16]{}, modelview[16]{};
+	e.get_floatv(kGlProjectionMatrix, projection);
+	e.get_floatv(kGlModelviewMatrix, modelview);
+	const JitterVertexClass c = classify_gl_fixed_function(projection, modelview);
+	if (perspective != nullptr && c != JitterVertexClass::Unknown)
+		*perspective = gl_fixed_function_perspective(projection, modelview);
+	return c;
 }
 
 GlJitterQuiet::GlJitterQuiet() noexcept : was_(t_own)

@@ -193,6 +193,7 @@ const char *scope_plane_name(ScopePlane p) noexcept
 	case ScopePlane::Upscaled: return "upscaled";
 	case ScopePlane::Final: return "final";
 	case ScopePlane::Mask: return "mask";
+	case ScopePlane::Neural: return "neural";
 	case ScopePlane::Count: break;
 	}
 	return "";

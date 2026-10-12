@@ -4,6 +4,7 @@
 #include "aeon_sr/upscalers/backend_fsr.hpp"
 #include "aeon_sr/upscalers/backend_xess.hpp"
 #include "aeon_sr/interop/interop.hpp"
+#include "aeon_sr/interop/gpu12.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
 #include "aeon_sr/ngx/ngx_runtime_d3d12.hpp"
 #include "aeon_sr/interop/remote_protocol.hpp"
@@ -40,6 +41,8 @@ public:
 	bool shutdown_requested() const noexcept;
 
 	const std::wstring &last_error() const noexcept { return last_error_; }
+
+	void set_queue_priority(int priority) noexcept { engine_.queue_priority = priority; }
 
 private:
 	struct Plane {
@@ -93,6 +96,18 @@ private:
 	uint64_t fence_signal_value_ = 0;
 
 	std::wstring last_error_;
+
+	struct Stats {
+		uint32_t frames = 0;
+		double serve_ms = 0.0, serve_max_ms = 0.0;
+		double stall_ms = 0.0, stall_max_ms = 0.0;
+		double gpu_ms = 0.0, gpu_max_ms = 0.0;
+		uint32_t gpu_frames = 0;
+		uint64_t behind = 0, behind_max = 0;
+		ULONGLONG since = 0;
+	} stats_;
+	Gpu12Timer gpu_timer_;
+	void note_stats(double serve_ms, double stall_ms) noexcept;
 };
 
 }

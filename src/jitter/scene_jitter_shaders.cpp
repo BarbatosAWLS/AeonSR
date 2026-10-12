@@ -1,11 +1,14 @@
 #include "aeon_sr/jitter/scene_jitter_shaders.hpp"
 
+#include "aeon_sr/jitter/constant_reads.hpp"
+#include "aeon_sr/jitter/scene_jitter_hooks.hpp"
 #include "aeon_sr/jitter/shader_offset.hpp"
 
 #include <d3d10.h>
 #include <d3d9.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <shared_mutex>
@@ -29,10 +32,31 @@ std::atomic<bool> g_any{ false };
 std::shared_mutex g_registry_lock;
 std::unordered_map<uint64_t, uint32_t> g_registry;
 std::atomic<uint64_t> g_generation{ 1 };
+std::unordered_map<uint64_t, D3D9WTerms> g_wterms;
+std::unordered_map<uint64_t, DxbcWTerms> g_dxbc_wterms;
+constexpr uint32_t kSlotMask = 0xFFFFu;
+constexpr uint32_t kClassShift = 28u;
+
+uint32_t slot_of(uint32_t entry) noexcept
+{
+	return entry & kSlotMask;
+}
+
+JitterVertexClass class_of(uint32_t entry) noexcept
+{
+	return static_cast<JitterVertexClass>((entry >> kClassShift) & 3u);
+}
+
+uint32_t class_bits(JitterVertexClass c) noexcept
+{
+	return static_cast<uint32_t>(c) << kClassShift;
+}
 
 std::atomic<uint32_t> g_d3d9_regs[kD3D9OffsetConstants / 32u]{};
 
 constexpr uint32_t kIndexedEntry = 0x80000000u;
+static_assert((kIndexedEntry & (3u << kClassShift)) == 0u && (kSlotMask & (3u << kClassShift)) == 0u,
+	"the class bits stand apart from the slot and the indexed bit");
 
 std::atomic<uint32_t> g_game_regs[kD3D9OffsetConstants / 32u]{};
 
@@ -65,6 +89,51 @@ thread_local std::vector<uint8_t> t_code;
 thread_local const void *t_code_ptr = nullptr;
 thread_local uint32_t t_index = 0;
 thread_local bool t_indexed = false;
+thread_local JitterVertexClass t_class = JitterVertexClass::Unknown;
+thread_local D3D9WTerms t_wterms{};
+thread_local bool t_wterms_known = false;
+thread_local DxbcWTerms t_dxbc_wterms{};
+thread_local bool t_dxbc_wterms_known = false;
+
+JitterVertexClass classify(device_api api, const shader_desc &desc)
+{
+	if (desc.code == nullptr || desc.code_size == 0)
+		return JitterVertexClass::Unknown;
+	if (api == device_api::d3d9)
+		return classify_d3d9_vertex_shader(static_cast<const uint32_t *>(desc.code), desc.code_size / 4u);
+	return classify_dxbc_vertex_shader(desc.code, desc.code_size);
+}
+
+bool read_wterms(device_api api, const shader_desc &desc, D3D9WTerms *out)
+{
+	if (api != device_api::d3d9 || desc.code == nullptr || desc.code_size == 0)
+		return false;
+	return d3d9_position_w_terms(static_cast<const uint32_t *>(desc.code), desc.code_size / 4u, out);
+}
+
+bool read_dxbc_wterms(device_api api, const shader_desc &desc, DxbcWTerms *out)
+{
+	if (api != device_api::d3d10 || desc.code == nullptr || desc.code_size == 0)
+		return false;
+	return dxbc_position_w_terms(desc.code, desc.code_size, out);
+}
+
+void ff_chain(const float *world, const float *view, const float *projection, float wvp[16]) noexcept
+{
+	const auto multiply = [](const float *a, const float *b, float *out) {
+		for (uint32_t r = 0; r < 4u; ++r) {
+			for (uint32_t c = 0; c < 4u; ++c) {
+				float sum = 0.0f;
+				for (uint32_t k = 0; k < 4u; ++k)
+					sum += a[r * 4u + k] * b[k * 4u + c];
+				out[r * 4u + c] = sum;
+			}
+		}
+	};
+	float wv[16];
+	multiply(world, view, wv);
+	multiply(wv, projection, wvp);
+}
 
 uint32_t registered(uint64_t handle)
 {
@@ -81,7 +150,7 @@ struct KnownReg {
 	bool game_set = false;
 };
 
-enum class DrawCarries { Grid, Offset, Nothing };
+enum class DrawCarries { Grid, Offset, Nothing, Interface };
 
 struct __declspec(uuid("6d0e2b1c-8a47-4f35-9c21-5b7e3a90d4f8")) ShaderJitterState {
 	uint64_t vs = 0;
@@ -100,6 +169,14 @@ struct __declspec(uuid("6d0e2b1c-8a47-4f35-9c21-5b7e3a90d4f8")) ShaderJitterStat
 	uint64_t ff_frame = ~0ull;
 	uint64_t decl = 0;
 	bool decl_pretransformed = false;
+	uint64_t wterms_of = ~0ull;
+	uint64_t wterms_generation = 0;
+	D3D9WTerms wterms{};
+	bool wterms_known = false;
+	uint64_t dxbc_wterms_of = ~0ull;
+	uint64_t dxbc_wterms_generation = 0;
+	DxbcWTerms dxbc_wterms{};
+	bool dxbc_wterms_known = false;
 
 	ID3D10Buffer *cb_zero = nullptr;
 	ID3D10Buffer *cb_moved = nullptr;
@@ -258,39 +335,46 @@ bool tests_no_depth(IDirect3DDevice9 *dev, bool scene_by_size)
 	return true;
 }
 
-DrawCarries d3d9_draw(command_list *cmd, ShaderJitterState &s, bool moved, ClipOffset o, bool scene_by_size)
+uint64_t bound_vertex_shader(IDirect3DDevice9 *dev, ShaderJitterState &s)
+{
+	if (s.pure)
+		return s.vs;
+	IDirect3DVertexShader9 *bound = nullptr;
+	if (FAILED(dev->GetVertexShader(&bound))) {
+		s.pure = true;
+		return s.vs;
+	}
+	const uint64_t vs = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bound));
+	if (bound != nullptr)
+		bound->Release();
+	return vs;
+}
+
+DrawCarries d3d9_draw(command_list *cmd, ShaderJitterState &s, bool moved, ClipOffset o, bool scene_by_size,
+	bool into_window)
 {
 	auto *const dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_native()));
-	uint64_t vs = s.vs;
-	if (!s.pure) {
-		IDirect3DVertexShader9 *bound = nullptr;
-		if (FAILED(dev->GetVertexShader(&bound))) {
-			s.pure = true;
-		} else {
-			vs = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bound));
-			if (bound != nullptr)
-				bound->Release();
-		}
-	}
+	const uint64_t vs = bound_vertex_shader(dev, s);
 	lookup(s, vs);
 	const bool process = s.stream_out;
-	const bool overlay = moved && !process && tests_no_depth(dev, scene_by_size);
+	const bool overlay = moved && !process && into_window && tests_no_depth(dev, scene_by_size);
 	if (process || overlay)
 		moved = false;
 	if (vs == 0) {
 		give_back_regs(dev, s, ~0u);
 		const bool carried = fixed_function_draw(dev, s, moved, o);
-		return process || overlay ? DrawCarries::Nothing : carried ? DrawCarries::Offset : DrawCarries::Grid;
+		return process ? DrawCarries::Nothing : overlay ? DrawCarries::Interface
+			: carried ? DrawCarries::Offset : DrawCarries::Grid;
 	}
 	if (s.ff_ours_set) {
 		dev->SetTransform(D3DTS_PROJECTION, &s.ff_game);
 		s.ff_ours_set = false;
 	}
-	if (s.entry == 0) {
+	if (slot_of(s.entry) == 0) {
 		give_back_regs(dev, s, ~0u);
-		return process || overlay ? DrawCarries::Nothing : DrawCarries::Grid;
+		return process ? DrawCarries::Nothing : overlay ? DrawCarries::Interface : DrawCarries::Grid;
 	}
-	const uint32_t reg = (s.entry & ~kIndexedEntry) - 1u;
+	const uint32_t reg = slot_of(s.entry) - 1u;
 	if ((s.entry & kIndexedEntry) != 0u && !s.known[reg].ours) {
 		float now[4];
 		if (!s.pure && SUCCEEDED(dev->GetVertexShaderConstantF(reg, now, 1)) &&
@@ -301,12 +385,13 @@ DrawCarries d3d9_draw(command_list *cmd, ShaderJitterState &s, bool moved, ClipO
 		give_back_regs(dev, s, ~0u);
 		if (moved && !process)
 			g_indexed_held.fetch_add(1);
-		return process || overlay ? DrawCarries::Nothing : DrawCarries::Grid;
+		return process ? DrawCarries::Nothing : overlay ? DrawCarries::Interface : DrawCarries::Grid;
 	}
 	give_back_regs(dev, s, reg);
 	const float v[4] = { moved ? o.x : 0.0f, moved ? o.y : 0.0f, 0.0f, 0.0f };
 	set_offset_reg(dev, s, reg, v);
-	return process || overlay ? DrawCarries::Nothing : moved ? DrawCarries::Offset : DrawCarries::Grid;
+	return process ? DrawCarries::Nothing : overlay ? DrawCarries::Interface : moved ? DrawCarries::Offset
+		: DrawCarries::Grid;
 }
 
 void give_back_slots(ID3D10Device *dev, ShaderJitterState &s, uint32_t keep)
@@ -361,11 +446,11 @@ DrawCarries d3d10_draw(command_list *cmd, ShaderJitterState &s, bool moved, Clip
 {
 	auto *const dev = reinterpret_cast<ID3D10Device *>(static_cast<uintptr_t>(cmd->get_native()));
 	lookup(s, s.vs);
-	if (s.entry == 0) {
+	if (slot_of(s.entry) == 0) {
 		give_back_slots(dev, s, ~0u);
 		return DrawCarries::Grid;
 	}
-	const uint32_t slot = s.entry - 1u;
+	const uint32_t slot = slot_of(s.entry) - 1u;
 	give_back_slots(dev, s, slot);
 	const bool buffers = make_buffers(dev, s);
 	moved = moved && !s.gs && buffers;
@@ -467,7 +552,7 @@ JitterShaderCounts jitter_shader_counts() noexcept
 }
 
 JitterShaderDraw jitter_shader_draw(command_list *cmd, bool moved, float tx, float ty, float vw, float vh,
-	bool scene_by_size) noexcept
+	bool scene_by_size, bool into_window) noexcept
 {
 	if (!moved && !g_any.load())
 		return JitterShaderDraw::Grid;
@@ -476,7 +561,7 @@ JitterShaderDraw jitter_shader_draw(command_list *cmd, bool moved, float tx, flo
 	DrawCarries c = DrawCarries::Grid;
 	switch (cmd->get_device()->get_api()) {
 	case device_api::d3d9:
-		c = d3d9_draw(cmd, s, moved, o, scene_by_size);
+		c = d3d9_draw(cmd, s, moved, o, scene_by_size, into_window);
 		break;
 	case device_api::d3d10:
 		c = d3d10_draw(cmd, s, moved, o);
@@ -485,7 +570,8 @@ JitterShaderDraw jitter_shader_draw(command_list *cmd, bool moved, float tx, flo
 		break;
 	}
 	return c == DrawCarries::Offset ? JitterShaderDraw::Offset
-		: c == DrawCarries::Nothing ? JitterShaderDraw::NotADraw : JitterShaderDraw::Grid;
+		: c == DrawCarries::Nothing ? JitterShaderDraw::NotADraw
+		: c == DrawCarries::Interface ? JitterShaderDraw::Interface : JitterShaderDraw::Grid;
 }
 
 bool jitter_d3d9_bound(command_list *cmd, uint64_t *target, uint64_t *depth) noexcept
@@ -508,11 +594,184 @@ bool jitter_d3d9_bound(command_list *cmd, uint64_t *target, uint64_t *depth) noe
 	return true;
 }
 
+JitterVertexClass jitter_shader_vertex_class(command_list *cmd) noexcept
+{
+	if (cmd == nullptr)
+		return JitterVertexClass::Unknown;
+	const device_api api = cmd->get_device()->get_api();
+	if (!jitter_in_shaders(api))
+		return JitterVertexClass::Unknown;
+	ShaderJitterState &s = state_of(cmd);
+	if (api == device_api::d3d10) {
+		lookup(s, s.vs);
+		return class_of(s.entry);
+	}
+	auto *const dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_native()));
+	const uint64_t vs = bound_vertex_shader(dev, s);
+	if (vs != 0) {
+		lookup(s, vs);
+		return class_of(s.entry);
+	}
+	if (s.pure)
+		return JitterVertexClass::Unknown;
+	if (pretransformed(dev, s))
+		return JitterVertexClass::Screen;
+	D3DMATRIX world{}, view{}, projection{};
+	if (FAILED(dev->GetTransform(D3DTS_WORLD, &world)) || FAILED(dev->GetTransform(D3DTS_VIEW, &view)) ||
+		FAILED(dev->GetTransform(D3DTS_PROJECTION, &projection)))
+		return JitterVertexClass::Unknown;
+	if (s.ff_ours_set && std::memcmp(&projection, &s.ff_ours, sizeof(projection)) == 0)
+		projection = s.ff_game;
+	return jitter_fixed_function_class(&world.m[0][0], &view.m[0][0], &projection.m[0][0]);
+}
+
+JitterVertexClass jitter_fixed_function_class(const float world[16], const float view[16],
+	const float projection[16]) noexcept
+{
+	if (projection[3] == 0.0f && projection[7] == 0.0f && projection[11] == 0.0f && projection[15] == 1.0f)
+		return JitterVertexClass::Screen;
+	float wvp[16];
+	ff_chain(world, view, projection, wvp);
+	bool identity = true;
+	for (uint32_t i = 0; i < 16u && identity; ++i) {
+		const float want = (i % 5u) == 0u ? 1.0f : 0.0f;
+		identity = std::fabs(wvp[i] - want) <= 1e-5f;
+	}
+	return identity ? JitterVertexClass::Screen : JitterVertexClass::Transformed;
+}
+
+bool jitter_fixed_function_perspective(const float world[16], const float view[16],
+	const float projection[16]) noexcept
+{
+	float wvp[16];
+	ff_chain(world, view, projection, wvp);
+	return std::fabs(wvp[3]) > 1e-6f || std::fabs(wvp[7]) > 1e-6f || std::fabs(wvp[11]) > 1e-6f;
+}
+
+namespace {
+
+int d3d10_projection(command_list *cmd, ShaderJitterState &s)
+{
+	const uint64_t generation = g_generation.load();
+	if (s.vs != s.dxbc_wterms_of || generation != s.dxbc_wterms_generation) {
+		s.dxbc_wterms_of = s.vs;
+		s.dxbc_wterms_generation = generation;
+		std::shared_lock<std::shared_mutex> lock(g_registry_lock);
+		const auto it = g_dxbc_wterms.find(s.vs);
+		s.dxbc_wterms_known = it != g_dxbc_wterms.end();
+		s.dxbc_wterms = s.dxbc_wterms_known ? it->second : DxbcWTerms{};
+	}
+	if (!s.dxbc_wterms_known || s.gs)
+		return -1;
+	struct Reader {
+		command_list *cmd;
+		ID3D10Device *dev;
+		ShaderJitterState *s;
+		uint64_t now;
+	} reader{ cmd, reinterpret_cast<ID3D10Device *>(static_cast<uintptr_t>(cmd->get_native())), &s,
+		scene_jitter().frame() };
+	constant_reads_poll(cmd, reader.now);
+	return dxbc_w_terms_perspective(
+		s.dxbc_wterms,
+		[](void *user, uint32_t slot, uint32_t reg, float out[4]) {
+			const Reader &r = *static_cast<const Reader *>(user);
+			if (slot >= kD3D10OffsetSlots)
+				return false;
+			ID3D10Buffer *b = nullptr;
+			r.dev->VSGetConstantBuffers(slot, 1, &b);
+			uint64_t handle = reinterpret_cast<uintptr_t>(b);
+			if (b != nullptr && (b == r.s->cb_zero || b == r.s->cb_moved))
+				handle = reinterpret_cast<uintptr_t>(r.s->game_cb[slot]);
+			const bool read = handle != 0 && d3d10_vertex_constant(r.cmd, r.s->vs, slot, reg, r.now, handle, out);
+			if (b != nullptr)
+				b->Release();
+			return read;
+		},
+		&reader);
+}
+
+}
+
+bool jitter_shader_perspective(command_list *cmd) noexcept
+{
+	return jitter_shader_projection(cmd) == 1;
+}
+
+int jitter_shader_projection(command_list *cmd) noexcept
+{
+	if (cmd == nullptr)
+		return -1;
+	const device_api api = cmd->get_device()->get_api();
+	if (api == device_api::d3d10)
+		return d3d10_projection(cmd, state_of(cmd));
+	if (api != device_api::d3d9)
+		return -1;
+	ShaderJitterState &s = state_of(cmd);
+	auto *const dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_native()));
+	const uint64_t vs = bound_vertex_shader(dev, s);
+	if (s.pure)
+		return -1;
+	if (vs == 0) {
+		if (pretransformed(dev, s))
+			return 0;
+		D3DMATRIX world{}, view{}, projection{};
+		if (FAILED(dev->GetTransform(D3DTS_WORLD, &world)) || FAILED(dev->GetTransform(D3DTS_VIEW, &view)) ||
+			FAILED(dev->GetTransform(D3DTS_PROJECTION, &projection)))
+			return -1;
+		if (s.ff_ours_set && std::memcmp(&projection, &s.ff_ours, sizeof(projection)) == 0)
+			projection = s.ff_game;
+		return jitter_fixed_function_perspective(&world.m[0][0], &view.m[0][0], &projection.m[0][0]) ? 1 : 0;
+	}
+	const uint64_t generation = g_generation.load();
+	if (vs != s.wterms_of || generation != s.wterms_generation) {
+		s.wterms_of = vs;
+		s.wterms_generation = generation;
+		std::shared_lock<std::shared_mutex> lock(g_registry_lock);
+		const auto it = g_wterms.find(vs);
+		s.wterms_known = it != g_wterms.end();
+		s.wterms = s.wterms_known ? it->second : D3D9WTerms{};
+	}
+	if (!s.wterms_known)
+		return -1;
+	float file[kD3D9OffsetConstants * 4u] = {};
+	for (uint32_t i = 0; i < s.wterms.count; ++i) {
+		const uint32_t reg = s.wterms.reg[i];
+		if (reg >= kD3D9OffsetConstants)
+			return -1;
+		float *const at = file + reg * 4u;
+		const KnownReg &k = s.known[reg];
+		if (k.ours) {
+			if (k.game_set)
+				std::memcpy(at, k.game, sizeof(k.game));
+		} else if (FAILED(dev->GetVertexShaderConstantF(reg, at, 1))) {
+			return -1;
+		}
+	}
+	return d3d9_w_terms_perspective(s.wterms, file, kD3D9OffsetConstants) ? 1 : 0;
+}
+
+bool jitter_d3d9_depth_state(command_list *cmd, bool *enabled, bool *compares) noexcept
+{
+	*enabled = false;
+	*compares = false;
+	if (cmd == nullptr || cmd->get_device()->get_api() != device_api::d3d9)
+		return false;
+	auto *const dev = reinterpret_cast<IDirect3DDevice9 *>(static_cast<uintptr_t>(cmd->get_native()));
+	DWORD z = D3DZB_FALSE, func = D3DCMP_LESSEQUAL;
+	if (FAILED(dev->GetRenderState(D3DRS_ZENABLE, &z)) || FAILED(dev->GetRenderState(D3DRS_ZFUNC, &func)))
+		return false;
+	*enabled = z != D3DZB_FALSE;
+	*compares = func != D3DCMP_ALWAYS && func != D3DCMP_NEVER;
+	return true;
+}
+
 namespace jitter_shader_events {
 
 bool create_pipeline(device *device, pipeline_layout, uint32_t count, const pipeline_subobject *subobjects)
 {
 	t_code_ptr = nullptr;
+	t_class = JitterVertexClass::Unknown;
+	t_wterms_known = false;
 	if (!jitter_in_shaders(device->get_api()))
 		return false;
 	for (uint32_t i = 0; i < count; ++i) {
@@ -522,10 +781,21 @@ bool create_pipeline(device *device, pipeline_layout, uint32_t count, const pipe
 			g_unwanted.fetch_add(1);
 			return false;
 		}
+		const shader_desc &game = *static_cast<const shader_desc *>(subobjects[i].data);
+		const JitterVertexClass c = classify(device->get_api(), game);
+		D3D9WTerms w{};
+		const bool w_known = read_wterms(device->get_api(), game, &w);
+		DxbcWTerms dw{};
+		const bool dw_known = read_dxbc_wterms(device->get_api(), game, &dw);
 		if (!rewrite(device, *static_cast<shader_desc *>(subobjects[i].data))) {
 			g_kept.fetch_add(1);
 			return false;
 		}
+		t_class = c;
+		t_wterms = w;
+		t_wterms_known = w_known;
+		t_dxbc_wterms = dw;
+		t_dxbc_wterms_known = dw_known;
 		return true;
 	}
 	return false;
@@ -540,12 +810,30 @@ void init_pipeline(device *device, pipeline_layout, uint32_t count, const pipeli
 			continue;
 		const auto *const desc = static_cast<const shader_desc *>(subobjects[i].data);
 		const bool ours = t_code_ptr != nullptr && desc->code == t_code_ptr;
+		bool layout = false;
+		for (uint32_t k = 0; k < count; ++k)
+			layout = layout || subobjects[k].type == pipeline_subobject_type::input_layout;
+		const JitterVertexClass c = ours ? t_class : layout ? JitterVertexClass::Unknown : classify(device->get_api(), *desc);
+		D3D9WTerms w = t_wterms;
+		const bool w_known = ours ? t_wterms_known : !layout && read_wterms(device->get_api(), *desc, &w);
+		DxbcWTerms dw = t_dxbc_wterms;
+		const bool dw_known = ours ? t_dxbc_wterms_known : !layout && read_dxbc_wterms(device->get_api(), *desc, &dw);
 		{
 			std::unique_lock<std::shared_mutex> lock(g_registry_lock);
 			if (ours)
-				g_registry[pipeline.handle] = (t_index + 1u) | (t_indexed ? kIndexedEntry : 0u);
+				g_registry[pipeline.handle] = (t_index + 1u) | (t_indexed ? kIndexedEntry : 0u) | class_bits(c);
+			else if (c != JitterVertexClass::Unknown)
+				g_registry[pipeline.handle] = class_bits(c);
 			else
 				g_registry.erase(pipeline.handle);
+			if (w_known)
+				g_wterms[pipeline.handle] = w;
+			else
+				g_wterms.erase(pipeline.handle);
+			if (dw_known)
+				g_dxbc_wterms[pipeline.handle] = dw;
+			else
+				g_dxbc_wterms.erase(pipeline.handle);
 			g_generation.fetch_add(1);
 		}
 		if (ours) {
@@ -557,6 +845,9 @@ void init_pipeline(device *device, pipeline_layout, uint32_t count, const pipeli
 		break;
 	}
 	t_code_ptr = nullptr;
+	t_class = JitterVertexClass::Unknown;
+	t_wterms_known = false;
+	t_dxbc_wterms_known = false;
 }
 
 void destroy_pipeline(device *device, pipeline pipeline)
@@ -564,8 +855,12 @@ void destroy_pipeline(device *device, pipeline pipeline)
 	if (!jitter_in_shaders(device->get_api()))
 		return;
 	std::unique_lock<std::shared_mutex> lock(g_registry_lock);
-	if (g_registry.erase(pipeline.handle) != 0)
+	const size_t gone =
+		g_registry.erase(pipeline.handle) + g_wterms.erase(pipeline.handle) + g_dxbc_wterms.erase(pipeline.handle);
+	if (gone != 0)
 		g_generation.fetch_add(1);
+	lock.unlock();
+	constant_reads().forget_shader(pipeline.handle);
 }
 
 void bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline pipeline)

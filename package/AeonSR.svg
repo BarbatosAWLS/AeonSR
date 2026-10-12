@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="512" height="512">
+  <defs>
+    <radialGradient id="babaBg" cx="0.5" cy="0.45" r="0.75">
+      <stop offset="0" stop-color="#27272a"/>
+      <stop offset="1" stop-color="#09090b"/>
+    </radialGradient>
+    <linearGradient id="babaSilver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.5" stop-color="#a1a1aa"/>
+      <stop offset="1" stop-color="#e4e4e7"/>
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="9" fill="url(#babaBg)"/>
+  <path d="M10.5 33 A16 16 0 1 1 37.5 33" fill="none" stroke="url(#babaSilver)" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M24 4 L38 42 L32 39 L24 17 L16 39 L10 42 Z" fill="url(#babaSilver)"/>
+  <line x1="24" y1="30" x2="24" y2="41" stroke="#ef4444" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M31 13 L32 17 L36 18 L32 19 L31 23 L30 19 L26 18 L30 17 Z" fill="#ffffff"/>
+</svg>

@@ -33,7 +33,6 @@ struct PanelState {
 	std::wstring native_dlss_modules;
 	std::wstring ngx_layer;
 	bool ngx_layer_relevant = false;
-	bool ngx_layer_nvidia = false;
 	bool active_is_xess = false;
 	bool active_is_vsr = false;
 	bool active_on12 = false;
@@ -155,6 +154,7 @@ struct PanelState {
 	bool jitter_in_frame = false;
 	bool jitter_mixed = false;
 	bool jitter_still = false;
+	bool jitter_withheld = false;
 	uint32_t jitter_moved_draws = 0;
 	uint32_t jitter_plain_draws = 0;
 	uint32_t jitter_elsewhere_draws = 0;

@@ -8,6 +8,26 @@
 
 namespace aeon_sr {
 
+size_t runtime_of_present(const PresentRuntime *runtimes, size_t count, const PresentRuntime &presenting) noexcept
+{
+	if (runtimes == nullptr)
+		return count;
+	if (presenting.native != 0) {
+		for (size_t i = 0; i < count; ++i)
+			if (runtimes[i].native == presenting.native)
+				return i;
+	}
+	size_t found = count;
+	for (size_t i = 0; i < count; ++i) {
+		if (runtimes[i].device != presenting.device || runtimes[i].hwnd != presenting.hwnd)
+			continue;
+		if (found != count)
+			return count;
+		found = i;
+	}
+	return found;
+}
+
 namespace {
 
 std::mutex g_state11_lock;

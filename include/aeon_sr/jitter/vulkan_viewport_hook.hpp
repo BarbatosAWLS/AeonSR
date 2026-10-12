@@ -34,19 +34,30 @@ public:
 		const bool *flipped = nullptr) noexcept;
 	void forget_list(void *cmd) noexcept;
 
+	bool depth_of(void *cmd, int *enable, int *write, int *op) const noexcept;
+	bool depth_hooked() const noexcept { return depth_hooked_; }
+	void note_depth(void *cmd, int enable, int write, int op) noexcept;
+
+	static void refuse_enables(uint32_t after, uint32_t n) noexcept;
+
 private:
 	struct Slot {
 		void *cmd = nullptr;
 		uint32_t count = 0;
 		uint64_t stamp = 0;
+		uint64_t used = 0;
 		JitterViewport vp[kJitterViewportSlots]{};
 		bool flipped[kJitterViewportSlots]{};
+		int8_t depth_enable = -1, depth_write = -1, depth_op = -1;
 	};
+
+	Slot *claim(void *cmd) noexcept;
 
 	Slot *find(void *cmd) noexcept;
 	const Slot *find(void *cmd) const noexcept;
 
 	bool installed_ = false;
+	bool depth_hooked_ = false;
 	bool saw_ = false;
 	const char *note_ = "";
 	void *device_ = nullptr;

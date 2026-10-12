@@ -260,11 +260,13 @@ struct NeuralRenderD3D12 : NeuralRenderCommon {
 	ID3D12Resource *delta_tex[2] = { nullptr, nullptr };
 	ID3D12Resource *built_tex = nullptr;
 	ID3D12Resource *smooth_tex[2] = { nullptr, nullptr };
+	ID3D12Resource *slope_tex = nullptr;
 	uint32_t delta_index = 0;
 	bool delta_valid = false;
 	uint32_t last_eval_rows = 0;
 	float last_warp_x = 0.0f, last_warp_y = 0.0f;
 	float input_detail = kNeuralInputDetail;
+	float detail_transfer = kNeuralDetailTransfer;
 	float last_area_share = 0.0f;
 	uint32_t logged_whole = 0;
 	uint64_t cost_logged_at = 0;
@@ -283,6 +285,7 @@ struct NeuralRenderD3D12 : NeuralRenderCommon {
 	Gpu12Fence gpu_fence;
 	Gpu12InitList init_list;
 	Gpu12Timer timer;
+	Gpu12Timer eval_timer;
 
 	NeuralCapture capture;
 

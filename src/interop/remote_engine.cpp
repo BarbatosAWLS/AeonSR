@@ -246,6 +246,8 @@ bool RemoteEngine::start(EngineDevice &engine, HMODULE module, reshade::api::dev
 	}
 
 	std::wstring command = L"\"" + host_path_ + L"\" --pid " + std::to_wstring(game_pid_);
+	if (host_gpu_priority_high)
+		command += L" --gpu-priority high";
 	std::vector<wchar_t> mutable_command(command.begin(), command.end());
 	mutable_command.push_back(L'\0');
 
@@ -409,6 +411,7 @@ void RemoteEngine::stop()
 	last_wait_value_ = 0;
 	outstanding_signal_ = 0;
 	frame_outstanding_ = false;
+	stats_ = Stats{};
 }
 
 RemoteEngine::~RemoteEngine()
@@ -556,6 +559,10 @@ bool RemoteEngine::exchange(EngineDevice &engine, const Request &req,
 	const HANDLE waits[2] = { response_, host_process_ };
 	const DWORD budget = first_frame_ ? remote::kFirstFrameTimeoutMs : remote::kFrameTimeoutMs;
 	const ULONGLONG deadline = GetTickCount64() + budget;
+	LARGE_INTEGER qpf{}, q0{}, q1{};
+	QueryPerformanceFrequency(&qpf);
+	QueryPerformanceCounter(&q0);
+	++stats_.frames;
 	bool answered = false;
 	for (;;) {
 		const ULONGLONG now = GetTickCount64();
@@ -577,6 +584,15 @@ bool RemoteEngine::exchange(EngineDevice &engine, const Request &req,
 		}
 		diag_trace("remote", L"a late answer to an abandoned frame was thrown away");
 	}
+	QueryPerformanceCounter(&q1);
+	if (qpf.QuadPart != 0) {
+		const double waited = 1000.0 * static_cast<double>(q1.QuadPart - q0.QuadPart) / static_cast<double>(qpf.QuadPart);
+		stats_.wait_ms += waited;
+		stats_.wait_max_ms = waited > stats_.wait_max_ms ? waited : stats_.wait_max_ms;
+		reply.wait_ms = static_cast<float>(waited);
+	}
+	stats_.answered += answered ? 1u : 0u;
+	stats_.timeouts += answered ? 0u : 1u;
 	if (!answered)
 		first_frame_ = false;
 	if (!answered) {
@@ -639,6 +655,22 @@ bool RemoteEngine::exchange(EngineDevice &engine, const Request &req,
 	}
 	frame_outstanding_ = false;
 	return true;
+}
+
+void RemoteEngine::note_stats() noexcept
+{
+	const ULONGLONG now = GetTickCount64();
+	if (stats_.since == 0)
+		stats_.since = now;
+	if (now < stats_.since + 10000u)
+		return;
+	if (stats_.frames != 0 || stats_.busy != 0)
+		diag_logf(DiagLevel::Info, "remote", L"remote: last 10 s %u frames handed to the engine host, %u answered, "
+			L"%u timed out, %u skipped with the host still on the one before; the answer took %.2f ms on average, "
+			L"%.1f ms at most", stats_.frames, stats_.answered, stats_.timeouts, stats_.busy,
+			stats_.frames != 0 ? stats_.wait_ms / stats_.frames : 0.0, stats_.wait_max_ms);
+	stats_ = Stats{};
+	stats_.since = now;
 }
 
 RemoteEngine::Row RemoteEngine::upscaler_row(const Reply &reply, const FrameInputs &inputs)
@@ -716,6 +748,9 @@ bool RemoteEngine::run(EngineDevice &engine, const Request &req, Reply &reply)
 				reply.message = last_error;
 				return false;
 			}
+			++stats_.busy;
+			note_stats();
+			reply.host_busy = true;
 			reply.step = remote::RemoteStep::Timeout;
 			reply.message = L"the engine host is still busy with an earlier frame";
 			return false;
@@ -767,6 +802,7 @@ bool RemoteEngine::run(EngineDevice &engine, const Request &req, Reply &reply)
 	}
 
 	const bool copy_back = exchange(engine, req, descs, reply);
+	note_stats();
 
 	ID3D12GraphicsCommandList *const back = engine.borrowed()
 		? reinterpret_cast<ID3D12GraphicsCommandList *>(game_list->get_native())

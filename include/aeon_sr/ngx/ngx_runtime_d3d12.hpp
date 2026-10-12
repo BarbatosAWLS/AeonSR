@@ -2,6 +2,7 @@
 
 #include "aeon_sr/interop/blit_d3d12.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
+#include "aeon_sr/ngx/ngx_api12.hpp"
 #include "aeon_sr/ngx/ngx_session.hpp"
 
 #include <d3d12.h>
@@ -17,6 +18,7 @@ struct NgxRuntimeD3D12 : NgxSession {
 	explicit NgxRuntimeD3D12(const wchar_t *tag = L"D3D12 ") noexcept : NgxSession(tag) {}
 
 	ID3D12Device *device = nullptr;
+	const Ngx12Api *api = nullptr;
 
 	static constexpr D3D12_RESOURCE_STATES kNgxSrvState =
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

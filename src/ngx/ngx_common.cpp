@@ -417,7 +417,7 @@ cbuffer NeuralCB : register(b1) {
   float nrWarpY;
   float nrGuideMotion;
   float nrInputDetail;
-  float _nrPad2;
+  float nrDetailTransfer;
   float _nrPad3;
 };
 float NrLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
@@ -643,6 +643,35 @@ float4 PSNeuralSmooth(VSOut i) : SV_Target {
 }
 )"
 R"(
+static const int kNrSlopeRadius = 1;
+static const float kNrSlopeEps = 0.000138;
+static const float kNrSlopeMin = -1.0;
+static const float kNrSlopeMax = 1.0;
+
+float4 PSNeuralSlope(VSOut i) : SV_Target {
+  float2 texel = 1.0 / max(nrModelSize, 1.0);
+  float sy = 0.0, syy = 0.0;
+  float3 sd = 0.0, syd = 0.0;
+  [unroll] for (int dy = -kNrSlopeRadius; dy <= kNrSlopeRadius; ++dy) {
+    [unroll] for (int dx = -kNrSlopeRadius; dx <= kNrSlopeRadius; ++dx) {
+      float4 s = srcTex.SampleLevel(srcSamp, i.uv + float2(dx, dy) * texel, 0);
+      sy += s.a;
+      syy += s.a * s.a;
+      sd += s.rgb;
+      syd += s.rgb * s.a;
+    }
+  }
+  const float n = (2 * kNrSlopeRadius + 1) * (2 * kNrSlopeRadius + 1);
+  float my = sy / n;
+  float vy = max(syy / n - my * my, 0.0);
+  float3 cov = syd / n - my * (sd / n);
+  float3 a = cov / (vy + kNrSlopeEps);
+  if (!all(isfinite(a)))
+    return float4(0.0, 0.0, 0.0, 1.0);
+  return float4(clamp(a, kNrSlopeMin, kNrSlopeMax), 1.0);
+}
+)"
+R"(
 static const float kNrRangeRescue = 20.0;
 
 float3 NrDeltaUpsample(float2 uv, float guide) {
@@ -653,24 +682,38 @@ float3 NrDeltaUpsample(float2 uv, float guide) {
   float2 centre = NrWarpToModel(uv) * nrModelSize - 0.5;
   float2 base = floor(centre);
   float2 frac = centre - base;
-  float3 acc = 0.0, tent_acc = 0.0;
+  float4 acc = 0.0, tent_acc = 0.0;
+  float3 slope_acc = 0.0, slope_tent = 0.0;
   float wsum = 0.0;
   float inv2r2 = 0.5 / max(nrSigmaR * nrSigmaR, 1e-6);
+  bool transfer = nrDetailTransfer > 0.0;
   [unroll] for (int dy = 0; dy <= 1; ++dy) {
     [unroll] for (int dx = 0; dx <= 1; ++dx) {
       float2 q = base + float2(dx, dy);
       float2 t = float2(dx == 0 ? 1.0 - frac.x : frac.x,
                         dy == 0 ? 1.0 - frac.y : frac.y);
-      float4 s = srcTex.SampleLevel(srcSamp, (q + 0.5) * mpix, 0);
+      float2 at = (q + 0.5) * mpix;
+      float4 s = srcTex.SampleLevel(srcSamp, at, 0);
       float dg = guide - s.a;
       float tw = t.x * t.y;
       float w = tw * exp(-dg * dg * inv2r2);
-      acc += s.rgb * w;
-      tent_acc += s.rgb * tw;
+      acc += s * w;
+      tent_acc += s * tw;
       wsum += w;
+      if (transfer) {
+        float3 k = flowTex.SampleLevel(srcSamp, at, 0).rgb;
+        slope_acc += k * w;
+        slope_tent += k * tw;
+      }
     }
   }
-  return lerp(tent_acc, acc / max(wsum, 1e-6), saturate(wsum * kNrRangeRescue));
+  float rescue = saturate(wsum * kNrRangeRescue);
+  float4 d = lerp(tent_acc, acc / max(wsum, 1e-6), rescue);
+  if (!transfer)
+    return d.rgb;
+  float3 k = lerp(slope_tent, slope_acc / max(wsum, 1e-6), rescue);
+  float h = guide - d.a;
+  return d.rgb + nrDetailTransfer * k * h;
 }
 bool NrDeltaIsExact() { return all(nrModelSize == nrFrameSize) && !NrWarped(); }
 

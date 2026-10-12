@@ -62,7 +62,9 @@ public:
 
 	static constexpr uint32_t kFramesInFlight = 2;
 
-	enum class Ring : uint32_t { Frame = 0 };
+	int queue_priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+
+	enum class Ring : uint32_t { Frame = 0, FrameGeneration = 1 };
 	static constexpr uint32_t kRings = 2;
 	bool use_ring(Ring ring) noexcept
 	{

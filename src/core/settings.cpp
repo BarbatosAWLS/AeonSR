@@ -311,6 +311,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 		else if (key == "Sharpness") out.sharpness = static_cast<float>(std::atof(val.c_str()));
 		else if (key == "MvProbe") out.mv_probe = parse_bool(val);
 		else if (key == "GpuTimings") out.gpu_timings = parse_bool(val);
+		else if (key == "HostGpuPriority") out.host_gpu_priority = parse_bool(val);
 		else if (key == "SpatialJitter") out.spatial_jitter = parse_bool(val);
 		else if (key == "UpscaleMode") out.upscale_mode = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
 		else if (key == "Upscaler") {
@@ -388,11 +389,13 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.neural_toggle_key = (v <= 0xFFu) ? v : 0u;
 		}
 		else if (key == "SplitCatmullRom") out.split_catmull_rom = parse_bool(val);
+		else if (key == "SplitPairs") out.split_pairs = parse_bool(val);
 		else if (key == "JitterSceneRule") {
 			const unsigned long v = std::strtoul(val.c_str(), nullptr, 10);
 			out.jitter_scene_rule = v <= 2ul ? static_cast<unsigned int>(v) : 0u;
 		}
 		else if (key == "JitterTestedQuads") out.jitter_tested_quads = parse_bool(val);
+		else if (key == "JitterSceneQuads") out.jitter_scene_quads = parse_bool(val);
 		else if (key == "DepthRegrid") out.depth_regrid = parse_bool(val);
 		else if (key == "UpscalerCapture") out.upscaler_capture = parse_bool(val);
 		else if (key == "ScopeCapture") out.scope_capture = parse_bool(val);
@@ -406,6 +409,11 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.scope_key = v >= 1ul && v <= 0xFEul ? static_cast<unsigned int>(v) : kScopeKeyDefault;
 		}
 		else if (key == "JitterFault") out.jitter_fault = val;
+		else if (key == "ReportKey") {
+			const unsigned long v = std::strtoul(val.c_str(), nullptr, 0);
+			out.report_key = v <= 0xFEul ? static_cast<unsigned int>(v) : 0u;
+		}
+		else if (key == "FlightFault") out.flight_fault = val;
 		else if (key == "KeepInterface") out.keep_interface = parse_bool(val);
 		else if (key == "ForceSystemMemory") out.force_system_memory = parse_bool(val);
 		else if (key == "DebugInfo") out.debug_info = parse_bool(val);
@@ -471,9 +479,13 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "NeuralResetOnCut=" << (in.neural_reset_on_cut ? 1 : 0) << "\n";
 	out << "NeuralToggleKey=" << (in.neural_toggle_key <= 0xFFu ? in.neural_toggle_key : 0u) << "\n";
 	out << "SplitCatmullRom=" << (in.split_catmull_rom ? 1 : 0) << "\n";
+	if (in.split_pairs)
+		out << "SplitPairs=1\n";
 	out << "JitterSceneRule=" << (in.jitter_scene_rule <= 2u ? in.jitter_scene_rule : 0u) << "\n";
 	if (!in.jitter_tested_quads)
 		out << "JitterTestedQuads=0\n";
+	if (!in.jitter_scene_quads)
+		out << "JitterSceneQuads=0\n";
 	if (!in.depth_regrid)
 		out << "DepthRegrid=0\n";
 	out << "UpscalerCapture=" << (in.upscaler_capture ? 1 : 0) << "\n";
@@ -486,11 +498,17 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		out << "ScopeKey=" << in.scope_key << "\n";
 	if (!in.jitter_fault.empty())
 		out << "JitterFault=" << in.jitter_fault << "\n";
+	if (in.report_key != 0)
+		out << "ReportKey=" << in.report_key << "\n";
+	if (!in.flight_fault.empty())
+		out << "FlightFault=" << in.flight_fault << "\n";
 	out << "KeepInterface=" << (in.keep_interface ? 1 : 0) << "\n";
 	out << "ForceSystemMemory=" << (in.force_system_memory ? 1 : 0) << "\n";
 	out << "MvProbe=" << (in.mv_probe ? 1 : 0) << "\n";
 	if (in.gpu_timings)
 		out << "GpuTimings=1\n";
+	if (in.host_gpu_priority)
+		out << "HostGpuPriority=1\n";
 	out << "DebugInfo=" << (in.debug_info ? 1 : 0) << "\n";
 	out << "VerboseLog=" << (in.verbose_log ? 1 : 0) << "\n";
 	out << "DebugView=" << (in.debug_view < kDebugViewCount ? in.debug_view : 0u) << "\n";

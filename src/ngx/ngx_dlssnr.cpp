@@ -4,6 +4,7 @@
 #include "aeon_sr/core/gpu_vendor.hpp"
 #include "aeon_sr/ngx/neural_arch_hook.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
+#include "aeon_sr/upscalers/runtime_load_check.hpp"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -548,6 +549,18 @@ bool NgxShim::load(const std::wstring &runtime_path, const std::wstring &trampol
 				L"); the runtime only initialises when its caller is a module with that name";
 		return false;
 	}
+	std::wstring got;
+	const bool snip_ours = loaded_module_is(snip, runtime_path, &got);
+	const bool tramp_ours = loaded_module_is(tramp, trampoline_path, &got);
+	if (!snip_ours || !tramp_ours) {
+		if (tramp_ours)
+			FreeLibrary(tramp);
+		if (snip_ours)
+			FreeLibrary(snip);
+		if (error)
+			*error = runtime_load_redirect_error(snip_ours ? trampoline_path : runtime_path, got);
+		return false;
+	}
 
 	nr_runtime = snip;
 	trampoline = tramp;
@@ -1000,7 +1013,7 @@ void NeuralRenderD3D12::release_scratch()
 {
 	for (ID3D12Resource **r : { &color_copy, &output_tex, &frame_copy, &proxy_copy,
 			&mv_small, &depth_small, &delta_tex[0], &delta_tex[1],
-			&built_tex, &smooth_tex[0], &smooth_tex[1] }) {
+			&built_tex, &smooth_tex[0], &smooth_tex[1], &slope_tex }) {
 		if (*r) { (*r)->Release(); *r = nullptr; }
 	}
 	depth_grid.release();
@@ -1076,6 +1089,10 @@ bool NeuralRenderD3D12::ensure_delta_scratch()
 		!create_tex12(device, model_width, model_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
 			false, kNgxSrvState, &built_tex))
 		return false;
+	if (slope_tex == nullptr &&
+		!create_tex12(device, model_width, model_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+			false, kNgxSrvState, &slope_tex))
+		return false;
 	if (noted)
 		diag_logf(DiagLevel::Info, "neural", L"its textures are made");
 	return true;
@@ -1134,6 +1151,7 @@ void NeuralRenderD3D12::shutdown_device()
 
 	init_list.release();
 	timer.release();
+	eval_timer.release();
 	gpu_fence.release();
 	queue = nullptr;
 	device = nullptr;
@@ -1317,14 +1335,15 @@ bool NeuralRenderD3D12::run(ID3D12GraphicsCommandList *cmd,
 		np.debug_view == 0u && np.paper_white == 1.0f && np.color_space == NeuralColorSpace::Sdr;
 
 	timer.poll();
+	eval_timer.poll();
 	if (timer.last_ms > 0.0 && eval_count >= cost_logged_at + 600) {
 		cost_logged_at = eval_count;
 		wchar_t buf[240]{};
-		_snwprintf_s(buf, _TRUNCATE, L"cost: %.2f ms of a %.2f ms frame (%.0f fps); model %ux%u, %.0f%% of it "
-			L"evaluated, %u pass(es)", timer.last_ms,
+		_snwprintf_s(buf, _TRUNCATE, L"cost: %.2f ms of a %.2f ms frame (%.0f fps), of which the runtime's evaluate "
+			L"%.2f ms; model %ux%u, %.0f%% of it evaluated, %u pass(es)", timer.last_ms,
 			static_cast<double>(np.frame_time_ms),
 			np.frame_time_ms > 0.01f ? 1000.0 / static_cast<double>(np.frame_time_ms) : 0.0,
-			model_width, model_height,
+			eval_timer.last_ms, model_width, model_height,
 			model_height != 0 && last_eval_rows != 0 ? 100.0 * last_eval_rows / model_height : 100.0,
 			created_passes);
 		diag_info("neural", buf);
@@ -1791,8 +1810,14 @@ bool NeuralRenderD3D12::run_composite(ID3D12GraphicsCommandList *cmd,
 
 	last_eval_rows = model_height;
 
-	if (ok && astep != AccumStep::Hold)
+	if (ok && astep != AccumStep::Hold) {
+		const bool timing = eval_timer.ensure(device, queue);
+		if (timing)
+			eval_timer.begin(cmd);
 		ok = evaluate_chain(cmd, model_width, model_height, mv_use, depth_use, np);
+		if (timing)
+			eval_timer.end(cmd);
+	}
 
 	ID3D12Resource *shown = nullptr;
 	if (ok && astep == AccumStep::Hold) {
@@ -1843,12 +1868,22 @@ bool NeuralRenderD3D12::run_composite(ID3D12GraphicsCommandList *cmd,
 		}
 	}
 
+	c.detail_transfer = 0.0f;
+	if (ok && detail_transfer > 0.0f && (model_width != w || model_height != h)) {
+		barrier12(cmd, slope_tex, kNgxSrvState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		const bool sloped = blit.draw_neural(device, cmd, NeuralPass::Slope, shown, nullptr, nullptr, nullptr,
+			slope_tex, DXGI_FORMAT_R16G16B16A16_FLOAT, model_width, model_height, c);
+		barrier12(cmd, slope_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, kNgxSrvState);
+		if (sloped)
+			c.detail_transfer = detail_transfer;
+	}
+
 	if (ok) {
 		barrier12(cmd, output_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		barrier12(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		ok = blit.draw_neural(device, cmd, NeuralPass::Composite, shown, frame_copy, nullptr, nullptr,
-			color, desc.Format, w, h, c);
+		ok = blit.draw_neural(device, cmd, NeuralPass::Composite, shown, frame_copy,
+			c.detail_transfer > 0.0f ? slope_tex : nullptr, nullptr, color, desc.Format, w, h, c);
 		barrier12(cmd, color, D3D12_RESOURCE_STATE_RENDER_TARGET, color_state);
 		barrier12(cmd, output_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

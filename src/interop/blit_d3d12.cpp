@@ -133,7 +133,7 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC base_pso_desc(ID3D12RootSignature *rs, ID3DBl
 void release_pso(BlitPipelineD3D12::PsoPair &pp)
 {
 	for (ID3D12PipelineState **s : { &pp.blit, &pp.debug, &pp.proxy, &pp.guide, &pp.delta,
-			&pp.rebuild, &pp.smooth, &pp.neural, &pp.debug_view }) {
+			&pp.rebuild, &pp.smooth, &pp.slope, &pp.neural, &pp.debug_view }) {
 		if (*s) { (*s)->Release(); *s = nullptr; }
 	}
 	pp.rtv = DXGI_FORMAT_UNKNOWN;
@@ -195,8 +195,15 @@ bool BlitPipelineD3D12::ensure(ID3D12Device *device)
 		if (err) { diag_error("shader", L"d3d12 neural smooth PS compile failed"); err->Release(); }
 		return false;
 	}
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralComposite", "ps_5_0", 0, 0, &psn, &err))) {
+	ID3DBlob *pssl = nullptr;
+	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralSlope", "ps_5_0", 0, 0, &pssl, &err))) {
 		psdl->Release(); psrb->Release(); pssm->Release();
+		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
+		if (err) { diag_error("shader", L"d3d12 neural slope PS compile failed"); err->Release(); }
+		return false;
+	}
+	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralComposite", "ps_5_0", 0, 0, &psn, &err))) {
+		psdl->Release(); psrb->Release(); pssm->Release(); pssl->Release();
 		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
 		if (err) { diag_error("shader", L"d3d12 neural composite PS compile failed"); err->Release(); }
 		return false;
@@ -204,6 +211,7 @@ bool BlitPipelineD3D12::ensure(ID3D12Device *device)
 	vs_blob = vs; ps_blit_blob = psb; ps_debug_blob = psd;
 	ps_proxy_blob = psp; ps_guide_blob = psg; ps_delta_blob = psdl;
 	ps_rebuild_blob = psrb; ps_smooth_blob = pssm; ps_neural_blob = psn;
+	ps_slope_blob = pssl;
 
 	D3D12_DESCRIPTOR_RANGE range{};
 	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -270,7 +278,7 @@ void BlitPipelineD3D12::release()
 	rel_blob(vs_blob); rel_blob(ps_blit_blob); rel_blob(ps_debug_blob);
 	rel_blob(ps_proxy_blob); rel_blob(ps_guide_blob); rel_blob(ps_delta_blob);
 	rel_blob(ps_rebuild_blob); rel_blob(ps_smooth_blob); rel_blob(ps_neural_blob);
-	rel_blob(ps_debug_view_blob);
+	rel_blob(ps_slope_blob); rel_blob(ps_debug_view_blob);
 	if (root_sig) { root_sig->Release(); root_sig = nullptr; }
 	if (srv_heap) { srv_heap->Release(); srv_heap = nullptr; }
 	if (rtv_heap) { rtv_heap->Release(); rtv_heap = nullptr; }
@@ -304,6 +312,7 @@ BlitPipelineD3D12::PsoPair *BlitPipelineD3D12::prepare_draw(ID3D12Device *device
 			!make(ps_delta_blob, &pair->delta) ||
 			!make(ps_rebuild_blob, &pair->rebuild) ||
 			!make(ps_smooth_blob, &pair->smooth) ||
+			!make(ps_slope_blob, &pair->slope) ||
 			!make(ps_neural_blob, &pair->neural)) {
 			release_pso(*pair);
 			return nullptr;
@@ -457,6 +466,7 @@ bool BlitPipelineD3D12::draw_neural(ID3D12Device *device, ID3D12GraphicsCommandL
 	case NeuralPass::Delta: pso = pair->delta; break;
 	case NeuralPass::Rebuild: pso = pair->rebuild; break;
 	case NeuralPass::Smooth: pso = pair->smooth; break;
+	case NeuralPass::Slope: pso = pair->slope; break;
 	case NeuralPass::Composite: break;
 	}
 	cmd->SetPipelineState(pso);

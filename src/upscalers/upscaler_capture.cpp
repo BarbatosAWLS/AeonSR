@@ -517,7 +517,8 @@ std::wstring UpscalerCaptureD3D12::status() const
 	return L"captured " + std::to_wstring(written_) + L" frames to " + root_;
 }
 
-void UpscalerCaptureD3D12::request_scope(const std::wstring &dir, uint32_t frames, uint64_t max_bytes)
+void UpscalerCaptureD3D12::request_scope(const std::wstring &dir, uint32_t frames, uint64_t max_bytes,
+	uint32_t planes)
 {
 	if (scope_left_ > 0 || frames == 0 || dir.empty())
 		return;
@@ -543,6 +544,7 @@ void UpscalerCaptureD3D12::request_scope(const std::wstring &dir, uint32_t frame
 	scope_left_ = frames;
 	scope_next_ = 0;
 	scope_max_bytes_ = max_bytes;
+	scope_wanted_ = planes & kScopeAllPlanes;
 	scope_sized_ = false;
 	scope_frame_bytes_ = 0;
 	scope_skipped_ = 0;
@@ -567,6 +569,10 @@ bool UpscalerCaptureD3D12::scope_size(ID3D12Device *device, const D3D12_RESOURCE
 	for (uint32_t i = 0; i < kScopeStagePlanes; ++i) {
 		const D3D12_RESOURCE_DESC &d = static_cast<ScopePlane>(i) == ScopePlane::Mask ? mask : color;
 		ScopeSlot &s = scope_slots_[i];
+		if ((scope_wanted_ & (1u << i)) == 0) {
+			s = ScopeSlot{};
+			continue;
+		}
 		UINT64 total = 0;
 		device->GetCopyableFootprints(&d, 0, 1, 0, &s.footprint, &s.rows, &s.row_bytes, &total);
 		if (s.rows == 0 || s.row_bytes == 0 || total == 0)
@@ -580,6 +586,8 @@ bool UpscalerCaptureD3D12::scope_size(ID3D12Device *device, const D3D12_RESOURCE
 		fmt[i].row_bytes = static_cast<uint32_t>(s.row_bytes);
 	}
 	scope_frame_bytes_ = offset;
+	if (scope_frame_bytes_ == 0)
+		return false;
 	const uint64_t fit = scope_max_bytes_ / scope_frame_bytes_;
 	uint32_t want = scope_left_;
 	if (fit < want)
@@ -623,7 +631,7 @@ void UpscalerCaptureD3D12::scope_copy(ScopePlane plane, ID3D12Device *device, ID
 {
 	const uint32_t i = static_cast<uint32_t>(plane);
 	if (scope_left_ == 0 || i >= kScopeStagePlanes || device == nullptr || cmd == nullptr || res == nullptr ||
-		(scope_cur_.scope_planes & (1u << i)) != 0)
+		(scope_cur_.scope_planes & (1u << i)) != 0 || (scope_wanted_ & (1u << i)) == 0)
 		return;
 	const D3D12_RESOURCE_DESC desc = res->GetDesc();
 	if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
@@ -775,6 +783,14 @@ void UpscalerCaptureD3D12::scope_finalize()
 	if (!error.empty() && scope_error_.empty())
 		scope_error_ = error;
 	scope_done_ = true;
+}
+
+bool UpscalerCaptureD3D12::scope_busy() const
+{
+	if (scope_left_ > 0)
+		return true;
+	std::lock_guard<std::mutex> lock(mutex_);
+	return scope_closed_ && !scope_done_;
 }
 
 std::wstring UpscalerCaptureD3D12::scope_status() const

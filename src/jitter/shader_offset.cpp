@@ -173,7 +173,7 @@ bool scan(const uint32_t *code, size_t n, Scan &s)
 		const uint32_t op = tok & 0xFFFFu;
 		if (op == kComment) {
 			const size_t len = (tok >> 16) & 0x7FFFu;
-			if (p + 1 + len > n)
+			if (len > n - p - 1)
 				return false;
 			read_ctab(code + p + 1, len, s);
 			p += 1 + len;
@@ -188,7 +188,7 @@ bool scan(const uint32_t *code, size_t n, Scan &s)
 				return false;
 			len = static_cast<size_t>(k);
 		}
-		if (p + 1 + len > n)
+		if (len > n - p - 1)
 			return false;
 		const uint32_t *prm = code + p + 1;
 		switch (op) {
@@ -364,7 +364,7 @@ bool scan(const uint32_t *t, size_t len, Scan &s)
 		const uint32_t tok = t[i];
 		const uint32_t op = tok & 0x7FFu;
 		const size_t ilen = op == kOpCustomData ? (i + 1 < len ? t[i + 1] : 0u) : ((tok >> 24) & 0x7Fu);
-		if (ilen == 0 || i + ilen > len)
+		if (ilen == 0 || ilen > len - i)
 			return false;
 		if (op == kOpCustomData) {
 			i += ilen;
@@ -425,6 +425,933 @@ bool scan(const uint32_t *t, size_t len, Scan &s)
 	}
 	return i == len;
 }
+
+}
+
+namespace vclass {
+
+enum class Reg : uint8_t { None, Temp, Indexed, Position };
+
+enum class Lanes : uint8_t { PerLane, Dot2, Dot3, Dot4, All };
+
+constexpr uint32_t kMaxSources = 8u;
+constexpr uint32_t kMaxTemps = 4096u;
+
+struct Dst {
+	Reg reg = Reg::None;
+	uint32_t index = 0;
+	uint8_t mask = 0;
+};
+
+struct Src {
+	Reg reg = Reg::None;
+	uint32_t index = 0;
+	uint8_t swizzle[4]{ 0, 1, 2, 3 };
+};
+
+enum class Mark : uint8_t { None, Call, Return };
+
+struct Instr {
+	Dst dst[2];
+	uint32_t dsts = 0;
+	Src src[kMaxSources];
+	uint32_t srcs = 0;
+	Lanes lanes = Lanes::All;
+	bool matrix = false;
+	bool mul_mad = false;
+	bool column = false;
+	bool block = false;
+	Mark mark = Mark::None;
+};
+
+struct Program {
+	std::vector<Instr> code;
+	size_t subs = SIZE_MAX;
+	bool position = false;
+	uint32_t temps = 0;
+	uint32_t indexed = 0;
+};
+
+enum class Kind : uint8_t { Other, Constant, Coordinate };
+
+struct Factor {
+	Kind kind = Kind::Other;
+	uint8_t swizzle[4]{ 0, 1, 2, 3 };
+};
+
+bool replicated(const uint8_t swizzle[4], uint8_t mask) noexcept
+{
+	int first = -1;
+	for (uint32_t c = 0; c < 4u; ++c) {
+		if ((mask & (1u << c)) == 0)
+			continue;
+		if (first < 0)
+			first = swizzle[c];
+		else if (swizzle[c] != first)
+			return false;
+	}
+	return true;
+}
+
+bool column(const Factor &a, const Factor &b, uint8_t mask) noexcept
+{
+	const auto by = [mask](const Factor &k, const Factor &v) {
+		return k.kind == Kind::Constant && v.kind == Kind::Coordinate && !replicated(k.swizzle, mask) &&
+			replicated(v.swizzle, mask);
+	};
+	return by(a, b) || by(b, a);
+}
+
+uint8_t lane_bit(uint8_t c) noexcept
+{
+	return static_cast<uint8_t>(1u << (c & 3u));
+}
+
+uint8_t reads(const Instr &in, const Src &s, uint8_t lanes) noexcept
+{
+	uint8_t m = 0;
+	switch (in.lanes) {
+	case Lanes::PerLane:
+		for (uint8_t c = 0; c < 4u; ++c) {
+			if ((lanes & (1u << c)) != 0)
+				m |= lane_bit(s.swizzle[c]);
+		}
+		return m;
+	case Lanes::Dot2:
+		return static_cast<uint8_t>(lane_bit(s.swizzle[0]) | lane_bit(s.swizzle[1]));
+	case Lanes::Dot3:
+		return static_cast<uint8_t>(lane_bit(s.swizzle[0]) | lane_bit(s.swizzle[1]) | lane_bit(s.swizzle[2]));
+	default:
+		return static_cast<uint8_t>(lane_bit(s.swizzle[0]) | lane_bit(s.swizzle[1]) | lane_bit(s.swizzle[2]) |
+			lane_bit(s.swizzle[3]));
+	}
+}
+
+bool add_src(Instr &in, const Src &s) noexcept
+{
+	if (in.srcs == kMaxSources)
+		return false;
+	in.src[in.srcs++] = s;
+	return true;
+}
+
+void note_reg(Program &p, Reg reg, uint32_t index) noexcept
+{
+	if (reg == Reg::Temp)
+		p.temps = std::max(p.temps, index + 1u);
+	else if (reg == Reg::Indexed)
+		p.indexed = std::max(p.indexed, index + 1u);
+}
+
+JitterVertexClass weigh(const Program &p)
+{
+	if (!p.position)
+		return JitterVertexClass::Unknown;
+	std::vector<uint8_t> temps(p.temps, 0u), indexed(p.indexed, 0u);
+	uint8_t position = 0xFu;
+	std::vector<uint8_t> taken(p.code.size(), 0u);
+	const auto live = [&](Reg reg, uint32_t index) -> uint8_t * {
+		switch (reg) {
+		case Reg::Temp: return index < temps.size() ? &temps[index] : nullptr;
+		case Reg::Indexed: return index < indexed.size() ? &indexed[index] : nullptr;
+		case Reg::Position: return &position;
+		default: return nullptr;
+		}
+	};
+	const auto step = [&](size_t k, bool replaces) -> bool {
+		const Instr &in = p.code[k];
+		if (in.mark == Mark::Return) {
+			const bool more = position != 0xFu;
+			position = 0xFu;
+			return more;
+		}
+		uint8_t lanes = 0;
+		for (uint32_t d = 0; d < in.dsts; ++d) {
+			uint8_t *const l = live(in.dst[d].reg, in.dst[d].index);
+			if (l == nullptr)
+				continue;
+			lanes |= *l & in.dst[d].mask;
+			if (replaces && in.dst[d].reg != Reg::Indexed)
+				*l &= static_cast<uint8_t>(~in.dst[d].mask);
+		}
+		if (lanes == 0)
+			return false;
+		taken[k] = 1u;
+		bool more = false;
+		for (uint32_t s = 0; s < in.srcs; ++s) {
+			uint8_t *const l = live(in.src[s].reg, in.src[s].index);
+			if (l == nullptr || l == &position)
+				continue;
+			const uint8_t now = static_cast<uint8_t>(*l | reads(in, in.src[s], lanes));
+			more = more || now != *l;
+			*l = now;
+		}
+		return more;
+	};
+	const auto once = [&](size_t k) { return !p.code[k].block && p.code[k].mark == Mark::None; };
+	const size_t subs = std::min(p.subs, p.code.size());
+	for (size_t k = subs; k-- > 0;) {
+		if (once(k)) {
+			step(k, true);
+			continue;
+		}
+		size_t first = k;
+		while (first > 0 && !once(first - 1))
+			--first;
+		bool calls = false;
+		for (size_t j = first; j <= k; ++j)
+			calls = calls || p.code[j].mark == Mark::Call;
+		for (bool more = true; more;) {
+			more = false;
+			for (size_t j = k + 1; j-- > first;)
+				more = step(j, false) || more;
+			for (size_t j = p.code.size(); calls && j-- > subs;)
+				more = step(j, false) || more;
+		}
+		k = first;
+	}
+	uint32_t matrices = 0, mul_mads = 0, columns = 0;
+	for (size_t k = 0; k < p.code.size(); ++k) {
+		if (taken[k] == 0u)
+			continue;
+		matrices += p.code[k].matrix ? 1u : 0u;
+		mul_mads += p.code[k].mul_mad ? 1u : 0u;
+		columns += p.code[k].column ? 1u : 0u;
+	}
+	return matrices != 0u || mul_mads >= 3u || columns >= 2u ? JitterVertexClass::Transformed
+		: JitterVertexClass::Screen;
+}
+
+bool read_d3d9(const uint32_t *code, size_t n, Program &out)
+{
+	using namespace sm3;
+	if (code == nullptr || n < 2 || (code[0] >> 16) != 0xFFFEu)
+		return false;
+	const uint32_t major = (code[0] >> 8) & 0xFFu;
+	if (major < 1u || major > 3u)
+		return false;
+	constexpr uint32_t kRegInput = 1, kRegPredicate = 19, kOpMul = 5, kOpDp3 = 8, kOpDp4 = 9, kOpM4x4 = 20,
+		kOpM3x3 = 23;
+	std::vector<uint8_t> literal(8192u, 0u);
+	int pos_out = -1;
+	for (int pass = 0; pass < 2; ++pass) {
+		size_t p = 1;
+		bool ended = false;
+		uint32_t depth = 0;
+		bool sub = false;
+		while (p < n) {
+			const uint32_t tok = code[p];
+			if (tok == kEnd) {
+				ended = true;
+				break;
+			}
+			const uint32_t op = tok & 0xFFFFu;
+			if (op == kComment) {
+				p += 1 + ((tok >> 16) & 0x7FFFu);
+				continue;
+			}
+			if ((tok & 0x80000000u) != 0)
+				return false;
+			size_t len = (tok >> 24) & 0xFu;
+			if (major < 2u) {
+				const int k = sm1_params(op);
+				if (k < 0 || (len != 0 && len != static_cast<size_t>(k)))
+					return false;
+				len = static_cast<size_t>(k);
+			}
+			if (len > n - p - 1)
+				return false;
+			const uint32_t *const prm = code + p + 1;
+			p += 1 + len;
+			if (op == kOpDcl) {
+				if (len != 2 || (prm[1] & 0x80000000u) == 0)
+					return false;
+				if (pass == 0 && reg_type(prm[1]) == kRegOutput && (prm[0] & 0x1Fu) == 0u &&
+					((prm[0] >> 16) & 0xFu) == 0u)
+					pos_out = static_cast<int>(reg_num(prm[1]));
+				continue;
+			}
+			if (op == kOpDef || op == kOpDefI || op == kOpDefB) {
+				if (len < 1)
+					return false;
+				const int c = const_index(prm[0]);
+				if (pass == 0 && op == kOpDef && c >= 0 && static_cast<size_t>(c) < literal.size())
+					literal[static_cast<size_t>(c)] = 1u;
+				continue;
+			}
+			if (pass == 0)
+				continue;
+			switch (op) {
+			case kOpIf: case kOpIfc: case kOpLoop: case kOpRep:
+				++depth;
+				continue;
+			case kOpEndIf: case kOpEndLoop: case kOpEndRep:
+				if (depth == 0)
+					return false;
+				--depth;
+				continue;
+			case kOpLabel:
+				if (!sub)
+					out.subs = out.code.size();
+				sub = true;
+				depth = 0;
+				continue;
+			case kOpCall: case kOpCallNz: case kOpRet:
+				if (!sub) {
+					Instr mark;
+					mark.mark = op == kOpRet ? Mark::Return : Mark::Call;
+					out.code.push_back(mark);
+				}
+				continue;
+			default:
+				break;
+			}
+			if (op == kOpNop || writes_nothing(op))
+				continue;
+			Instr in;
+			in.block = sub || depth != 0 || (major >= 2u && (tok & (1u << 28)) != 0);
+			switch (op) {
+			case 1: case 2: case 3: case 4: case 5: case 10: case 11: case 12: case 13: case 18: case 19: case 35:
+			case 80: case 88:
+				in.lanes = Lanes::PerLane;
+				break;
+			case kOpDp3: case 22: case kOpM3x3:
+				in.lanes = Lanes::Dot3;
+				break;
+			case kOpDp4: case kOpM4x4: case 21:
+				in.lanes = Lanes::Dot4;
+				break;
+			default:
+				in.lanes = Lanes::All;
+				break;
+			}
+			bool constant = false;
+			Factor factors[2];
+			uint32_t nfactors = 0;
+			size_t i = 0;
+			while (i < len) {
+				const uint32_t t = prm[i];
+				if ((t & 0x80000000u) == 0)
+					return false;
+				const uint32_t type = reg_type(t);
+				const bool relative = (t & kRelative) != 0;
+				Factor f;
+				for (uint32_t c = 0; c < 4u; ++c)
+					f.swizzle[c] = static_cast<uint8_t>((t >> (16u + 2u * c)) & 3u);
+				if (i == 0) {
+					Dst d;
+					d.mask = static_cast<uint8_t>((t >> 16) & 0xFu);
+					if (major < 3u && type == kRegRastOut && reg_num(t) == 0u) {
+						if (relative)
+							return false;
+						d.reg = Reg::Position;
+					} else if (major >= 3u && type == kRegOutput) {
+						if (relative)
+							return false;
+						if (static_cast<int>(reg_num(t)) == pos_out)
+							d.reg = Reg::Position;
+					} else if (type == kRegTemp) {
+						d.reg = Reg::Temp;
+						d.index = reg_num(t);
+					}
+					if (d.reg == Reg::Position)
+						out.position = true;
+					note_reg(out, d.reg, d.index);
+					in.dst[in.dsts++] = d;
+				} else if (type == kRegTemp) {
+					Src s;
+					s.reg = Reg::Temp;
+					s.index = reg_num(t);
+					std::memcpy(s.swizzle, f.swizzle, 4);
+					note_reg(out, s.reg, s.index);
+					if (!add_src(in, s))
+						return false;
+					f.kind = Kind::Coordinate;
+				} else if (type == kRegInput) {
+					f.kind = Kind::Coordinate;
+				} else if (type != kRegPredicate) {
+					const int c = const_index(t);
+					if (c >= 0 && (relative || static_cast<size_t>(c) >= literal.size() || literal[static_cast<size_t>(c)] == 0u)) {
+						constant = true;
+						f.kind = Kind::Constant;
+					}
+				}
+				if (i != 0 && type != kRegPredicate && nfactors < 2u)
+					factors[nfactors++] = f;
+				++i;
+				if (relative && major >= 2u) {
+					if (i >= len || (prm[i] & 0x80000000u) == 0)
+						return false;
+					++i;
+				}
+			}
+			if (in.dsts == 0)
+				continue;
+			in.matrix = constant && (op == kOpDp3 || op == kOpDp4 || (op >= kOpM4x4 && op <= kOpM3x3));
+			in.mul_mad = constant && (op == kOpMad || op == kOpMul);
+			in.column = in.mul_mad && nfactors == 2u && column(factors[0], factors[1], in.dst[0].mask);
+			out.code.push_back(in);
+		}
+		if (!ended)
+			return false;
+	}
+	return out.temps <= kMaxTemps;
+}
+
+namespace sm4ops {
+
+constexpr uint32_t kCall = 4, kCallC = 5, kDp2 = 15, kDp3 = 16, kDp4 = 17, kEndIf = 21, kEndLoop = 22,
+	kEndSwitch = 23, kIf = 31, kLabel = 44, kLoop = 48, kMad = 50, kMul = 56, kRet = 62, kRetC = 63,
+	kSwitch = 76, kCustomData = 53, kInterfaceCall = 120, kDclOutputSiv = 103;
+constexpr uint32_t kTypeTemp = 0, kTypeInput = 1, kTypeOutput = 2, kTypeIndexableTemp = 3, kTypeImm32 = 4,
+	kTypeImm64 = 5, kTypeConstantBuffer = 8;
+
+bool declaration(uint32_t op) noexcept
+{
+	return (op >= 88u && op <= 106u) || (op >= 113u && op <= 116u) || (op >= 143u && op <= 162u) || op == 206u;
+}
+
+uint32_t destinations(uint32_t op) noexcept
+{
+	switch (op) {
+	case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 13: case 18: case 19: case 20:
+	case 21: case 22: case 23: case 31: case 44: case 48: case 58: case 62: case 63: case 76: case 117: case 118:
+	case 119: case 190: case 207: case 208:
+		return 0;
+	case 38: case 77: case 78: case 81: case 132: case 133: case 142:
+		return 2;
+	default:
+		return 1;
+	}
+}
+
+Lanes lanes(uint32_t op) noexcept
+{
+	switch (op) {
+	case 0: case 1: case 14: case 24: case 25: case 26: case 27: case 28: case 29: case 30: case 32: case 33:
+	case 34: case 35: case 36: case 37: case 39: case 40: case 41: case 42: case 43: case 47: case 49: case 50:
+	case 51: case 52: case 54: case 55: case 56: case 57: case 59: case 60: case 64: case 65: case 66: case 67:
+	case 68: case 75: case 79: case 80: case 82: case 83: case 84: case 85: case 86: case 87: case 129:
+		return Lanes::PerLane;
+	case kDp2: return Lanes::Dot2;
+	case kDp3: return Lanes::Dot3;
+	case kDp4: return Lanes::Dot4;
+	default: return Lanes::All;
+	}
+}
+
+struct Operand {
+	uint32_t type = 0;
+	uint32_t comps = 0;
+	uint8_t mask = 0;
+	uint8_t swizzle[4]{ 0, 1, 2, 3 };
+	uint32_t dim = 0;
+	uint32_t index0 = 0;
+	bool relative0 = false;
+};
+
+size_t operand(const uint32_t *t, size_t k, size_t end, Operand &o, Instr &in, Program &p, int depth = 0)
+{
+	if (k >= end || depth > 4)
+		return 0;
+	const uint32_t tok = t[k];
+	size_t n = 1;
+	for (bool ext = (tok >> 31) != 0; ext;) {
+		if (k + n >= end)
+			return 0;
+		ext = (t[k + n] >> 31) != 0;
+		++n;
+	}
+	o.comps = tok & 3u;
+	if (o.comps == 3u)
+		return 0;
+	if (o.comps == 2u) {
+		switch ((tok >> 2) & 3u) {
+		case 0:
+			o.mask = static_cast<uint8_t>((tok >> 4) & 0xFu);
+			break;
+		case 1:
+			o.mask = 0xFu;
+			for (uint32_t c = 0; c < 4u; ++c)
+				o.swizzle[c] = static_cast<uint8_t>((tok >> (4u + 2u * c)) & 3u);
+			break;
+		case 2:
+			o.mask = 0xFu;
+			for (uint8_t &s : o.swizzle)
+				s = static_cast<uint8_t>((tok >> 4) & 3u);
+			break;
+		default:
+			return 0;
+		}
+	} else if (o.comps == 1u) {
+		o.mask = 1u;
+		for (uint8_t &s : o.swizzle)
+			s = 0u;
+	}
+	o.type = (tok >> 12) & 0xFFu;
+	if (o.type == kTypeImm32)
+		n += o.comps == 1u ? 1u : o.comps == 2u ? 4u : 0u;
+	else if (o.type == kTypeImm64)
+		n += o.comps == 1u ? 2u : o.comps == 2u ? 8u : 0u;
+	if (k + n > end)
+		return 0;
+	o.dim = (tok >> 20) & 3u;
+	for (uint32_t d = 0; d < o.dim; ++d) {
+		const uint32_t rep = (tok >> (22u + 3u * d)) & 7u;
+		if (rep > 4u)
+			return 0;
+		if (rep == 0u || rep == 3u) {
+			if (k + n >= end)
+				return 0;
+			if (d == 0u)
+				o.index0 = t[k + n];
+			n += 1;
+		} else if (rep == 1u || rep == 4u) {
+			n += 2;
+		}
+		if (rep >= 2u) {
+			Operand sub;
+			const size_t used = operand(t, k + n, end, sub, in, p, depth + 1);
+			if (used == 0)
+				return 0;
+			if (sub.type == kTypeTemp || sub.type == kTypeIndexableTemp) {
+				Src s;
+				s.reg = sub.type == kTypeTemp ? Reg::Temp : Reg::Indexed;
+				s.index = sub.index0;
+				std::memcpy(s.swizzle, sub.swizzle, 4);
+				note_reg(p, s.reg, s.index);
+				if (!add_src(in, s))
+					return 0;
+			}
+			n += used;
+			if (d == 0u)
+				o.relative0 = true;
+		}
+		if (k + n > end)
+			return 0;
+	}
+	return n;
+}
+
+}
+
+bool read_sm4(const uint32_t *t, size_t len, Program &out)
+{
+	using namespace sm4ops;
+	int pos = -1;
+	uint32_t depth = 0;
+	bool sub = false;
+	size_t i = 2;
+	while (i < len) {
+		const uint32_t tok = t[i];
+		const uint32_t op = tok & 0x7FFu;
+		const size_t ilen = op == kCustomData ? (i + 1 < len ? t[i + 1] : 0u) : ((tok >> 24) & 0x7Fu);
+		if (ilen == 0 || ilen > len - i)
+			return false;
+		const size_t end = i + ilen;
+		if (op == kCustomData) {
+			i = end;
+			continue;
+		}
+		if (declaration(op)) {
+			if (op == kDclOutputSiv && ilen >= 4 && sm4::op_type(t[i + 1]) == kTypeOutput && (t[i + 1] >> 31) == 0 &&
+				t[i + 3] == sm4::kNamePosition)
+				pos = static_cast<int>(t[i + 2]);
+			i = end;
+			continue;
+		}
+		if (op == kInterfaceCall)
+			return false;
+		switch (op) {
+		case kIf: case kLoop: case kSwitch:
+			++depth;
+			break;
+		case kEndIf: case kEndLoop: case kEndSwitch:
+			if (depth == 0)
+				return false;
+			--depth;
+			break;
+		case kLabel:
+			if (!sub)
+				out.subs = out.code.size();
+			sub = true;
+			depth = 0;
+			break;
+		default:
+			break;
+		}
+		size_t k = i + 1;
+		for (bool ext = (tok >> 31) != 0; ext;) {
+			if (k >= end)
+				return false;
+			ext = (t[k] >> 31) != 0;
+			++k;
+		}
+		Instr in;
+		in.lanes = lanes(op);
+		in.block = sub || depth != 0;
+		const uint32_t writes = destinations(op);
+		bool constant = false;
+		Factor factors[2];
+		uint32_t nfactors = 0;
+		for (uint32_t index = 0; k < end; ++index) {
+			Operand o;
+			const size_t used = operand(t, k, end, o, in, out);
+			if (used == 0)
+				return false;
+			k += used;
+			if (index < writes) {
+				if (in.dsts == 2u)
+					return false;
+				Dst d;
+				d.mask = static_cast<uint8_t>(o.comps == 2u ? o.mask : o.comps == 1u ? 1u : 0u);
+				if (o.type == kTypeTemp) {
+					d.reg = Reg::Temp;
+					d.index = o.index0;
+				} else if (o.type == kTypeIndexableTemp) {
+					d.reg = Reg::Indexed;
+					d.index = o.index0;
+				} else if (o.type == kTypeOutput) {
+					if (o.relative0 || o.dim != 1u)
+						return false;
+					if (static_cast<int>(o.index0) == pos)
+						d.reg = Reg::Position;
+				}
+				if (d.reg == Reg::Position)
+					out.position = true;
+				note_reg(out, d.reg, d.index);
+				in.dst[in.dsts++] = d;
+				continue;
+			}
+			Factor f;
+			std::memcpy(f.swizzle, o.swizzle, 4);
+			if (o.type == kTypeConstantBuffer) {
+				constant = true;
+				f.kind = Kind::Constant;
+			} else if (o.type == kTypeTemp || o.type == kTypeIndexableTemp) {
+				Src s;
+				s.reg = o.type == kTypeTemp ? Reg::Temp : Reg::Indexed;
+				s.index = o.index0;
+				std::memcpy(s.swizzle, o.swizzle, 4);
+				note_reg(out, s.reg, s.index);
+				if (!add_src(in, s))
+					return false;
+				f.kind = Kind::Coordinate;
+			} else if (o.type == kTypeInput) {
+				f.kind = Kind::Coordinate;
+			}
+			if (nfactors < 2u)
+				factors[nfactors++] = f;
+		}
+		if (k != end)
+			return false;
+		if (!sub && (op == kCall || op == kCallC || op == kRet || op == kRetC)) {
+			Instr mark;
+			mark.mark = op == kRet || op == kRetC ? Mark::Return : Mark::Call;
+			out.code.push_back(mark);
+		}
+		in.matrix = constant && (op == kDp2 || op == kDp3 || op == kDp4);
+		in.mul_mad = constant && (op == kMad || op == kMul);
+		in.column = in.mul_mad && nfactors == 2u && column(factors[0], factors[1], in.dst[0].mask);
+		if (in.dsts != 0)
+			out.code.push_back(in);
+		i = end;
+	}
+	return i == len && out.temps <= kMaxTemps && out.indexed <= kMaxTemps;
+}
+
+}
+
+namespace wterms {
+
+using namespace sm3;
+
+constexpr uint32_t kRegInput = 1, kRegPredicate = 19;
+constexpr uint32_t kOpAdd = 2, kOpSub = 3, kOpMul = 5, kOpDp3 = 8, kOpDp4 = 9, kOpM4x4 = 20, kOpM4x3 = 21,
+	kOpM3x4 = 22, kOpM3x3 = 23, kOpM3x2 = 24;
+constexpr uint32_t kSaturate = 1u << 20;
+constexpr uint32_t kModNone = 0u, kModNegate = 1u;
+constexpr int kDeviceConstants = static_cast<int>(kD3D9OffsetConstants);
+constexpr int kBudget = 256;
+
+struct Operand {
+	uint32_t type = 0;
+	uint32_t num = 0;
+	uint8_t swizzle[4]{ 0, 1, 2, 3 };
+	bool relative = false;
+	bool literal = false;
+	bool modified = false;
+};
+
+struct Instr {
+	uint32_t op = 0;
+	bool once = true;
+	bool saturate = false;
+	bool relative = false;
+	uint32_t type = 0, num = 0;
+	uint8_t mask = 0;
+	Operand src[3];
+	uint32_t srcs = 0;
+	bool more = false;
+};
+
+struct Shader {
+	std::vector<Instr> code;
+	uint32_t pos_type = 0, pos_num = 0;
+	bool position = false;
+};
+
+bool constant(const Operand &o) noexcept
+{
+	return o.type == kRegConst || o.type == kRegConst2 || o.type == kRegConst3 || o.type == kRegConst4;
+}
+
+bool read(const uint32_t *code, size_t n, Shader &out)
+{
+	if (code == nullptr || n < 2 || (code[0] >> 16) != 0xFFFEu)
+		return false;
+	const uint32_t major = (code[0] >> 8) & 0xFFu;
+	if (major < 1u || major > 3u)
+		return false;
+	out.pos_type = major < 3u ? kRegRastOut : kRegOutput;
+	out.position = major < 3u;
+	std::vector<uint8_t> literal(8192u, 0u);
+	for (int pass = 0; pass < 2; ++pass) {
+		size_t p = 1;
+		uint32_t depth = 0;
+		bool ended = false, main_ended = false;
+		while (p < n) {
+			const uint32_t tok = code[p];
+			if (tok == kEnd) {
+				ended = true;
+				break;
+			}
+			const uint32_t op = tok & 0xFFFFu;
+			if (op == kComment) {
+				p += 1 + ((tok >> 16) & 0x7FFFu);
+				continue;
+			}
+			if ((tok & 0x80000000u) != 0)
+				return false;
+			size_t len = (tok >> 24) & 0xFu;
+			if (major < 2u) {
+				const int k = sm1_params(op);
+				if (k < 0 || (len != 0 && len != static_cast<size_t>(k)))
+					return false;
+				len = static_cast<size_t>(k);
+			}
+			if (len > n - p - 1)
+				return false;
+			const uint32_t *const prm = code + p + 1;
+			p += 1 + len;
+			if (op == kOpDcl) {
+				if (len != 2 || (prm[1] & 0x80000000u) == 0)
+					return false;
+				if (pass == 0 && major >= 3u && reg_type(prm[1]) == kRegOutput && (prm[0] & 0x1Fu) == 0u &&
+					((prm[0] >> 16) & 0xFu) == 0u) {
+					out.pos_num = reg_num(prm[1]);
+					out.position = true;
+				}
+				continue;
+			}
+			if (op == kOpDef || op == kOpDefI || op == kOpDefB) {
+				if (len < 1)
+					return false;
+				const int c = const_index(prm[0]);
+				if (pass == 0 && op == kOpDef && c >= 0 && static_cast<size_t>(c) < literal.size())
+					literal[static_cast<size_t>(c)] = 1u;
+				continue;
+			}
+			if (pass == 0 || main_ended)
+				continue;
+			switch (op) {
+			case kOpIf: case kOpIfc: case kOpLoop: case kOpRep:
+				++depth;
+				continue;
+			case kOpEndIf: case kOpEndLoop: case kOpEndRep:
+				if (depth == 0)
+					return false;
+				--depth;
+				continue;
+			case kOpRet: case kOpLabel:
+				if (depth != 0)
+					return false;
+				main_ended = true;
+				continue;
+			case kOpCall: case kOpCallNz:
+				return false;
+			default:
+				break;
+			}
+			if (op == kOpNop || writes_nothing(op))
+				continue;
+			Instr in;
+			in.op = op;
+			in.once = depth == 0 && !(major >= 2u && (tok & (1u << 28)) != 0);
+			size_t i = 0;
+			bool first = true;
+			while (i < len) {
+				const uint32_t t = prm[i];
+				if ((t & 0x80000000u) == 0)
+					return false;
+				const uint32_t type = reg_type(t);
+				const bool relative = (t & kRelative) != 0;
+				if (first) {
+					in.type = type;
+					in.num = reg_num(t);
+					in.mask = static_cast<uint8_t>((t >> 16) & 0xFu);
+					in.saturate = (t & kSaturate) != 0;
+					in.relative = relative;
+					if (relative && type == kRegOutput)
+						return false;
+					first = false;
+				} else if (type != kRegPredicate) {
+					Operand o;
+					o.type = type;
+					o.num = reg_num(t);
+					for (uint32_t c = 0; c < 4u; ++c)
+						o.swizzle[c] = static_cast<uint8_t>((t >> (16u + 2u * c)) & 3u);
+					o.relative = relative;
+					const uint32_t mod = (t >> 24) & 0xFu;
+					o.modified = mod != kModNone && mod != kModNegate;
+					const int c = const_index(t);
+					o.literal = c >= 0 && !relative && static_cast<size_t>(c) < literal.size() &&
+						literal[static_cast<size_t>(c)] != 0u;
+					if (in.srcs < 3u)
+						in.src[in.srcs++] = o;
+					else
+						in.more = true;
+				}
+				++i;
+				if (relative && major >= 2u) {
+					if (i >= len || (prm[i] & 0x80000000u) == 0)
+						return false;
+					++i;
+				}
+			}
+			if (!first)
+				out.code.push_back(in);
+		}
+		if (!ended)
+			return false;
+	}
+	return out.position;
+}
+
+struct Tracer {
+	const Shader &s;
+	D3D9WTerms &out;
+	int budget = kBudget;
+
+	bool name(int reg, uint8_t lane) noexcept
+	{
+		if (reg < 0 || reg >= kDeviceConstants)
+			return false;
+		for (uint32_t i = 0; i < out.count; ++i) {
+			if (out.reg[i] == reg && out.lane[i] == lane)
+				return true;
+		}
+		if (out.count == D3D9WTerms::kMax)
+			return false;
+		out.reg[out.count] = static_cast<uint16_t>(reg);
+		out.lane[out.count] = lane;
+		++out.count;
+		return true;
+	}
+
+	bool product(const Operand &a, uint8_t la, const Operand &b, uint8_t lb) noexcept
+	{
+		if (a.modified || b.modified)
+			return false;
+		const bool ka = constant(a), kb = constant(b);
+		if (ka && kb)
+			return !a.relative && !b.relative;
+		if (ka == kb)
+			return false;
+		const Operand &k = ka ? a : b;
+		const Operand &v = ka ? b : a;
+		const uint8_t lk = ka ? la : lb, lv = ka ? lb : la;
+		if (v.type != kRegTemp && v.type != kRegInput)
+			return false;
+		if (k.relative)
+			return false;
+		if (lv == 3u)
+			return true;
+		if (k.literal)
+			return false;
+		return name(k.type == kRegConst ? static_cast<int>(k.num) : -1, lk);
+	}
+
+	bool addend(const Operand &o, uint8_t lane, size_t before) noexcept
+	{
+		if (o.modified)
+			return false;
+		if (constant(o))
+			return !o.relative;
+		if (o.type == kRegInput)
+			return lane == 3u;
+		if (o.type == kRegTemp && !o.relative)
+			return value(kRegTemp, o.num, lane, before);
+		return false;
+	}
+
+	bool value(uint32_t type, uint32_t num, uint8_t lane, size_t before) noexcept
+	{
+		if (--budget < 0)
+			return false;
+		for (size_t k = before; k-- > 0;) {
+			const Instr &in = s.code[k];
+			if (in.type != type || in.num != num || (in.mask & (1u << lane)) == 0)
+				continue;
+			if (!in.once || in.relative || in.saturate || in.more)
+				return false;
+			return written(k, lane);
+		}
+		return false;
+	}
+
+	bool written(size_t k, uint8_t lane) noexcept
+	{
+		const Instr &in = s.code[k];
+		const auto at = [&in](uint32_t i, uint8_t l) { return in.src[i].swizzle[l]; };
+		switch (in.op) {
+		case kOpMov:
+			return in.srcs == 1u && addend(in.src[0], at(0, lane), k);
+		case kOpAdd: case kOpSub:
+			return in.srcs == 2u && addend(in.src[0], at(0, lane), k) && addend(in.src[1], at(1, lane), k);
+		case kOpMul:
+			return in.srcs == 2u && product(in.src[0], at(0, lane), in.src[1], at(1, lane));
+		case kOpMad:
+			return in.srcs == 3u && product(in.src[0], at(0, lane), in.src[1], at(1, lane)) &&
+				addend(in.src[2], at(2, lane), k);
+		case kOpDp3: case kOpDp4: {
+			if (in.srcs != 2u)
+				return false;
+			const uint8_t dots = static_cast<uint8_t>(in.op == kOpDp3 ? 3u : 4u);
+			for (uint8_t i = 0; i < dots; ++i) {
+				if (!product(in.src[0], at(0, i), in.src[1], at(1, i)))
+					return false;
+			}
+			return true;
+		}
+		case kOpM4x4: case kOpM4x3: case kOpM3x4: case kOpM3x3: case kOpM3x2: {
+			const uint32_t rows = in.op == kOpM3x2 ? 2u : (in.op == kOpM4x3 || in.op == kOpM3x3) ? 3u : 4u;
+			const uint8_t dots = static_cast<uint8_t>((in.op == kOpM4x4 || in.op == kOpM4x3) ? 4u : 3u);
+			if (in.srcs != 2u || lane >= rows || !constant(in.src[1]))
+				return false;
+			Operand row = in.src[1];
+			row.num += lane;
+			for (uint8_t i = 0; i < dots; ++i) {
+				if (!product(in.src[0], at(0, i), row, i))
+					return false;
+			}
+			return true;
+		}
+		default:
+			return false;
+		}
+	}
+};
 
 }
 
@@ -497,6 +1424,370 @@ uint32_t read32(const uint8_t *p) noexcept
 void write32(uint8_t *p, uint32_t v) noexcept
 {
 	std::memcpy(p, &v, 4);
+}
+
+bool dxbc_program(const void *code, size_t bytes, std::vector<uint32_t> &t, size_t &len)
+{
+	if (code == nullptr || bytes < kDxbcHeader)
+		return false;
+	const auto *in = static_cast<const uint8_t *>(code);
+	if (read32(in) != kDxbc)
+		return false;
+	const uint32_t total = read32(in + 24);
+	const uint32_t count = read32(in + 28);
+	if (total < kDxbcHeader || total > bytes || count == 0 || count > 64u || kDxbcHeader + 4u * count > total)
+		return false;
+	constexpr uint32_t kShex = 0x58454853u;
+	uint32_t program = 0;
+	for (uint32_t c = 0; c < count; ++c) {
+		const uint32_t off = read32(in + kDxbcHeader + 4u * c);
+		if (off > total - 8u || read32(in + off + 4) > total - off - 8u)
+			return false;
+		if (read32(in + off) == kShdr || read32(in + off) == kShex)
+			program = off;
+	}
+	if (program == 0)
+		return false;
+	const uint32_t size = read32(in + program + 4);
+	if (size < 8u || (size & 3u) != 0)
+		return false;
+	t.assign(size / 4u, 0u);
+	std::memcpy(t.data(), in + program + 8, size);
+	const uint32_t major = (t[0] >> 4) & 0xFu;
+	if ((t[0] >> 16) != 1u || major < 4u || major > 5u)
+		return false;
+	len = t[1];
+	return len >= 2 && len <= t.size();
+}
+
+namespace wterms4 {
+
+constexpr uint32_t kOpAdd = 0, kOpCall = 4, kOpCallC = 5, kOpDp2 = 15, kOpDp3 = 16, kOpDp4 = 17, kOpEndIf = 21,
+	kOpEndLoop = 22, kOpEndSwitch = 23, kOpIf = 31, kOpLabel = 44, kOpLoop = 48, kOpMad = 50, kOpCustomData = 53,
+	kOpMov = 54, kOpMul = 56, kOpRet = 62, kOpRetC = 63, kOpSwitch = 76, kOpInterfaceCall = 120,
+	kOpDclOutputSiv = 103;
+constexpr uint32_t kTypeTemp = 0, kTypeInput = 1, kTypeOutput = 2, kTypeImm32 = 4, kTypeImm64 = 5,
+	kTypeConstantBuffer = 8, kTypeImmediateConstantBuffer = 9;
+constexpr uint32_t kNamePosition = 1;
+constexpr uint32_t kSaturate = 1u << 13;
+constexpr int kBudget = 256;
+
+struct Operand {
+	uint32_t type = 0;
+	uint32_t index0 = 0;
+	uint32_t index1 = 0;
+	uint32_t dim = 0;
+	uint8_t mask = 0;
+	uint8_t swizzle[4]{ 0, 1, 2, 3 };
+	bool relative = false;
+	bool modified = false;
+};
+
+struct Instr {
+	uint32_t op = 0;
+	bool once = true;
+	bool saturate = false;
+	Operand dst[2];
+	uint32_t dsts = 0;
+	Operand src[3];
+	uint32_t srcs = 0;
+	bool more = false;
+};
+
+struct Shader {
+	std::vector<Instr> code;
+	int pos = -1;
+};
+
+size_t operand(const uint32_t *t, size_t k, size_t end, Operand &o, int depth = 0)
+{
+	if (k >= end || depth > 4)
+		return 0;
+	const uint32_t tok = t[k];
+	size_t n = 1;
+	for (bool ext = (tok >> 31) != 0; ext;) {
+		if (k + n >= end)
+			return 0;
+		const uint32_t e = t[k + n];
+		ext = (e >> 31) != 0;
+		if ((e & 0x3Fu) == 1u) {
+			if (((e >> 6) & 0xFFu) > 3u)
+				o.modified = true;
+		} else if ((e & 0x3Fu) != 0u) {
+			o.modified = true;
+		}
+		++n;
+	}
+	const uint32_t comps = tok & 3u;
+	if (comps == 3u)
+		return 0;
+	if (comps == 2u) {
+		switch ((tok >> 2) & 3u) {
+		case 0:
+			o.mask = static_cast<uint8_t>((tok >> 4) & 0xFu);
+			break;
+		case 1:
+			o.mask = 0xFu;
+			for (uint32_t c = 0; c < 4u; ++c)
+				o.swizzle[c] = static_cast<uint8_t>((tok >> (4u + 2u * c)) & 3u);
+			break;
+		case 2:
+			o.mask = 0xFu;
+			for (uint8_t &s : o.swizzle)
+				s = static_cast<uint8_t>((tok >> 4) & 3u);
+			break;
+		default:
+			return 0;
+		}
+	} else if (comps == 1u) {
+		o.mask = 1u;
+		for (uint8_t &s : o.swizzle)
+			s = 0u;
+	}
+	o.type = (tok >> 12) & 0xFFu;
+	if (o.type == kTypeImm32)
+		n += comps == 1u ? 1u : comps == 2u ? 4u : 0u;
+	else if (o.type == kTypeImm64)
+		n += comps == 1u ? 2u : comps == 2u ? 8u : 0u;
+	if (k + n > end)
+		return 0;
+	o.dim = (tok >> 20) & 3u;
+	for (uint32_t d = 0; d < o.dim; ++d) {
+		const uint32_t rep = (tok >> (22u + 3u * d)) & 7u;
+		if (rep > 4u)
+			return 0;
+		if (rep == 0u || rep == 3u) {
+			if (k + n >= end)
+				return 0;
+			if (d == 0u)
+				o.index0 = t[k + n];
+			else if (d == 1u)
+				o.index1 = t[k + n];
+			n += 1;
+		} else if (rep == 1u || rep == 4u) {
+			n += 2;
+			o.relative = true;
+		}
+		if (rep >= 2u) {
+			Operand sub;
+			const size_t used = operand(t, k + n, end, sub, depth + 1);
+			if (used == 0)
+				return 0;
+			n += used;
+			o.relative = true;
+		}
+		if (k + n > end)
+			return 0;
+	}
+	return n;
+}
+
+bool read(const uint32_t *t, size_t len, Shader &out)
+{
+	using vclass::sm4ops::declaration;
+	using vclass::sm4ops::destinations;
+	uint32_t depth = 0;
+	bool ended = false;
+	size_t i = 2;
+	while (i < len) {
+		const uint32_t tok = t[i];
+		const uint32_t op = tok & 0x7FFu;
+		const size_t ilen = op == kOpCustomData ? (i + 1 < len ? t[i + 1] : 0u) : ((tok >> 24) & 0x7Fu);
+		if (ilen == 0 || ilen > len - i)
+			return false;
+		const size_t end = i + ilen;
+		if (op == kOpCustomData) {
+			i = end;
+			continue;
+		}
+		if (declaration(op)) {
+			if (op == kOpDclOutputSiv && ilen >= 4 && ((t[i + 1] >> 12) & 0xFFu) == kTypeOutput &&
+				(t[i + 1] >> 31) == 0 && t[i + 3] == kNamePosition)
+				out.pos = static_cast<int>(t[i + 2]);
+			i = end;
+			continue;
+		}
+		if (ended || op == kOpLabel) {
+			ended = true;
+			i = end;
+			continue;
+		}
+		switch (op) {
+		case kOpIf: case kOpLoop: case kOpSwitch:
+			++depth;
+			i = end;
+			continue;
+		case kOpEndIf: case kOpEndLoop: case kOpEndSwitch:
+			if (depth == 0)
+				return false;
+			--depth;
+			i = end;
+			continue;
+		case kOpRet: case kOpRetC:
+			if (depth != 0 || op == kOpRetC)
+				return false;
+			ended = true;
+			i = end;
+			continue;
+		case kOpCall: case kOpCallC: case kOpInterfaceCall:
+			return false;
+		default:
+			break;
+		}
+		size_t k = i + 1;
+		for (bool ext = (tok >> 31) != 0; ext;) {
+			if (k >= end)
+				return false;
+			ext = (t[k] >> 31) != 0;
+			++k;
+		}
+		Instr in;
+		in.op = op;
+		in.once = depth == 0;
+		in.saturate = (tok & kSaturate) != 0;
+		const uint32_t writes = destinations(op);
+		for (uint32_t index = 0; k < end; ++index) {
+			Operand o;
+			const size_t used = operand(t, k, end, o);
+			if (used == 0)
+				return false;
+			k += used;
+			if (index < writes) {
+				if (in.dsts == 2u)
+					return false;
+				if (o.type == kTypeOutput && (o.relative || o.dim != 1u))
+					return false;
+				in.dst[in.dsts++] = o;
+			} else if (in.srcs < 3u) {
+				in.src[in.srcs++] = o;
+			} else {
+				in.more = true;
+			}
+		}
+		if (k != end)
+			return false;
+		if (in.dsts != 0)
+			out.code.push_back(in);
+		i = end;
+	}
+	return i == len && out.pos >= 0;
+}
+
+bool constant(const Operand &o) noexcept
+{
+	return o.type == kTypeConstantBuffer || o.type == kTypeImm32 || o.type == kTypeImm64 ||
+		o.type == kTypeImmediateConstantBuffer;
+}
+
+struct Tracer {
+	const Shader &s;
+	DxbcWTerms &out;
+	int budget = kBudget;
+
+	bool name(const Operand &k, uint8_t lane) noexcept
+	{
+		if (k.type != kTypeConstantBuffer || k.dim != 2u || k.index0 >= kD3D10OffsetSlots || k.index1 >= 4096u)
+			return false;
+		for (uint32_t i = 0; i < out.count; ++i) {
+			if (out.slot[i] == k.index0 && out.reg[i] == k.index1 && out.lane[i] == lane)
+				return true;
+		}
+		if (out.count == DxbcWTerms::kMax)
+			return false;
+		out.slot[out.count] = static_cast<uint8_t>(k.index0);
+		out.reg[out.count] = static_cast<uint16_t>(k.index1);
+		out.lane[out.count] = lane;
+		++out.count;
+		return true;
+	}
+
+	bool product(const Operand &a, uint8_t la, const Operand &b, uint8_t lb) noexcept
+	{
+		if (a.modified || b.modified)
+			return false;
+		const bool ka = constant(a), kb = constant(b);
+		if (ka && kb)
+			return !a.relative && !b.relative;
+		if (ka == kb)
+			return false;
+		const Operand &k = ka ? a : b;
+		const Operand &v = ka ? b : a;
+		const uint8_t lk = ka ? la : lb, lv = ka ? lb : la;
+		if (v.type != kTypeTemp && v.type != kTypeInput)
+			return false;
+		if (k.relative)
+			return false;
+		if (lv == 3u)
+			return true;
+		return name(k, lk);
+	}
+
+	bool addend(const Operand &o, uint8_t lane, size_t before) noexcept
+	{
+		if (o.modified)
+			return false;
+		if (constant(o))
+			return !o.relative;
+		if (o.type == kTypeInput)
+			return lane == 3u;
+		if (o.type == kTypeTemp && !o.relative)
+			return value(kTypeTemp, o.index0, lane, before);
+		return false;
+	}
+
+	bool value(uint32_t type, uint32_t num, uint8_t lane, size_t before) noexcept
+	{
+		if (--budget < 0)
+			return false;
+		for (size_t k = before; k-- > 0;) {
+			const Instr &in = s.code[k];
+			bool hit = false, first = false;
+			for (uint32_t d = 0; d < in.dsts; ++d) {
+				const Operand &o = in.dst[d];
+				if (o.type == type && o.index0 == num && (o.mask & (1u << lane)) != 0) {
+					hit = true;
+					first = d == 0u;
+				}
+			}
+			if (!hit)
+				continue;
+			if (!first || !in.once || in.saturate || in.more || in.dsts != 1u)
+				return false;
+			return written(k, lane);
+		}
+		return false;
+	}
+
+	bool written(size_t k, uint8_t lane) noexcept
+	{
+		const Instr &in = s.code[k];
+		const auto at = [&in](uint32_t i, uint8_t l) { return in.src[i].swizzle[l]; };
+		switch (in.op) {
+		case kOpMov:
+			return in.srcs == 1u && addend(in.src[0], at(0, lane), k);
+		case kOpAdd:
+			return in.srcs == 2u && addend(in.src[0], at(0, lane), k) && addend(in.src[1], at(1, lane), k);
+		case kOpMul:
+			return in.srcs == 2u && product(in.src[0], at(0, lane), in.src[1], at(1, lane));
+		case kOpMad:
+			return in.srcs == 3u && product(in.src[0], at(0, lane), in.src[1], at(1, lane)) &&
+				addend(in.src[2], at(2, lane), k);
+		case kOpDp2: case kOpDp3: case kOpDp4: {
+			if (in.srcs != 2u)
+				return false;
+			const uint8_t dots = static_cast<uint8_t>(in.op == kOpDp2 ? 2u : in.op == kOpDp3 ? 3u : 4u);
+			for (uint8_t i = 0; i < dots; ++i) {
+				if (!product(in.src[0], at(0, i), in.src[1], at(1, i)))
+					return false;
+			}
+			return true;
+		}
+		default:
+			return false;
+		}
+	}
+};
+
 }
 
 }
@@ -740,6 +2031,98 @@ bool offset_dxbc_vertex_shader(const void *code, size_t bytes, std::vector<uint8
 	std::memcpy(out.data() + 4, hash, sizeof(hash));
 	*slot = K;
 	return true;
+}
+
+JitterVertexClass classify_d3d9_vertex_shader(const uint32_t *code, size_t dwords)
+{
+	vclass::Program p;
+	if (!vclass::read_d3d9(code, dwords, p))
+		return JitterVertexClass::Unknown;
+	return vclass::weigh(p);
+}
+
+JitterVertexClass classify_dxbc_vertex_shader(const void *code, size_t bytes)
+{
+	std::vector<uint32_t> t;
+	size_t len = 0;
+	if (!dxbc_program(code, bytes, t, len))
+		return JitterVertexClass::Unknown;
+	vclass::Program p;
+	if (!vclass::read_sm4(t.data(), len, p))
+		return JitterVertexClass::Unknown;
+	return vclass::weigh(p);
+}
+
+bool d3d9_position_w_terms(const uint32_t *code, size_t dwords, D3D9WTerms *out)
+{
+	if (out == nullptr)
+		return false;
+	*out = D3D9WTerms{};
+	wterms::Shader s;
+	if (!wterms::read(code, dwords, s))
+		return false;
+	wterms::Tracer t{ s, *out };
+	if (!t.value(s.pos_type, s.pos_num, 3u, s.code.size())) {
+		*out = D3D9WTerms{};
+		return false;
+	}
+	return true;
+}
+
+bool d3d9_w_terms_perspective(const D3D9WTerms &terms, const float *constants, uint32_t registers) noexcept
+{
+	if (constants == nullptr)
+		return false;
+	for (uint32_t i = 0; i < terms.count && i < D3D9WTerms::kMax; ++i) {
+		if (terms.reg[i] >= registers || terms.lane[i] > 3u)
+			continue;
+		const float v = constants[terms.reg[i] * 4u + terms.lane[i]];
+		if (v > 1e-6f || v < -1e-6f)
+			return true;
+	}
+	return false;
+}
+
+bool dxbc_position_w_terms(const void *code, size_t bytes, DxbcWTerms *out)
+{
+	if (out == nullptr)
+		return false;
+	*out = DxbcWTerms{};
+	std::vector<uint32_t> t;
+	size_t len = 0;
+	if (!dxbc_program(code, bytes, t, len))
+		return false;
+	wterms4::Shader s;
+	if (!wterms4::read(t.data(), len, s))
+		return false;
+	wterms4::Tracer tracer{ s, *out };
+	if (!tracer.value(wterms4::kTypeOutput, static_cast<uint32_t>(s.pos), 3u, s.code.size())) {
+		*out = DxbcWTerms{};
+		return false;
+	}
+	return true;
+}
+
+int dxbc_w_terms_perspective(const DxbcWTerms &terms, DxbcConstantRead read, void *user) noexcept
+{
+	if (read == nullptr)
+		return -1;
+	bool unknown = false;
+	for (uint32_t i = 0; i < terms.count && i < DxbcWTerms::kMax; ++i) {
+		float v[4] = {};
+		if (terms.lane[i] > 3u || !read(user, terms.slot[i], terms.reg[i], v)) {
+			unknown = true;
+			continue;
+		}
+		const float x = v[terms.lane[i]];
+		if (x != x) {
+			unknown = true;
+			continue;
+		}
+		if (x > 1e-6f || x < -1e-6f)
+			return 1;
+	}
+	return unknown ? -1 : 0;
 }
 
 ClipOffset jitter_clip_offset(float tx, float ty, float vw, float vh) noexcept

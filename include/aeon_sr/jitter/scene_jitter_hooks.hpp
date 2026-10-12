@@ -61,6 +61,8 @@ void bind_pipeline_states(reshade::api::command_list *cmd, uint32_t count, const
 void init_pipeline(reshade::api::device *dev, reshade::api::pipeline_layout layout, uint32_t count,
 	const reshade::api::pipeline_subobject *subobjects, reshade::api::pipeline pipe);
 void destroy_pipeline(reshade::api::device *dev, reshade::api::pipeline pipe);
+bool clear_depth_stencil(reshade::api::command_list *cmd, reshade::api::resource_view dsv, const float *depth,
+	const uint8_t *stencil, uint32_t rect_count, const reshade::api::rect *rects);
 
 }
 

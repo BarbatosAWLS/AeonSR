@@ -1,10 +1,12 @@
 #include "aeon_sr/jitter/scene_jitter_hooks.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/jitter/constant_reads.hpp"
 #include "aeon_sr/jitter/depth_regrid.hpp"
 #include "aeon_sr/jitter/gl_jitter.hpp"
 #include "aeon_sr/jitter/scene_jitter_shaders.hpp"
 #include "aeon_sr/jitter/scene_snapshot.hpp"
+#include "aeon_sr/jitter/shader_position.hpp"
 #include "aeon_sr/jitter/vulkan_viewport_hook.hpp"
 
 #include <d3d11.h>
@@ -12,7 +14,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace aeon_sr {
@@ -25,6 +30,8 @@ SceneJitter g_scene_jitter;
 struct JitterCounted {
 	std::mutex lock;
 	JitterDrawCounts counts;
+	std::atomic<uint32_t> all_draws{ 0 };
+	void fold_all_draws() noexcept { counts.all_draws += all_draws.exchange(0, std::memory_order_relaxed); }
 };
 
 struct __declspec(uuid("3f0c9a7e-4d2b-4a61-9e55-8b1f6d2c7a40")) JitterContextData : JitterCounted {
@@ -40,6 +47,8 @@ struct __declspec(uuid("3f0c9a7e-4d2b-4a61-9e55-8b1f6d2c7a40")) JitterContextDat
 	uint64_t size_epoch = 0;
 	bool bind_seen = false;
 	uint64_t asked_epoch = ~0ull;
+	uint64_t projection_serial = 0;
+	uint32_t projection_tries = 0;
 	uint64_t last_pass_target = 0;
 	bool closed = false;
 	struct RegridSlot {
@@ -52,6 +61,11 @@ struct __declspec(uuid("3f0c9a7e-4d2b-4a61-9e55-8b1f6d2c7a40")) JitterContextDat
 	uint32_t regrid_count = 0;
 	int immediate = -1;
 	bool depth_write = true, dsv_read_only = false;
+	uint64_t vertex_pipe = 0, depth_pipe = 0;
+	bool vertex_stale = false, depth_stale = false;
+	uint64_t dyn_pipe = ~0ull;
+	bool dyn_depth = false;
+	int8_t dyn_enable = -1, dyn_write = -1, dyn_op = -1, dyn_compares = -1;
 
 	~JitterContextData();
 };
@@ -117,11 +131,15 @@ bool is_command_list(command_list *cmd)
 	return true;
 }
 
+void depth_defaults(command_list *cmd, JitterListState &s);
+
 JitterContextData &context_of(command_list *cmd)
 {
 	JitterContextData *data = cmd->get_private_data<JitterContextData>();
-	if (data == nullptr)
+	if (data == nullptr) {
 		data = cmd->create_private_data<JitterContextData>();
+		depth_defaults(cmd, data->state);
+	}
 	return *data;
 }
 
@@ -340,23 +358,152 @@ void regrid_bound(command_list *cmd, shader_stage stage, uint32_t first, uint32_
 	}
 }
 
-bool depth_tests(uint64_t state)
+struct D3D11Depth {
+	bool tests = true;
+	bool writes = true;
+	bool enabled = true;
+	bool compares = true;
+};
+
+D3D11Depth d3d11_depth(uint64_t state)
 {
+	D3D11Depth out;
 	if (state == 0)
-		return true;
+		return out;
 	D3D11_DEPTH_STENCIL_DESC desc{};
 	reinterpret_cast<ID3D11DepthStencilState *>(static_cast<uintptr_t>(state))->GetDesc(&desc);
-	return desc.DepthEnable != FALSE &&
+	out.enabled = desc.DepthEnable != FALSE;
+	out.tests = out.enabled &&
 		!(desc.DepthFunc == D3D11_COMPARISON_ALWAYS && desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+	out.writes = out.enabled && desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
+	out.compares = desc.DepthFunc != D3D11_COMPARISON_ALWAYS && desc.DepthFunc != D3D11_COMPARISON_NEVER;
+	return out;
 }
 
-bool depth_writes(uint64_t state)
+bool func_compares(compare_op op)
 {
-	if (state == 0)
-		return true;
-	D3D11_DEPTH_STENCIL_DESC desc{};
-	reinterpret_cast<ID3D11DepthStencilState *>(static_cast<uintptr_t>(state))->GetDesc(&desc);
-	return desc.DepthEnable != FALSE && desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
+	return op != compare_op::always && op != compare_op::never;
+}
+
+void depth_defaults(command_list *cmd, JitterListState &s)
+{
+	switch (cmd->get_device()->get_api()) {
+	case device_api::d3d10:
+	case device_api::d3d11:
+		jitter_on_depth_pipeline(s, true, 1, 1);
+		break;
+	case device_api::opengl:
+		jitter_on_depth_pipeline(s, true, -1, -1);
+		jitter_on_depth_dynamic(s, 0, 1);
+		break;
+	case device_api::d3d9:
+		jitter_on_depth_pipeline(s, true, -1, -1);
+		jitter_on_depth_dynamic(s, 1, 1);
+		break;
+	default:
+		jitter_on_depth_pipeline(s, false, -1, -1);
+		break;
+	}
+}
+
+struct PipelineFacts {
+	bool depth = false;
+	int8_t enable = -1, compares = -1;
+	int8_t write = -1, op = -1;
+	JitterVertexClass vertex = JitterVertexClass::Unknown;
+	bool wterms_known = false;
+	DxbcWTerms wterms{};
+};
+std::shared_mutex g_facts_lock;
+std::unordered_map<uint64_t, PipelineFacts> g_facts;
+std::atomic<bool> g_any_facts{ false };
+
+void note_pipeline_facts(uint64_t pipe, const PipelineFacts &f)
+{
+	if (pipe == 0)
+		return;
+	const bool any = f.depth || f.vertex != JitterVertexClass::Unknown || f.wterms_known;
+	if (!any && !g_any_facts.load(std::memory_order_relaxed))
+		return;
+	const std::unique_lock<std::shared_mutex> lock(g_facts_lock);
+	if (any) {
+		g_facts[pipe] = f;
+		g_any_facts.store(true, std::memory_order_relaxed);
+	} else {
+		g_facts.erase(pipe);
+	}
+}
+
+PipelineFacts pipeline_facts(uint64_t pipe)
+{
+	if (pipe == 0 || !g_any_facts.load(std::memory_order_relaxed))
+		return PipelineFacts{};
+	const std::shared_lock<std::shared_mutex> lock(g_facts_lock);
+	const auto it = g_facts.find(pipe);
+	return it != g_facts.end() ? it->second : PipelineFacts{};
+}
+
+void depth_reset(command_list *cmd, JitterContextData &d)
+{
+	depth_defaults(cmd, d.state);
+	d.vertex_stale = false;
+	d.depth_stale = false;
+}
+
+void quad_facts(command_list *cmd, JitterContextData &d, bool vertex = true)
+{
+	d.state.perspective = false;
+	d.state.projection = -1;
+	if (!vertex) {
+	} else if (d.vertex_pipe == 0 && cmd->get_device()->get_api() == device_api::opengl) {
+		d.state.vertex_class = gl_fixed_function_vertex_class(&d.state.perspective);
+		d.vertex_stale = false;
+	} else if (d.vertex_stale) {
+		d.state.vertex_class = pipeline_facts(d.vertex_pipe).vertex;
+		d.vertex_stale = false;
+	}
+	if (d.depth_stale) {
+		if (d.depth_pipe == 0 && cmd->get_device()->get_api() == device_api::d3d10) {
+			jitter_on_depth_pipeline(d.state, true, 1, 1);
+		} else {
+			const PipelineFacts f = pipeline_facts(d.depth_pipe);
+			jitter_on_depth_pipeline(d.state, f.depth, f.enable, f.compares);
+		}
+		d.depth_stale = false;
+	}
+}
+
+int d3d11_projection(command_list *cmd, JitterContextData &d)
+{
+	const PipelineFacts f = pipeline_facts(d.vertex_pipe);
+	if (!f.wterms_known || d3d11_vertex_position_replaced(cmd))
+		return -1;
+	struct Reader {
+		command_list *cmd;
+		uint64_t shader;
+		uint64_t now;
+	} reader{ cmd, d.vertex_pipe, g_scene_jitter.frame() };
+	if (immediate_context(cmd, d))
+		constant_reads_poll(cmd, reader.now);
+	return dxbc_w_terms_perspective(
+		f.wterms,
+		[](void *user, uint32_t slot, uint32_t reg, float out[4]) {
+			const Reader &r = *static_cast<const Reader *>(user);
+			return d3d11_vertex_constant(r.cmd, r.shader, slot, reg, r.now, out);
+		},
+		&reader);
+}
+
+constexpr uint32_t kProjectionTries = 16u;
+bool try_scene_projection(JitterContextData &d, uint64_t serial)
+{
+	if (serial == 0 || g_scene_jitter.scene_perspective(serial))
+		return false;
+	if (d.projection_serial != serial) {
+		d.projection_serial = serial;
+		d.projection_tries = 0;
+	}
+	return d.projection_tries++ < kProjectionTries;
 }
 
 std::shared_mutex g_untested_lock;
@@ -522,8 +669,41 @@ void take_hooked_viewports(command_list *cmd, JitterContextData &d)
 	apply(cmd, d, held, r);
 }
 
+void take_hooked_depth(command_list *cmd, JitterContextData &d)
+{
+	if (!is_vulkan(cmd) || d.depth_pipe == 0 || !vulkan_viewport_hook().depth_hooked())
+		return;
+	if (d.dyn_pipe != d.depth_pipe) {
+		const PipelineFacts f = pipeline_facts(d.depth_pipe);
+		d.dyn_pipe = d.depth_pipe;
+		d.dyn_depth = f.depth;
+		d.dyn_enable = f.enable;
+		d.dyn_write = f.write;
+		d.dyn_op = f.op;
+		d.dyn_compares = f.compares;
+	}
+	if (!d.dyn_depth || (d.dyn_enable >= 0 && d.dyn_op >= 0 && d.dyn_write >= 0))
+		return;
+	int en = -1, wr = -1, op = -1;
+	if (!vulkan_viewport_hook().depth_of(native_of(cmd), &en, &wr, &op))
+		return;
+	const int enable = d.dyn_enable >= 0 ? d.dyn_enable : en;
+	const int write = d.dyn_write >= 0 ? d.dyn_write : wr;
+	const int func = d.dyn_op >= 0 ? d.dyn_op : op;
+	jitter_on_depth_dynamic(d.state, d.dyn_enable < 0 ? en : -1,
+		d.dyn_compares < 0 && op >= 0 ? (func_compares(static_cast<compare_op>(op)) ? 1 : 0) : -1);
+	if (enable == 0)
+		jitter_on_depth_test(d.state, false);
+	else if (enable == 1)
+		jitter_on_depth_test(d.state, !(func == static_cast<int>(compare_op::always) && write == 0));
+}
+
 void count_other(JitterContextData &d, const JitterArm &arm, bool fullscreen)
 {
+	if (!fullscreen && arm.scene_depth != 0 && d.state.depth != 0 && d.state.depth != arm.scene_depth) {
+		const std::lock_guard<std::mutex> lock(d.lock);
+		count_other_depth_draw(d.counts, d.state.depth_w, d.state.depth_h);
+	}
 	if (fullscreen || !jitter_scene_by_size(arm))
 		return;
 	uint32_t w = 0, h = 0;
@@ -544,11 +724,39 @@ void shader_draw(command_list *cmd, bool fullscreen)
 			bind_target_and_depth(cmd, d, resource_of(cmd, resource_view{ target }), resource_of(cmd, resource_view{ depth }));
 	}
 	bool scene = false;
+	bool over_scene = false;
+	bool window_quad = false;
+	if (g_scene_jitter.engaged())
+		d.all_draws.fetch_add(1u, std::memory_order_relaxed);
 	if (g_scene_jitter.engaged() && (g_scene_jitter.scene_known() || d.state.bound_serial != 0)) {
 		const bool held = d.state.bound_serial != 0;
 		JitterRebind r;
 		d.state.scene_tested = g_scene_jitter.scene_tested(arm_of(cmd, d).serial);
-		scene = jitter_on_draw(d.state, arm_of(cmd, d), fullscreen, &r);
+		const bool into_window = jitter_draw_into_window(d.state, arm_of(cmd, d));
+		const bool depth_bound = fullscreen && jitter_scene_depth_bound(d.state, arm_of(cmd, d));
+		over_scene = depth_bound && !into_window;
+		bool quad_scene = false;
+		if (depth_bound && (into_window || arm_of(cmd, d).scene_quads)) {
+			quad_facts(cmd, d);
+			bool enabled = false, compares = false;
+			if (jitter_d3d9_depth_state(cmd, &enabled, &compares))
+				jitter_on_depth_dynamic(d.state, enabled ? 1 : 0, compares ? 1 : 0);
+			if (over_scene) {
+				d.state.vertex_class = jitter_shader_vertex_class(cmd);
+				if (d.state.vertex_class == JitterVertexClass::Transformed) {
+					d.state.scene_perspective = g_scene_jitter.scene_perspective(arm_of(cmd, d).serial);
+					if (d.state.scene_perspective)
+						d.state.projection = static_cast<int8_t>(jitter_shader_projection(cmd));
+				}
+				quad_scene = jitter_quad_is_scene(d.state, arm_of(cmd, d));
+			} else {
+				bool known = false;
+				window_quad = jitter_depth_compares(d.state, &known) && known;
+				d.state.perspective = window_quad && arm_of(cmd, d).scene_quads && jitter_shader_perspective(cmd);
+				quad_scene = jitter_window_quad_is_scene(d.state, arm_of(cmd, d));
+			}
+		}
+		scene = jitter_on_draw(d.state, arm_of(cmd, d), fullscreen && !quad_scene, &r);
 		apply(cmd, d, held, r);
 		if (!scene)
 			count_other(d, arm_of(cmd, d), fullscreen);
@@ -557,12 +765,15 @@ void shader_draw(command_list *cmd, bool fullscreen)
 	const bool want = d.state.bound_serial != 0 && d.state.app_count != 0;
 	const JitterViewport &vp = d.state.app[0];
 	const JitterShaderDraw carried = jitter_shader_draw(cmd, want, arm.target_x, arm.target_y, vp.width, vp.height,
-		arm.scene_depth == 0);
-	if (scene && carried != JitterShaderDraw::NotADraw) {
+		arm.scene_depth == 0, d.state.target == 0 || jitter_draw_into_window(d.state, arm));
+	if (scene && carried != JitterShaderDraw::NotADraw && carried != JitterShaderDraw::Interface) {
 		const bool by_target = d.state.target_scene && d.state.depth == 0;
 		const bool by_depth = jitter_scene_depth_bound(d.state, arm);
 		if (by_depth && d.state.depth_test)
 			g_scene_jitter.note_scene_tested(arm.serial);
+		if (!fullscreen && by_depth && d.state.depth_test && try_scene_projection(d, arm.serial) &&
+			jitter_shader_projection(cmd) == 1)
+			g_scene_jitter.note_scene_perspective(arm.serial);
 		const std::lock_guard<std::mutex> lock(d.lock);
 		count_scene_draw(d.counts, carried == JitterShaderDraw::Offset ? d.state.bound_serial : 0u,
 			d.state.depth_aliased);
@@ -572,6 +783,16 @@ void shader_draw(command_list *cmd, bool fullscreen)
 			++d.counts.depth_draws;
 		if (!jitter_draw_into_window(d.state, arm))
 			++d.counts.outside_draws;
+		if ((over_scene || window_quad) && carried == JitterShaderDraw::Offset)
+			++d.counts.quads_moved;
+	} else if (scene && carried == JitterShaderDraw::Interface) {
+		const std::lock_guard<std::mutex> lock(d.lock);
+		++d.counts.interface_kept;
+		if (!jitter_draw_into_window(d.state, arm))
+			++d.counts.interface_kept_outside;
+	} else if ((over_scene || window_quad) && !scene) {
+		const std::lock_guard<std::mutex> lock(d.lock);
+		++d.counts.quads_kept;
 	}
 }
 
@@ -613,7 +834,9 @@ void any_draw(command_list *cmd, bool fullscreen)
 	if (!g_scene_jitter.engaged() || route == Route::None)
 		return;
 	JitterContextData &d = context_of(cmd);
+	d.all_draws.fetch_add(1u, std::memory_order_relaxed);
 	take_hooked_viewports(cmd, d);
+	take_hooked_depth(cmd, d);
 	if (!g_scene_jitter.scene_known() && d.state.bound_serial == 0)
 		return;
 	const bool held = d.state.bound_serial != 0;
@@ -628,6 +851,29 @@ void any_draw(command_list *cmd, bool fullscreen)
 		jitter_scene_depth_bound(d.state, arm_of(cmd, d)) && index < scene_snapshot().last_mesh_before() &&
 		scene_snapshot().scene_drawn_into(arm_of(cmd, d).serial, resource{ d.state.target }))
 		fullscreen = false;
+	const bool over_scene = quad && !jitter_draw_into_window(d.state, arm_of(cmd, d)) &&
+		jitter_scene_depth_bound(d.state, arm_of(cmd, d));
+	if (fullscreen && over_scene && arm_of(cmd, d).scene_quads) {
+		quad_facts(cmd, d);
+		if (is_d3d11(cmd) && d.state.vertex_class == JitterVertexClass::Transformed) {
+			d.state.scene_perspective = g_scene_jitter.scene_perspective(arm_of(cmd, d).serial);
+			if (d.state.scene_perspective)
+				d.state.projection = static_cast<int8_t>(d3d11_projection(cmd, d));
+		}
+		if (jitter_quad_is_scene(d.state, arm_of(cmd, d)))
+			fullscreen = false;
+	}
+	bool window_quad = false;
+	if (quad && jitter_draw_into_window(d.state, arm_of(cmd, d)) && jitter_scene_depth_bound(d.state, arm_of(cmd, d))) {
+		quad_facts(cmd, d, false);
+		bool known = false;
+		window_quad = jitter_depth_compares(d.state, &known) && known;
+		if (window_quad && fullscreen && arm_of(cmd, d).scene_quads && is_d3d11(cmd)) {
+			d.state.perspective = d3d11_projection(cmd, d) == 1;
+			if (jitter_window_quad_is_scene(d.state, arm_of(cmd, d)))
+				fullscreen = false;
+		}
+	}
 	const bool scene = jitter_on_draw(d.state, arm_of(cmd, d), fullscreen, &r);
 	if (scene && into_window && !quad)
 		scene_snapshot().note_scene_mesh(index);
@@ -650,6 +896,9 @@ void any_draw(command_list *cmd, bool fullscreen)
 		const bool by_depth = jitter_scene_depth_bound(d.state, arm_of(cmd, d));
 		if (by_depth && d.state.depth_test)
 			g_scene_jitter.note_scene_tested(arm_of(cmd, d).serial);
+		if (!quad && by_depth && d.state.depth_test && is_d3d11(cmd) &&
+			try_scene_projection(d, arm_of(cmd, d).serial) && d3d11_projection(cmd, d) == 1)
+			g_scene_jitter.note_scene_perspective(arm_of(cmd, d).serial);
 		const std::lock_guard<std::mutex> lock(d.lock);
 		count_scene_draw(d.counts, d.state.bound_serial, d.state.depth_aliased);
 		if (by_target)
@@ -658,8 +907,14 @@ void any_draw(command_list *cmd, bool fullscreen)
 			++d.counts.depth_draws;
 		if (!jitter_draw_into_window(d.state, arm_of(cmd, d)))
 			++d.counts.outside_draws;
+		if ((over_scene || window_quad) && d.state.bound_serial != 0)
+			++d.counts.quads_moved;
 	} else {
 		count_other(d, arm_of(cmd, d), fullscreen);
+		if (over_scene || window_quad) {
+			const std::lock_guard<std::mutex> lock(d.lock);
+			++d.counts.quads_kept;
+		}
 	}
 }
 
@@ -673,6 +928,7 @@ void hand_on_counts(command_list *cmd)
 	JitterDrawCounts counts;
 	{
 		const std::lock_guard<std::mutex> lock(data->lock);
+		data->fold_all_draws();
 		if (!any_draw_counts(data->counts))
 			return;
 		counts = data->counts;
@@ -706,7 +962,7 @@ void init(command_list *cmd)
 		if (cmd->get_private_data<JitterCommandListData>() == nullptr)
 			cmd->create_private_data<JitterCommandListData>();
 	} else if (cmd->get_private_data<JitterContextData>() == nullptr) {
-		cmd->create_private_data<JitterContextData>();
+		depth_defaults(cmd, cmd->create_private_data<JitterContextData>()->state);
 	}
 }
 
@@ -750,6 +1006,14 @@ bool clear_depth_stencil(command_list *cmd, resource_view dsv, const float *dept
 		return false;
 	if (depth != nullptr && dsv.handle != 0 && is_d3d11(cmd))
 		note_depth_written(cmd, resource_of(cmd, dsv));
+	if (depth != nullptr && dsv.handle != 0 && g_scene_jitter.engaged()) {
+		JitterContextData &d = context_of(cmd);
+		const JitterArm &a = arm_of(cmd, d);
+		const uint64_t cleared = resource_of(cmd, dsv);
+		if (a.serial != 0 && cleared != 0 && (cleared == a.scene_depth || cleared == d.state.depth) &&
+				g_scene_jitter.scene_tested(a.serial))
+			d.state.depth_cleared_serial = a.serial;
+	}
 	return false;
 }
 
@@ -772,6 +1036,8 @@ bool copy_texture_region(command_list *cmd, resource, uint32_t, const subresourc
 
 void destroy_device(device *dev)
 {
+	if (dev != nullptr && (dev->get_api() == device_api::d3d10 || dev->get_api() == device_api::d3d11))
+		constant_reads_forget(dev->get_native());
 	if (dev == nullptr || dev->get_api() != device_api::d3d11)
 		return;
 	const std::lock_guard<std::mutex> lock(g_regrid_lock);
@@ -851,7 +1117,9 @@ void bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline state)
 	if (cmd == nullptr)
 		return;
 	const bool cleared = stages == pipeline_stage::all && state.handle == 0;
-	if (!cleared && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::depth_stencil)) == 0)
+	const bool depth_stage = (static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::depth_stencil)) != 0;
+	const bool vertex_stage = (static_cast<uint32_t>(stages) & static_cast<uint32_t>(pipeline_stage::vertex_shader)) != 0;
+	if (!cleared && !depth_stage && !vertex_stage)
 		return;
 	if (!followed(cmd))
 		return;
@@ -859,14 +1127,30 @@ void bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline state)
 	if (cleared) {
 		g_scene_jitter.note_bound(d.state.bound_serial != 0, false);
 		jitter_on_cleared(d.state);
+		depth_reset(cmd, d);
 		if (d.regrid_count != 0)
 			regrid_drop(cmd, d, false);
 		d.depth_write = true;
 		return;
 	}
-	jitter_on_depth_test(d.state, is_d3d11(cmd) ? depth_tests(state.handle) : !untested_pipeline(state.handle));
-	if (is_d3d11(cmd))
-		d.depth_write = depth_writes(state.handle);
+	if (vertex_stage) {
+		d.vertex_pipe = state.handle;
+		d.vertex_stale = true;
+	}
+	if (!depth_stage)
+		return;
+	if (is_d3d11(cmd)) {
+		const D3D11Depth depth = d3d11_depth(state.handle);
+		jitter_on_depth_test(d.state, depth.tests);
+		d.depth_write = depth.writes;
+		jitter_on_depth_pipeline(d.state, true, depth.enabled ? 1 : 0, depth.compares ? 1 : 0);
+		d.depth_stale = false;
+		return;
+	}
+	jitter_on_depth_test(d.state, !untested_pipeline(state.handle));
+	d.depth_pipe = state.handle;
+	d.depth_stale = true;
+	d.dyn_pipe = ~0ull;
 }
 
 void bind_pipeline_states(command_list *cmd, uint32_t count, const dynamic_state *states, const uint32_t *values)
@@ -876,36 +1160,134 @@ void bind_pipeline_states(command_list *cmd, uint32_t count, const dynamic_state
 	if (states == nullptr || values == nullptr || !followed(cmd))
 		return;
 	for (uint32_t i = 0; i < count; ++i) {
-		if (states[i] == dynamic_state::depth_enable)
+		if (states[i] == dynamic_state::depth_enable) {
 			jitter_on_depth_test(context_of(cmd).state, values[i] != 0);
+			jitter_on_depth_dynamic(context_of(cmd).state, values[i] != 0 ? 1 : 0, -1);
+		} else if (states[i] == dynamic_state::depth_func) {
+			jitter_on_depth_dynamic(context_of(cmd).state, -1, func_compares(static_cast<compare_op>(values[i])) ? 1 : 0);
+		}
 	}
+}
+
+uint64_t vertex_code_hash(const shader_desc &vs) noexcept
+{
+	uint64_t h = 1469598103934665603ull;
+	const auto mix = [&h](const uint8_t *p, size_t n) {
+		for (size_t i = 0; i < n; ++i) {
+			h ^= p[i];
+			h *= 1099511628211ull;
+		}
+	};
+	mix(static_cast<const uint8_t *>(vs.code), vs.code_size);
+	if (vs.entry_point != nullptr)
+		mix(reinterpret_cast<const uint8_t *>(vs.entry_point), std::strlen(vs.entry_point));
+	const uint64_t size = vs.code_size;
+	mix(reinterpret_cast<const uint8_t *>(&size), sizeof(size));
+	return h;
+}
+
+std::mutex g_vertex_classes_lock;
+std::unordered_map<uint64_t, JitterVertexClass> g_vertex_classes;
+constexpr size_t kVertexClassesKept = 8192u;
+
+JitterVertexClass vertex_class_of(device_api api, const shader_desc &vs, bool layout)
+{
+	if (vs.code == nullptr || vs.code_size == 0)
+		return JitterVertexClass::Unknown;
+	if (api == device_api::d3d11)
+		return layout ? JitterVertexClass::Unknown : classify_dxbc_vertex_shader(vs.code, vs.code_size);
+	if (api != device_api::d3d12 && api != device_api::vulkan && api != device_api::opengl)
+		return JitterVertexClass::Unknown;
+	const uint64_t key = vertex_code_hash(vs) ^ static_cast<uint64_t>(api);
+	{
+		const std::lock_guard<std::mutex> lock(g_vertex_classes_lock);
+		const auto it = g_vertex_classes.find(key);
+		if (it != g_vertex_classes.end())
+			return it->second;
+	}
+	JitterVertexClass c = JitterVertexClass::Unknown;
+	if (api == device_api::d3d12)
+		c = classify_dxbc_vertex_shader(vs.code, vs.code_size);
+	else if (api == device_api::vulkan)
+		c = classify_spirv_vertex_shader(vs.code, vs.code_size, vs.entry_point);
+	else
+		c = classify_glsl_vertex_shader(static_cast<const char *>(vs.code), vs.code_size);
+	const std::lock_guard<std::mutex> lock(g_vertex_classes_lock);
+	if (g_vertex_classes.size() >= kVertexClassesKept)
+		g_vertex_classes.clear();
+	g_vertex_classes[key] = c;
+	return c;
 }
 
 void init_pipeline(device *dev, pipeline_layout, uint32_t count, const pipeline_subobject *subobjects, pipeline pipe)
 {
-	if (dev == nullptr || pipe.handle == 0 || subobjects == nullptr || dev->get_api() == device_api::d3d11)
+	if (dev == nullptr || pipe.handle == 0 || subobjects == nullptr)
+		return;
+	const device_api api = dev->get_api();
+	if (api == device_api::d3d9)
 		return;
 	const depth_stencil_desc *ds = nullptr;
+	const shader_desc *vs = nullptr;
+	const pipeline *libraries = nullptr;
+	uint32_t library_count = 0;
+	bool dynamic_enable = false, dynamic_func = false, dynamic_write = false, layout = false;
 	for (uint32_t i = 0; i < count; ++i) {
+		layout = layout || subobjects[i].type == pipeline_subobject_type::input_layout;
 		if (subobjects[i].data == nullptr)
 			continue;
 		if (subobjects[i].type == pipeline_subobject_type::depth_stencil_state) {
 			ds = static_cast<const depth_stencil_desc *>(subobjects[i].data);
+		} else if (subobjects[i].type == pipeline_subobject_type::vertex_shader && subobjects[i].count != 0) {
+			vs = static_cast<const shader_desc *>(subobjects[i].data);
+		} else if (subobjects[i].type == pipeline_subobject_type::libraries) {
+			libraries = static_cast<const pipeline *>(subobjects[i].data);
+			library_count = subobjects[i].count;
 		} else if (subobjects[i].type == pipeline_subobject_type::dynamic_pipeline_states) {
 			const auto *const states = static_cast<const dynamic_state *>(subobjects[i].data);
 			for (uint32_t k = 0; k < subobjects[i].count; ++k) {
-				if (states[k] == dynamic_state::depth_enable || states[k] == dynamic_state::depth_func)
-					return;
+				dynamic_enable = dynamic_enable || states[k] == dynamic_state::depth_enable;
+				dynamic_func = dynamic_func || states[k] == dynamic_state::depth_func;
+				dynamic_write = dynamic_write || states[k] == dynamic_state::depth_write_mask;
 			}
 		}
 	}
-	if (ds != nullptr && !(ds->depth_enable && !(ds->depth_func == compare_op::always && !ds->depth_write_mask)))
+	bool untested = api != device_api::d3d11 && !dynamic_enable && !dynamic_func && ds != nullptr &&
+		!(ds->depth_enable && !(ds->depth_func == compare_op::always && !ds->depth_write_mask));
+	PipelineFacts facts;
+	if (ds != nullptr && api != device_api::d3d11) {
+		facts.depth = true;
+		facts.enable = static_cast<int8_t>(dynamic_enable ? -1 : ds->depth_enable ? 1 : 0);
+		facts.compares = static_cast<int8_t>(dynamic_func ? -1 : func_compares(ds->depth_func) ? 1 : 0);
+		facts.write = static_cast<int8_t>(dynamic_write ? -1 : ds->depth_write_mask ? 1 : 0);
+		facts.op = static_cast<int8_t>(dynamic_func ? -1 : static_cast<int>(ds->depth_func));
+	}
+	if (vs != nullptr)
+		facts.vertex = vertex_class_of(api, *vs, layout);
+	if (vs != nullptr && api == device_api::d3d11 && !layout && vs->code != nullptr)
+		facts.wterms_known = dxbc_position_w_terms(vs->code, vs->code_size, &facts.wterms);
+	for (uint32_t k = 0; libraries != nullptr && k < library_count; ++k) {
+		const PipelineFacts lib = pipeline_facts(libraries[k].handle);
+		if (!facts.depth && lib.depth) {
+			facts.depth = true;
+			facts.enable = lib.enable;
+			facts.compares = lib.compares;
+			facts.write = lib.write;
+			facts.op = lib.op;
+		}
+		if (facts.vertex == JitterVertexClass::Unknown)
+			facts.vertex = lib.vertex;
+		untested = untested || untested_pipeline(libraries[k].handle);
+	}
+	if (untested)
 		note_untested_pipeline(pipe.handle, true);
+	note_pipeline_facts(pipe.handle, facts);
 }
 
 void destroy_pipeline(device *, pipeline pipe)
 {
 	note_untested_pipeline(pipe.handle, false);
+	note_pipeline_facts(pipe.handle, PipelineFacts{});
+	constant_reads().forget_shader(pipe.handle);
 }
 
 bool draw(command_list *cmd, uint32_t vertices, uint32_t instances, uint32_t, uint32_t)
@@ -961,6 +1343,7 @@ void execute_secondary(command_list *cmd, command_list *secondary)
 			if (!context->closed)
 				return;
 			context->closed = false;
+			context->fold_all_draws();
 			counts = context->counts;
 			context->counts = JitterDrawCounts{};
 		}
@@ -1008,8 +1391,10 @@ void reset(command_list *cmd)
 	data->last_pass_target = 0;
 	g_scene_jitter.note_bound(data->state.bound_serial != 0, false);
 	jitter_on_reset(data->state);
+	depth_reset(cmd, *data);
 	const std::lock_guard<std::mutex> lock(data->lock);
 	data->counts = JitterDrawCounts{};
+	data->all_draws.store(0, std::memory_order_relaxed);
 	data->closed = false;
 }
 
@@ -1046,6 +1431,7 @@ SceneJitter &scene_jitter() noexcept
 void register_scene_jitter_hooks() noexcept
 {
 	register_jitter_shader_hooks();
+	constant_reads_forget(0);
 	reshade::register_event<reshade::addon_event::init_command_list>(jitter_events::init);
 	reshade::register_event<reshade::addon_event::bind_viewports>(jitter_events::bind_viewports);
 	reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(jitter_events::bind_render_targets);
@@ -1084,6 +1470,7 @@ void discard_scene_jitter_counts(reshade::api::effect_runtime *runtime) noexcept
 		if (JitterContextData *const data = immediate->get_private_data<JitterContextData>()) {
 			const std::lock_guard<std::mutex> lock(data->lock);
 			data->counts = JitterDrawCounts{};
+			data->all_draws.store(0, std::memory_order_relaxed);
 		}
 	}
 	g_scene_jitter.discard_counts();

@@ -17,11 +17,11 @@ const char *status_label(UpscalerStatus status) noexcept
 	case UpscalerStatus::MissingRuntime: return "missing runtime DLL";
 	case UpscalerStatus::UnsupportedApi: return "unsupported on this API";
 	case UpscalerStatus::UnsupportedGpu: return "not supported on this GPU";
-	case UpscalerStatus::InitFailed: return "init failed";
+	case UpscalerStatus::InitFailed: return "could not start";
 	case UpscalerStatus::NeedMotionVectors: return "need motion vectors";
 	case UpscalerStatus::NeedDepth: return "need a depth buffer";
-	case UpscalerStatus::Ready: return "ready";
-	case UpscalerStatus::EvaluateFailed: return "evaluate failed";
+	case UpscalerStatus::Ready: return "running";
+	case UpscalerStatus::EvaluateFailed: return "failed this frame";
 	case UpscalerStatus::Crashed: return "runtime crashed (disabled)";
 	case UpscalerStatus::Loading: return "loading, the frame goes on without it";
 	}

@@ -2,6 +2,7 @@
 #include "aeon_sr/interop/interop_bridges.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
+#include "aeon_sr/core/gpu_vendor.hpp"
 
 #include <d3d9.h>
 #include <dxgi1_6.h>
@@ -41,6 +42,29 @@ void safe_release(T *&p)
 		p->Release();
 		p = nullptr;
 	}
+}
+
+bool engine_adapter_is_intel(IDXGIAdapter1 *adapter)
+{
+	DXGI_ADAPTER_DESC1 d{};
+	if (adapter == nullptr || FAILED(adapter->GetDesc1(&d)))
+		return false;
+	const KernelAdapterIds k = kernel_adapter_ids(d.AdapterLuid.LowPart, d.AdapterLuid.HighPart);
+	return resolve_vendor_with_kernel(d.VendorId, d.Description, k).vendor == GpuVendor::Intel;
+}
+
+D3D_FEATURE_LEVEL engine_device_max_level(ID3D12Device *device)
+{
+	const D3D_FEATURE_LEVEL levels[] = {
+		D3D_FEATURE_LEVEL_1_0_CORE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+		D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2,
+	};
+	D3D12_FEATURE_DATA_FEATURE_LEVELS data{};
+	data.NumFeatureLevels = static_cast<UINT>(sizeof(levels) / sizeof(levels[0]));
+	data.pFeatureLevelsRequested = levels;
+	if (device == nullptr || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &data, sizeof(data))))
+		return D3D_FEATURE_LEVEL_1_0_CORE;
+	return data.MaxSupportedFeatureLevel;
 }
 
 }
@@ -279,7 +303,17 @@ bool EngineDevice::finish_device()
 			D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
 		};
 		HRESULT hr = E_FAIL;
+		if (!engine_adapter_is_intel(adapter_) &&
+			SUCCEEDED(D3D12CreateDevice(adapter_, D3D_FEATURE_LEVEL_1_0_CORE, IID_PPV_ARGS(&device12_))) &&
+			device12_ != nullptr) {
+			if (engine_device_max_level(device12_) >= D3D_FEATURE_LEVEL_11_0)
+				hr = S_OK;
+			else
+				safe_release(device12_);
+		}
 		for (const D3D_FEATURE_LEVEL fl : levels) {
+			if (SUCCEEDED(hr))
+				break;
 			hr = D3D12CreateDevice(adapter_, fl, IID_PPV_ARGS(&device12_));
 			if (SUCCEEDED(hr))
 				break;
@@ -295,6 +329,7 @@ bool EngineDevice::finish_device()
 
 	D3D12_COMMAND_QUEUE_DESC qdesc{};
 	qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+	qdesc.Priority = queue_priority;
 	bool ok = SUCCEEDED(device12_->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue12_)));
 	for (auto &ring : allocators_)
 		for (ID3D12CommandAllocator *&a : ring)

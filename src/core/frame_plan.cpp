@@ -137,7 +137,7 @@ FramePlan plan_frame(const Settings &s, const FrameSignals &sig, const BackendSl
 		p.jitter_in_frame = true;
 		plan.jitter_active = true;
 		plan.jitter_decision = JitterDecision::Drawn;
-		if ((sig.jitter_drawn_index & 1u) != 0u) {
+		if ((s.split_pairs || sig.camera_moving) && (sig.jitter_drawn_index & 1u) != 0u) {
 			const Jitter q = split_pair_point(sig.jitter_drawn_index, kJitterAmount);
 			plan.split_shift_x = q.x - sig.jitter_drawn_x;
 			plan.split_shift_y = q.y - sig.jitter_drawn_y;
@@ -157,7 +157,7 @@ FramePlan plan_frame(const Settings &s, const FrameSignals &sig, const BackendSl
 		plan.jitter_active = true;
 		plan.jitter_decision = JitterDecision::Empty;
 		plan.next.jitter_index = h.jitter_index + 1u;
-	} else if (s.spatial_jitter) {
+	} else if (s.spatial_jitter && !sig.jitter_withheld) {
 		const Jitter j = halton_jitter(h.jitter_index, kJitterAmount);
 		p.jitter_x = j.x;
 		p.jitter_y = j.y;

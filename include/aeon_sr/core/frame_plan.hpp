@@ -22,6 +22,8 @@ struct FrameSignals {
 	float jitter_drawn_x = 0.0f, jitter_drawn_y = 0.0f;
 	bool jitter_drawn_ambiguous = false;
 	bool jitter_drawn_empty = false;
+	bool jitter_withheld = false;
+	bool camera_moving = false;
 
 	NeuralColorSpace color_space = NeuralColorSpace::Sdr;
 };
@@ -94,6 +96,35 @@ struct FramePlan {
 Jitter split_pair_point(uint32_t drawn_index, float amount) noexcept;
 
 bool split_uses_catmull_rom(bool setting, BackendChoice backend) noexcept;
+
+struct CameraMotionGate {
+	static constexpr float kOn = 0.5f;
+	static constexpr float kOff = 0.3f;
+	static constexpr uint32_t kConfirm = 3u;
+	bool moving = false;
+	uint32_t streak = 0;
+
+	bool step(float motion_px) noexcept
+	{
+		if (!(motion_px >= 0.0f))
+			return moving;
+		if (moving) {
+			moving = motion_px > kOff;
+			streak = 0;
+			return moving;
+		}
+		streak = motion_px > kOn ? streak + 1u : 0u;
+		moving = streak >= kConfirm;
+		if (moving)
+			streak = 0;
+		return moving;
+	}
+	void reset() noexcept
+	{
+		moving = false;
+		streak = 0;
+	}
+};
 
 FramePlan plan_frame(const Settings &settings, const FrameSignals &signals, const BackendSlots &slots,
 	const FrameHistory &history, float frame_time_ms) noexcept;

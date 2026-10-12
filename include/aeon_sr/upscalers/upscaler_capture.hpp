@@ -43,8 +43,12 @@ public:
 	std::wstring status() const;
 
 	static constexpr uint64_t kScopeMaxBytes = 4ull << 30;
-	void request_scope(const std::wstring &dir, uint32_t frames, uint64_t max_bytes = kScopeMaxBytes);
+	static constexpr uint32_t kScopeAllPlanes = (1u << kScopeStagePlanes) - 1u;
+	void request_scope(const std::wstring &dir, uint32_t frames, uint64_t max_bytes = kScopeMaxBytes,
+		uint32_t planes = kScopeAllPlanes);
 	bool scope_recording() const noexcept { return scope_left_ > 0; }
+	bool scope_busy() const;
+	void scope_cancel() { scope_close_all(); }
 	uint32_t scope_next() const noexcept { return scope_next_; }
 	void scope_begin(ID3D12Device *device, ID3D12CommandQueue *queue);
 	void scope_copy(ScopePlane plane, ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
@@ -119,6 +123,7 @@ private:
 	uint32_t scope_left_ = 0;
 	uint32_t scope_next_ = 0;
 	uint64_t scope_max_bytes_ = kScopeMaxBytes;
+	uint32_t scope_wanted_ = kScopeAllPlanes;
 	bool scope_sized_ = false;
 	D3D12_RESOURCE_DESC scope_color_{};
 	ScopeSlot scope_slots_[kScopeStagePlanes];

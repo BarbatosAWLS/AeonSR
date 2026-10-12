@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.1.2 LANGUAGES C CXX)
+project(AeonSR VERSION 1.2.0 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -127,6 +127,8 @@ set(AEONSR_SOURCES
   src/core/diag_report.cpp
   src/core/diagnostics.cpp
   src/core/dxgi_format_util.cpp
+  src/core/flight_recorder.cpp
+  src/core/report_bundle.cpp
   src/upscalers/ffx_dx11_loader.cpp
   src/upscalers/ffx_loader.cpp
   src/motion/flow_probe.cpp
@@ -150,13 +152,18 @@ set(AEONSR_SOURCES
   src/ngx/neural_arch_hook.cpp
   src/ngx/neural_hardware.cpp
   src/ngx/ngx_common.cpp
+  src/ngx/ngx_override.cpp
   src/ngx/ngx_dlssnr.cpp
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
+  src/ngx/ngx_api12.cpp
   src/ngx/ngx_session.cpp
   src/motion/optical_flow.cpp
+  src/motion/game_jitter_probe.cpp
+  src/motion/game_jitter_memory.cpp
   src/core/panel.cpp
+  src/core/panel_widgets.cpp
   src/interop/remote_engine.cpp
   src/interop/remote_protocol.cpp
   src/core/runtime_search.cpp
@@ -164,6 +171,8 @@ set(AEONSR_SOURCES
   src/jitter/scene_jitter_hooks.cpp
   src/jitter/scene_jitter_shaders.cpp
   src/jitter/shader_offset.cpp
+  src/jitter/shader_position.cpp
+  src/jitter/constant_reads.cpp
   src/jitter/gl_jitter.cpp
   src/motion/scene_stability.cpp
   src/core/settings.cpp
@@ -191,6 +200,7 @@ set(AEONSR_VENDOR_SOURCES
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
+  src/ngx/ngx_api12.cpp
   src/ngx/ngx_session.cpp
   src/upscalers/xess_loader.cpp
 )
@@ -230,7 +240,7 @@ target_include_directories(AeonSR PRIVATE
   "${RESHADE_ROOT}/deps/spirv/include/spirv/unified1")
 target_compile_definitions(AeonSR PRIVATE ${AEONSR_COMMON_DEFINITIONS})
 target_link_libraries(AeonSR PRIVATE aeon_sr_minhook
-  d3d11 d3d12 d3d10 d3d9 dxgi d3dcompiler opengl32 gdi32 shell32 ole32)
+  d3d11 d3d12 d3d10 d3d9 dxgi d3dcompiler opengl32 gdi32 shell32 ole32 windowscodecs)
 
 if(AEONSR_X64)
   target_link_libraries(AeonSR PRIVATE "${NGX_LIB}")
@@ -258,10 +268,12 @@ if(AEONSR_X64)
     src/ngx/neural_arch_hook.cpp
     src/ngx/neural_hardware.cpp
     src/ngx/ngx_common.cpp
+    src/ngx/ngx_override.cpp
     src/upscalers/native_dlss.cpp
     src/ngx/ngx_dlssnr.cpp
     src/ngx/ngx_runtime_d3d12.cpp
     src/ngx/ngx_shared_d3d12.cpp
+    src/ngx/ngx_api12.cpp
     src/ngx/ngx_session.cpp
     src/interop/remote_protocol.cpp
     src/core/runtime_search.cpp
@@ -354,6 +366,11 @@ function(aeonsr_version_resource target filename description filetype)
   set(AEONSR_RC_FILENAME "${filename}")
   set(AEONSR_RC_DESCRIPTION "${description}")
   set(AEONSR_RC_FILETYPE "${filetype}")
+  if(filetype STREQUAL "VFT_APP")
+    set(AEONSR_RC_ICON "1 ICON \"${CMAKE_CURRENT_SOURCE_DIR}/package/AeonSR.ico\"")
+  else()
+    set(AEONSR_RC_ICON "")
+  endif()
   set(rc "${CMAKE_CURRENT_BINARY_DIR}/version_${target}.rc")
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/core/version.rc.in" "${rc}" @ONLY)
   target_sources(${target} PRIVATE "${rc}")

@@ -9,6 +9,7 @@
 
 #include <Windows.h>
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 
@@ -72,8 +73,9 @@ void append_settings(std::wstring &out, const Settings &s)
 		bool_label(s.neural_highlight_guard_on),
 		static_cast<double>(s.neural_highlight_guard),
 		bool_label(s.neural_no_depth), bool_label(s.neural_no_motion_vectors));
-	out += wformat(L"  debug_view=%u  neural_debug_view=%u  osd=%hs  verbose_log=%hs\n",
-		s.debug_view, s.neural_debug_view, bool_label(s.show_osd), bool_label(s.debug_info));
+	out += wformat(L"  debug_view=%u  neural_debug_view=%u  osd=%hs  debug_info=%hs  verbose_log=%hs\n",
+		s.debug_view, s.neural_debug_view, bool_label(s.show_osd), bool_label(s.debug_info),
+		bool_label(s.verbose_log));
 }
 
 }
@@ -118,10 +120,8 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 		if (!api.empty() && bridge.size() > api.size() + 1 && bridge.compare(0, api.size(), api) == 0 &&
 			bridge[api.size()] == ' ')
 			bridge.erase(0, api.size() + 1);
-		if (state.bridge_sync != nullptr)
+		if (!state.bridge_any_ready && state.bridge_sync != nullptr)
 			bridge += std::string(", ") + state.bridge_sync;
-		if (state.bridge_any_ready && !state.bridge_fsr_adapter_matched)
-			bridge += ", adapter not matched yet";
 		add("Bridge to Direct3D 12", state.bridge_any_ready ? CheckState::Ok : CheckState::Warn, std::move(bridge),
 			state.bridge_any_ready ? "" : "The add-on could not reach a Direct3D 12 device yet.");
 	}
@@ -180,10 +180,17 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			"Pick the game's depth buffer in ReShade's own depth settings. "
 			"The add-on works without it, with slightly worse edges.");
 	} else {
-		const std::string depth_line = format("%s, %s%s%s, far %.0f%s",
-			depth_provider_label(state.depth_provider), state.depth_reversed ? "reversed" : "normal",
-			state.depth_upside_down ? ", upside down" : "", state.depth_mirrored ? ", mirrored" : "",
-			static_cast<double>(state.depth_far_plane), state.depth_logarithmic ? ", logarithmic" : "");
+		std::string depth_line = depth_provider_label(state.depth_provider);
+		if (state.depth_reversed)
+			depth_line += ", reversed";
+		if (state.depth_upside_down)
+			depth_line += ", upside down";
+		if (state.depth_mirrored)
+			depth_line += ", mirrored";
+		if (state.depth_far_plane > 0.0f)
+			depth_line += format(", far plane %.0f", static_cast<double>(state.depth_far_plane));
+		if (state.depth_logarithmic)
+			depth_line += ", logarithmic";
 		if (state.depth_overridden.empty())
 			add("Depth buffer", CheckState::Ok, depth_line);
 		else
@@ -203,17 +210,16 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 		std::string action;
 		CheckState s = CheckState::Ok;
 		switch (state.active_status) {
-		case UpscalerStatus::Ready:
-			detail += format(", %ux%u -> %ux%u",
-				state.active_is_fsr || state.active_is_xess || state.active_is_vsr
-					? state.upscaler_render_width : state.ngx_render_width,
-				state.active_is_fsr || state.active_is_xess || state.active_is_vsr
-					? state.upscaler_render_height : state.ngx_render_height,
-				state.active_is_fsr || state.active_is_xess || state.active_is_vsr
-					? state.upscaler_out_width : state.ngx_width,
-				state.active_is_fsr || state.active_is_xess || state.active_is_vsr
-					? state.upscaler_out_height : state.ngx_height);
+		case UpscalerStatus::Ready: {
+			const bool vendor = state.active_is_fsr || state.active_is_xess || state.active_is_vsr;
+			const uint32_t rw = vendor ? state.upscaler_render_width : state.ngx_render_width;
+			const uint32_t rh = vendor ? state.upscaler_render_height : state.ngx_render_height;
+			const uint32_t ow = vendor ? state.upscaler_out_width : state.ngx_width;
+			const uint32_t oh = vendor ? state.upscaler_out_height : state.ngx_height;
+			detail += rw == ow && rh == oh ? format(" at %ux%u", ow, oh)
+				: format(", %ux%u -> %ux%u", rw, rh, ow, oh);
 			break;
+		}
 		case UpscalerStatus::MissingRuntime:
 			s = CheckState::Fail;
 			action = std::string("Its runtime DLL is not beside ") + kAddonFileName +
@@ -221,7 +227,8 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			break;
 		case UpscalerStatus::UnsupportedApi:
 			s = CheckState::Fail;
-			action = "This upscaler does not run on this graphics API. Pick another one.";
+			if (state.active_error.empty())
+				action = "This upscaler does not run on this graphics API. Pick another one.";
 			break;
 		case UpscalerStatus::UnsupportedGpu:
 			s = CheckState::Fail;
@@ -229,7 +236,6 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			break;
 		case UpscalerStatus::NeedMotionVectors:
 			s = CheckState::Warn;
-			action = "Waiting for the motion estimator; it needs two frames after a resolution change.";
 			break;
 		case UpscalerStatus::NeedDepth:
 			s = CheckState::Warn;
@@ -241,8 +247,12 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			action = "The runtime faulted and was switched off for this session. Restart the game.";
 			break;
 		case UpscalerStatus::InitFailed:
+			s = CheckState::Fail;
+			action = "Pick another upscaler. If none of them starts, save the report and send it.";
+			break;
 		case UpscalerStatus::EvaluateFailed:
 			s = CheckState::Fail;
+			action = "If this does not clear in a few seconds, save the report and send it.";
 			break;
 		case UpscalerStatus::Loading:
 			s = CheckState::Warn;
@@ -251,6 +261,7 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			break;
 		case UpscalerStatus::Idle:
 			s = CheckState::Warn;
+			action = "Waiting for a frame to work on.";
 			break;
 		}
 		if (!state.active_error.empty())
@@ -258,16 +269,20 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 		add("Upscaler", s, std::move(detail), std::move(action));
 	}
 
-	if (!state.ngx_layer.empty() && state.ngx_layer_nvidia) {
+	if (!state.ngx_layer.empty()) {
 		if (state.ngx_layer_relevant && !state.host_error.empty())
-			add("Other DLSS program", CheckState::Fail, "loaded in the game: " + diag_narrow(state.ngx_layer),
-				"Aeon SR's DLSS and DLSS neural rendering run in AeonSRHost.exe, apart from it, and it did not "
+			add("Other upscaler program", CheckState::Fail, "loaded in the game: " + diag_narrow(state.ngx_layer),
+				"Aeon SR's upscaler and DLSS neural rendering run in AeonSRHost.exe, apart from it, and it did not "
 				"start: " + diag_narrow(state.host_error));
-		else
-			add("Other DLSS program", CheckState::Ok, "loaded in the game: " + diag_narrow(state.ngx_layer),
-				state.ngx_layer_relevant
-					? "Aeon SR's DLSS and DLSS neural rendering run in AeonSRHost.exe, apart from it."
-					: "Aeon SR's DLSS and DLSS neural rendering would run in AeonSRHost.exe, apart from it.");
+		else {
+			std::string action;
+			if (!state.upscalers_remote)
+				action = state.ngx_layer_relevant
+					? "Aeon SR's upscaler and DLSS neural rendering run in AeonSRHost.exe, apart from it."
+					: "Aeon SR's upscaler and DLSS neural rendering would run in AeonSRHost.exe, apart from it.";
+			add("Other upscaler program", CheckState::Ok, "loaded in the game: " + diag_narrow(state.ngx_layer),
+				std::move(action));
+		}
 	}
 
 	if (state.native_dlss) {
@@ -276,31 +291,27 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			add("Game's own DLSS", CheckState::Fail, "loaded by the game: " + diag_narrow(state.native_dlss_modules),
 				"Aeon SR's DLSS runs in AeonSRHost.exe, apart from it, and it did not start: " +
 				diag_narrow(state.host_error));
-		else
+		else {
+			std::string action;
+			if (state.ngx_layer.empty() && !state.upscalers_remote)
+				action = dlss_on ? "Aeon SR's DLSS runs in AeonSRHost.exe, apart from it."
+					: "Aeon SR's DLSS would run in AeonSRHost.exe, apart from it.";
 			add("Game's own DLSS", CheckState::Ok, "loaded by the game: " + diag_narrow(state.native_dlss_modules),
-				dlss_on ? "Aeon SR's DLSS runs in AeonSRHost.exe, apart from it."
-						: "Aeon SR's DLSS would run in AeonSRHost.exe, apart from it.");
+				std::move(action));
+		}
 	}
 
 	if (!settings.neural_render) {
 		add("Neural rendering", CheckState::Off, "turned off");
 	} else if (state.neural_last == 1) {
-		std::string detail = format("running, %u pass%s at %ux%u",
-			state.neural_passes_built, state.neural_passes_built == 1 ? "" : "es",
-			state.neural_model_width, state.neural_model_height);
-		if (state.neural_eval_rows != 0 && state.neural_eval_rows < state.neural_model_height)
-			detail += format(", up to %.0f%% of the model per frame",
-				100.0 * state.neural_eval_rows / state.neural_model_height);
-		if (state.neural_gpu_ms > 0.0f)
-			detail += format(", %.2f ms", static_cast<double>(state.neural_gpu_ms));
-		if (!state.neural_runtime_cards.empty())
-			detail += ", runtime built for " + state.neural_runtime_cards;
+		const unsigned int asked = clamp_neural_passes(settings.neural_passes);
+		const bool short_chain = state.neural_passes_built != 0 && state.neural_passes_built < asked;
+		std::string detail = short_chain
+			? format("running %u of %u passes", state.neural_passes_built, asked)
+			: std::string("running");
 		if (state.neural_reported_architecture != 0u)
 			detail += " (its own card check bypassed)";
-		const bool short_chain = state.neural_passes_built != 0 &&
-			state.neural_passes_built < clamp_neural_passes(settings.neural_passes);
-		add("Neural rendering", short_chain ? CheckState::Warn : CheckState::Ok,
-			state.upscalers_remote ? detail + ", in the helper process" : detail,
+		add("Neural rendering", short_chain ? CheckState::Warn : CheckState::Ok, std::move(detail),
 			short_chain ? "The runtime would not build every pass; the chain is shorter than asked for." : "");
 	} else if (!vendor_may_be_nvidia(state.gpu_vendor)) {
 		add("Neural rendering", CheckState::Fail,
@@ -335,7 +346,7 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			"Everything else in Aeon SR works on this card.");
 	} else if (state.neural_driver_too_old) {
 		add("Neural rendering", CheckState::Fail,
-			format("driver %u.%02u, the runtime needs %u.%u",
+			format("driver %u.%02u, the runtime needs %u.%02u",
 				state.neural_driver_major, state.neural_driver_minor,
 				state.neural_required_driver_major, state.neural_required_driver_minor),
 			"Update the NVIDIA driver.");
@@ -355,15 +366,15 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 
 	if (settings.debug_view != 0 || settings.neural_debug_view != 0)
 		add("Inspection view", CheckState::Warn, "the frame is being replaced by a debug picture",
-			"Set Debug view (Diagnostics) and Neural debug view (Neural Rendering) to Off to see the game again.");
+			"Set Motion and depth view (Diagnostics) and Neural debug view (Neural Rendering) to Off "
+			"to see the game again.");
 
 	const uint32_t errors = diag_count(DiagLevel::Error);
 	const uint32_t warnings = diag_count(DiagLevel::Warn);
 	if (errors != 0)
 		add("Log", CheckState::Warn,
 			format("%u error%s and %u warning%s so far", errors, errors == 1 ? "" : "s",
-				warnings, warnings == 1 ? "" : "s"),
-			"Save the diagnostic report; it carries them with the machine they happened on.");
+				warnings, warnings == 1 ? "" : "s"));
 	else if (warnings != 0)
 		add("Log", CheckState::Warn, format("%u warning%s so far", warnings, warnings == 1 ? "" : "s"));
 	else
@@ -471,7 +482,8 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 			: state.jitter_in_frame && state.jitter_still ? "armed, nothing drawn took it, the frame left still"
 			: state.jitter_in_frame && state.jitter_mixed ? "drawn into the game, mixed this frame"
 			: state.jitter_in_frame ? "drawn into the game"
-			: state.jitter_active ? "resampled" : "idle",
+			: state.jitter_active ? "resampled"
+			: state.jitter_withheld ? "not drawn, the game jitters its own frame" : "idle",
 		static_cast<double>(state.frame_time_ms));
 	if (state.jitter_in_frame || state.jitter_held_lists != 0 || state.jitter_note[0] != '\0')
 		out += wformat(L"  jitter draws: %u moved, %u on the game's grid, %u replayed at an older "
@@ -564,7 +576,7 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 		out += L"\n";
 	}
 	if (state.neural_required_driver_major != 0)
-		out += wformat(L"  driver      %u.%02u   runtime requires %u.%u\n",
+		out += wformat(L"  driver      %u.%02u   runtime requires %u.%02u\n",
 			state.neural_driver_major, state.neural_driver_minor,
 			state.neural_required_driver_major, state.neural_required_driver_minor);
 	else
@@ -613,6 +625,59 @@ std::wstring diag_write_report(const PanelState &state, const Settings &settings
 	fclose(f);
 	diag_logf(DiagLevel::Info, "report", L"wrote %s", path.c_str());
 	return path;
+}
+
+namespace {
+
+bool technical(const std::string &s)
+{
+	if (s.find("(0x") != std::string::npos)
+		return true;
+	for (size_t at = s.find(" failed"); at != std::string::npos; at = s.find(" failed", at + 1)) {
+		size_t b = at;
+		while (b > 0 && (std::isalnum(static_cast<unsigned char>(s[b - 1])) != 0 || s[b - 1] == '_'))
+			--b;
+		for (size_t i = b + 1; i < at; ++i)
+			if (std::islower(static_cast<unsigned char>(s[i - 1])) != 0 &&
+				std::isupper(static_cast<unsigned char>(s[i])) != 0)
+				return true;
+	}
+	return false;
+}
+
+}
+
+std::string diag_player_text(const std::string &raw, std::string *tech)
+{
+	std::string s = raw;
+	for (const char *prefix : { "NVSDK_NGX_D3D12_", "NVSDK_NGX_D3D11_", "NVSDK_NGX_VULKAN_", "NVSDK_NGX_" }) {
+		const size_t len = std::char_traits<char>::length(prefix);
+		for (size_t at = s.find(prefix); at != std::string::npos; at = s.find(prefix, at))
+			s.erase(at, len);
+	}
+	tech->clear();
+	const size_t dash = s.rfind(" - ");
+	if (dash != std::string::npos && technical(s.substr(dash + 3))) {
+		*tech = s.substr(dash + 3);
+		return s.substr(0, dash);
+	}
+	if (!technical(s))
+		return s;
+	*tech = s;
+	for (size_t at = s.find(" (0x"); at != std::string::npos; at = s.find(" (0x", at)) {
+		const size_t close = s.find(')', at);
+		s.erase(at, close == std::string::npos ? std::string::npos : close - at + 1);
+	}
+	static const struct { const char *call, *words; } kCalls[] = {
+		{ "D3D12 CreateFeature failed", "start failed" },
+		{ "CreateFeature failed", "start failed" },
+	};
+	for (const auto &c : kCalls)
+		for (size_t at = s.find(c.call); at != std::string::npos; at = s.find(c.call, at))
+			s.replace(at, std::char_traits<char>::length(c.call), c.words);
+	if (!s.empty())
+		s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+	return s;
 }
 
 }

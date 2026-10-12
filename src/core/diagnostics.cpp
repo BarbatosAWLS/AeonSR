@@ -197,6 +197,13 @@ void collect_adapters(std::vector<DiagAdapter> &out, uint32_t active_luid_low, i
 			r.name = d.Description;
 			r.vendor_id = d.VendorId;
 			r.device_id = d.DeviceId;
+			const KernelAdapterIds k = kernel_adapter_ids(d.AdapterLuid.LowPart, d.AdapterLuid.HighPart);
+			if (k.known && (k.vendor_id != d.VendorId || k.device_id != d.DeviceId)) {
+				r.vendor_id = k.vendor_id;
+				r.device_id = k.device_id;
+				if (!k.name.empty())
+					r.name = k.name + L" (described to the game as " + d.Description + L")";
+			}
 			r.subsys_id = d.SubSysId;
 			r.revision = d.Revision;
 			r.dedicated_vram = d.DedicatedVideoMemory;
@@ -531,7 +538,8 @@ bool nvidia_driver_version(uint32_t luid_low, int32_t luid_high,
 		LARGE_INTEGER umd{};
 		if (SUCCEEDED(a->GetDesc(&d)) &&
 			d.AdapterLuid.LowPart == luid_low && d.AdapterLuid.HighPart == luid_high &&
-			d.VendorId == kVendorIdNvidia &&
+			resolve_vendor_with_kernel(d.VendorId, d.Description, kernel_adapter_ids(luid_low, luid_high)).vendor ==
+				GpuVendor::Nvidia &&
 			SUCCEEDED(a->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
 			const uint32_t sub = static_cast<uint32_t>(HIWORD(umd.LowPart));
 			const uint32_t build = static_cast<uint32_t>(LOWORD(umd.LowPart));
@@ -597,7 +605,8 @@ void diag_collect_environment_gpu()
 			if (factory->EnumAdapters(0, &a) == S_OK && a != nullptr) {
 				DXGI_ADAPTER_DESC d{};
 				if (SUCCEEDED(a->GetDesc(&d))) {
-					active_vendor = d.VendorId;
+					const KernelAdapterIds k = kernel_adapter_ids(d.AdapterLuid.LowPart, d.AdapterLuid.HighPart);
+					active_vendor = k.known ? k.vendor_id : d.VendorId;
 					active_luid_low = d.AdapterLuid.LowPart;
 					active_luid_high = d.AdapterLuid.HighPart;
 					nvidia_driver_version(d.AdapterLuid.LowPart, d.AdapterLuid.HighPart,

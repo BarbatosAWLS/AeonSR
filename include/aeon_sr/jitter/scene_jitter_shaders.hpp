@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aeon_sr/core/imgui_reshade.hpp"
+#include "aeon_sr/jitter/shader_offset.hpp"
 
 #include <cstdint>
 
@@ -24,12 +25,26 @@ enum class JitterShaderDraw {
 	Grid,
 	Offset,
 	NotADraw,
+	Interface,
 };
 
 JitterShaderDraw jitter_shader_draw(reshade::api::command_list *cmd, bool moved, float tx, float ty, float vw,
-	float vh, bool scene_by_size = false) noexcept;
+	float vh, bool scene_by_size = false, bool into_window = true) noexcept;
 
 bool jitter_d3d9_bound(reshade::api::command_list *cmd, uint64_t *target, uint64_t *depth) noexcept;
+
+JitterVertexClass jitter_shader_vertex_class(reshade::api::command_list *cmd) noexcept;
+
+JitterVertexClass jitter_fixed_function_class(const float world[16], const float view[16],
+	const float projection[16]) noexcept;
+
+bool jitter_fixed_function_perspective(const float world[16], const float view[16],
+	const float projection[16]) noexcept;
+
+bool jitter_shader_perspective(reshade::api::command_list *cmd) noexcept;
+int jitter_shader_projection(reshade::api::command_list *cmd) noexcept;
+
+bool jitter_d3d9_depth_state(reshade::api::command_list *cmd, bool *enabled, bool *compares) noexcept;
 
 void register_jitter_shader_hooks() noexcept;
 

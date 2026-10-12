@@ -42,14 +42,14 @@ struct NeuralDrawConstants {
 	float warp_y = 0.0f;
 	float guide_motion = 0.0f;
 	float input_detail = 0.0f;
-	float pad2 = 0.0f;
+	float detail_transfer = 0.0f;
 	float pad3 = 0.0f;
 };
 
 inline constexpr uint32_t kNeuralConstantCount = 28;
 inline constexpr uint32_t kBlitConstantCount = 16;
 
-enum class NeuralPass { Proxy, Guide, Delta, Rebuild, Smooth, Composite };
+enum class NeuralPass { Proxy, Guide, Delta, Rebuild, Smooth, Slope, Composite };
 
 struct BlitPipelineD3D12 {
 	ID3D12RootSignature *root_sig = nullptr;
@@ -63,6 +63,7 @@ struct BlitPipelineD3D12 {
 		ID3D12PipelineState *delta = nullptr;
 		ID3D12PipelineState *rebuild = nullptr;
 		ID3D12PipelineState *smooth = nullptr;
+		ID3D12PipelineState *slope = nullptr;
 		ID3D12PipelineState *neural = nullptr;
 		ID3D12PipelineState *debug_view = nullptr;
 	};
@@ -70,6 +71,7 @@ struct BlitPipelineD3D12 {
 	void *vs_blob = nullptr, *ps_blit_blob = nullptr, *ps_debug_blob = nullptr;
 	void *ps_proxy_blob = nullptr, *ps_guide_blob = nullptr, *ps_delta_blob = nullptr;
 	void *ps_rebuild_blob = nullptr, *ps_smooth_blob = nullptr, *ps_neural_blob = nullptr;
+	void *ps_slope_blob = nullptr;
 	void *ps_debug_view_blob = nullptr;
 	ID3D12DescriptorHeap *srv_heap = nullptr;
 	ID3D12DescriptorHeap *rtv_heap = nullptr;

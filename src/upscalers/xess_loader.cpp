@@ -1,4 +1,5 @@
 #include "aeon_sr/upscalers/xess_loader.hpp"
+#include "aeon_sr/upscalers/runtime_load_check.hpp"
 
 namespace aeon_sr {
 
@@ -8,6 +9,12 @@ bool xess_load(XessApi &out, const std::wstring &dll_path, std::wstring &error)
 	out.module = LoadLibraryW(dll_path.c_str());
 	if (out.module == nullptr) {
 		error = L"LoadLibrary failed for libxess.dll";
+		return false;
+	}
+	std::wstring got;
+	if (!loaded_module_is(out.module, dll_path, &got)) {
+		error = runtime_load_redirect_error(dll_path, got);
+		out = XessApi{};
 		return false;
 	}
 
@@ -27,6 +34,13 @@ bool xess_load(XessApi &out, const std::wstring &dll_path, std::wstring &error)
 		error = L"libxess.dll missing required exports";
 		xess_unload(out);
 		return false;
+	}
+	for (const char *name : { "xessD3D12CreateContext", "xessD3D12Execute" }) {
+		if (export_patched(out.module, name)) {
+			error = runtime_hooked_error(dll_path, name);
+			xess_unload(out);
+			return false;
+		}
 	}
 	error.clear();
 	return true;

@@ -17,6 +17,23 @@ using namespace aeon_sr;
 
 namespace {
 
+std::wstring d3d9ex_attempts(const d3d9ex::Result &r)
+{
+	std::wstring s;
+	for (int i = 0; i < r.attempt_count; ++i) {
+		const d3d9ex::Attempt &a = r.attempts[i];
+		const wchar_t *const format = a.format == D3DFMT_X8R8G8B8 ? L"X8R8G8B8"
+			: a.format == D3DFMT_A8R8G8B8 ? L"A8R8G8B8" : L"other format";
+		const wchar_t *const order = a.scanline == D3DSCANLINEORDERING_PROGRESSIVE ? L"progressive"
+			: a.scanline == D3DSCANLINEORDERING_INTERLACED ? L"interlaced" : L"no scan-line order";
+		wchar_t one[160];
+		_snwprintf_s(one, _TRUNCATE, L"%ls%ux%u %u Hz %ls (%u) %ls 0x%08lX", i == 0 ? L"" : L"; ", a.width, a.height,
+			a.refresh, format, static_cast<unsigned>(a.format), order, static_cast<unsigned long>(a.hr));
+		s += one;
+	}
+	return s;
+}
+
 bool on_create_device(reshade::api::device_api api, uint32_t &api_version)
 {
 	if (api != reshade::api::device_api::d3d9)
@@ -40,10 +57,13 @@ void on_init_device(reshade::api::device *device)
 		if (r.outcome == d3d9ex::Outcome::Upgraded)
 			diag_info("interop", std::wstring(L"the game's Direct3D 9 device was made Direct3D 9Ex, so its frames "
 				L"reach the upscaler on the graphics card") + (r.mode_made ? L" (fullscreen: the display mode was "
-				L"built from the game's own settings)" : L""));
+				L"built from the game's own settings" : L"") + (r.refresh_filled != 0 ? L", at " +
+				std::to_wstring(r.refresh_filled) + L" Hz where it asked for no refresh rate" : L"") +
+				(r.mode_made ? L")" : L"") + (r.attempt_count > 1 ? L"; display modes asked: " + d3d9ex_attempts(r) : L""));
 		else if (r.outcome == d3d9ex::Outcome::FellBack)
 			diag_warn("interop", std::wstring(L"Direct3D 9Ex refused this game's device (") + hr + L"), so it "
-				L"was made the plain Direct3D 9 device the game asked for, and its frames travel through system memory");
+				L"was made the plain Direct3D 9 device the game asked for, and its frames travel through system memory" +
+				(r.attempt_count > 0 ? L"; display modes asked: " + d3d9ex_attempts(r) : L""));
 	}
 	if (auto *a = app())
 		a->on_init_device(device);
@@ -61,10 +81,28 @@ void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 		a->on_init_swapchain(swapchain, resize);
 }
 
+bool fill_d3d9_refresh(reshade::api::device_api api, reshade::api::swapchain_desc &desc)
+{
+	if (api != reshade::api::device_api::d3d9 || !desc.fullscreen_state || desc.fullscreen_refresh_rate != 0.0f)
+		return false;
+	const reshade::api::format f = desc.back_buffer.texture.format;
+	const D3DFORMAT format = f == reshade::api::format::b8g8r8a8_unorm ? D3DFMT_A8R8G8B8
+		: f == reshade::api::format::b8g8r8x8_unorm ? D3DFMT_X8R8G8B8 : D3DFMT_UNKNOWN;
+	const UINT rate = d3d9ex::refresh_for_reset(desc.back_buffer.texture.width, desc.back_buffer.texture.height,
+		format);
+	if (rate == 0)
+		return false;
+	desc.fullscreen_refresh_rate = static_cast<float>(rate);
+	diag_logf(DiagLevel::Info, "interop", L"the game's fullscreen Direct3D 9Ex device asked for no refresh rate "
+		L"again; %u Hz, one of the display's own, which Direct3D 9Ex takes where it refuses none", rate);
+	return true;
+}
+
 bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *)
 {
+	const bool refresh = fill_d3d9_refresh(api, desc);
 	if (!request_swapchain_usage(api, desc))
-		return false;
+		return refresh;
 	diag_info("swapchain", L"asked for transfer usage on the Vulkan swap chain, so the frame can be "
 		L"carried to the upscalers and back");
 	return true;
@@ -257,7 +295,11 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE 
 	reshade::unregister_addon(addon_module, reshade_module);
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID)
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved)
 {
+	if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
+		if (aeon_sr::App *const a = aeon_sr::app())
+			a->at_process_exit();
+	}
 	return TRUE;
 }

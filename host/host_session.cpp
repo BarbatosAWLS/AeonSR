@@ -139,6 +139,7 @@ void HostSession::shutdown()
 	release_planes();
 	release(fence_);
 	fence_name_[0] = L'\0';
+	gpu_timer_.release();
 	engine_.shutdown();
 	block_ = nullptr;
 }
@@ -312,13 +313,58 @@ void HostSession::serve_frame()
 	const uint64_t frame_index = block_->frame_index;
 	fence_signal_value_ = block_->fence_signal_value;
 
-	struct Epilogue {
-		HostSession *self;
-		uint64_t index;
-		~Epilogue() { self->finish_frame(index); }
-	} epilogue{ this, frame_index };
+	LARGE_INTEGER qpf{}, q0{}, q1{};
+	QueryPerformanceFrequency(&qpf);
+	QueryPerformanceCounter(&q0);
+	const double stall_before = engine_.begin_stall_ms();
+	{
+		struct Epilogue {
+			HostSession *self;
+			uint64_t index;
+			~Epilogue() { self->finish_frame(index); }
+		} epilogue{ this, frame_index };
 
-	run_frame();
+		run_frame();
+	}
+	QueryPerformanceCounter(&q1);
+	const double serve = qpf.QuadPart != 0
+		? 1000.0 * static_cast<double>(q1.QuadPart - q0.QuadPart) / static_cast<double>(qpf.QuadPart) : 0.0;
+	note_stats(serve, engine_.begin_stall_ms() - stall_before);
+}
+
+void HostSession::note_stats(double serve_ms, double stall_ms) noexcept
+{
+	Stats &s = stats_;
+	++s.frames;
+	s.serve_ms += serve_ms;
+	s.serve_max_ms = serve_ms > s.serve_max_ms ? serve_ms : s.serve_max_ms;
+	s.stall_ms += stall_ms;
+	s.stall_max_ms = stall_ms > s.stall_max_ms ? stall_ms : s.stall_max_ms;
+	gpu_timer_.poll();
+	if (gpu_timer_.last_ms > 0.0) {
+		++s.gpu_frames;
+		s.gpu_ms += gpu_timer_.last_ms;
+		s.gpu_max_ms = gpu_timer_.last_ms > s.gpu_max_ms ? gpu_timer_.last_ms : s.gpu_max_ms;
+	}
+	if (ID3D12Fence *const f = engine_.fence()) {
+		const uint64_t done = f->GetCompletedValue();
+		const uint64_t behind = engine_.last_submitted() > done ? engine_.last_submitted() - done : 0;
+		s.behind += behind;
+		s.behind_max = behind > s.behind_max ? behind : s.behind_max;
+	}
+	const ULONGLONG now = GetTickCount64();
+	if (s.since == 0)
+		s.since = now;
+	if (now < s.since + 10000u)
+		return;
+	diag_logf(DiagLevel::Info, "host", L"host: last 10 s %u frames served in %.2f ms on average (%.1f at most), "
+		L"%.2f ms of it waiting for this engine's GPU to free an allocator (%.1f at most); the host's commands took "
+		L"%.2f ms on the GPU from first to last (%.1f at most); %.2f of its frames still on its GPU when it answered "
+		L"(%llu at most)", s.frames, s.serve_ms / s.frames, s.serve_max_ms, s.stall_ms / s.frames, s.stall_max_ms,
+		s.gpu_frames != 0 ? s.gpu_ms / s.gpu_frames : 0.0, s.gpu_max_ms,
+		static_cast<double>(s.behind) / s.frames, static_cast<unsigned long long>(s.behind_max));
+	s = Stats{};
+	s.since = now;
 }
 
 void HostSession::run_frame()
@@ -359,6 +405,9 @@ void HostSession::run_frame()
 	}
 
 	ID3D12GraphicsCommandList *const cmd = engine_.begin_list();
+	const bool timing = cmd != nullptr && gpu_timer_.ensure(engine_.device(), queue);
+	if (timing)
+		gpu_timer_.begin(cmd);
 	if (cmd == nullptr) {
 		fail(remote::RemoteStep::Engine, "host.engine",
 			engine_.last_error.empty()
@@ -391,6 +440,8 @@ void HostSession::run_frame()
 
 	run_neural(inputs, colour, inputs.engine.motion, inputs.engine.depth);
 
+	if (timing)
+		gpu_timer_.end(cmd);
 	if (!engine_.submit_list()) {
 		fail(remote::RemoteStep::Engine, "host.submit",
 			engine_.last_error.empty()

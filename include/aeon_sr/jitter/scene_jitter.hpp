@@ -1,5 +1,7 @@
 #pragma once
 
+#include "aeon_sr/jitter/shader_offset.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -45,6 +47,7 @@ struct JitterArm {
 	bool scene_targets = true;
 	bool move_window = false;
 	bool tested_quads = false;
+	bool scene_quads = false;
 	bool depth_regrid = false;
 	uint64_t back_buffer = 0;
 	uint64_t back_buffers[kJitterBackBuffers]{};
@@ -70,14 +73,23 @@ struct JitterDrawCounts {
 	uint32_t by_target = 0;
 	uint32_t depth_draws = 0;
 	uint32_t outside_draws = 0;
+	uint32_t interface_kept = 0;
+	uint32_t interface_kept_outside = 0;
+	uint32_t all_draws = 0;
+	uint32_t quads_moved = 0;
+	uint32_t quads_kept = 0;
 	uint32_t other_w[kJitterOtherSizes]{}, other_h[kJitterOtherSizes]{};
 	uint32_t other_draws[kJitterOtherSizes]{};
 	uint32_t other_overflow = 0;
+	uint32_t other_depth_w[kJitterOtherSizes]{}, other_depth_h[kJitterOtherSizes]{};
+	uint32_t other_depth_draws[kJitterOtherSizes]{};
+	uint32_t other_depth_overflow = 0;
 };
 
 void count_moved_draws(JitterDrawCounts &c, uint64_t serial, uint32_t n = 1u) noexcept;
 void count_scene_draw(JitterDrawCounts &c, uint64_t bound_serial, bool aliased = false) noexcept;
 void count_other_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n = 1u) noexcept;
+void count_other_depth_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n = 1u) noexcept;
 void add_draw_counts(JitterDrawCounts &into, const JitterDrawCounts &from) noexcept;
 JitterDrawCounts replayed_draw_counts(const JitterDrawCounts &c) noexcept;
 bool any_draw_counts(const JitterDrawCounts &c) noexcept;
@@ -110,6 +122,14 @@ struct JitterListState {
 	bool target_scene = false;
 	bool target_window = false;
 	bool depth_test = true;
+	bool depth_pipe_known = false;
+	int8_t depth_pipe_enable = -1, depth_pipe_func = -1;
+	int8_t depth_dyn_enable = -1, depth_dyn_func = -1;
+	JitterVertexClass vertex_class = JitterVertexClass::Unknown;
+	bool perspective = false;
+	int8_t projection = -1;
+	bool scene_perspective = false;
+	uint64_t depth_cleared_serial = 0;
 	bool scene_tested = false;
 	JitterMovedSet moved[kJitterMovedHistory]{};
 	uint32_t moved_next = 0;
@@ -144,6 +164,14 @@ bool jitter_rebind_expected(const JitterRebind &r, uint32_t count, const JitterV
 
 bool jitter_is_fullscreen_draw(uint32_t vertices, uint32_t instances) noexcept;
 
+void jitter_on_depth_pipeline(JitterListState &s, bool known, int enable, int compares) noexcept;
+void jitter_on_depth_dynamic(JitterListState &s, int enable, int compares) noexcept;
+bool jitter_depth_compares(const JitterListState &s, bool *known) noexcept;
+
+bool jitter_quad_is_scene(const JitterListState &s, const JitterArm &arm) noexcept;
+
+bool jitter_window_quad_is_scene(const JitterListState &s, const JitterArm &arm) noexcept;
+
 struct JitterFrame {
 	bool valid = false;
 	bool ambiguous = false;
@@ -159,7 +187,11 @@ struct JitterFrame {
 	uint32_t by_target = 0;
 	uint32_t depth_draws = 0;
 	uint32_t outside_draws = 0;
+	uint32_t interface_kept = 0, interface_kept_outside = 0;
+	uint32_t all_draws = 0;
+	uint32_t quads_moved = 0, quads_kept = 0;
 	uint32_t other_w = 0, other_h = 0, other_draws = 0;
+	uint32_t other_depth_w = 0, other_depth_h = 0, other_depth_draws = 0;
 	bool empty = false;
 
 	uint64_t serial = 0;
@@ -215,6 +247,15 @@ public:
 	bool scene_tested(uint64_t serial) const noexcept
 	{
 		return serial != 0 && scene_tested_.load(std::memory_order_relaxed) == serial;
+	}
+	void note_scene_perspective(uint64_t serial) noexcept
+	{
+		if (serial != 0 && scene_perspective_.load(std::memory_order_relaxed) != serial)
+			scene_perspective_.store(serial, std::memory_order_relaxed);
+	}
+	bool scene_perspective(uint64_t serial) const noexcept
+	{
+		return serial != 0 && scene_perspective_.load(std::memory_order_relaxed) == serial;
 	}
 	bool saw_frame_depth() const noexcept { return saw_frame_depth_.load(std::memory_order_relaxed); }
 	void forget_scene_targets() noexcept;
@@ -273,6 +314,7 @@ private:
 	std::atomic<uint32_t> presented_next_{ 0 };
 	std::atomic<bool> saw_frame_depth_{ false };
 	std::atomic<uint64_t> scene_tested_{ 0 };
+	std::atomic<uint64_t> scene_perspective_{ 0 };
 	std::atomic<uint64_t> frame_{ 0 };
 	std::atomic<bool> scene_known_{ false };
 	std::atomic<int> lists_bound_{ 0 };
@@ -330,6 +372,7 @@ private:
 	JitterArm pending_{};
 	bool pending_set_ = false;
 	uint32_t stops_ = 0;
+	uint32_t others_ = 0;
 };
 
 class JitterCounts {
@@ -344,6 +387,8 @@ public:
 	static constexpr uint32_t kAloneAfter = 120u;
 	static constexpr uint32_t kRawMovedInWindow = 3u;
 	static constexpr uint32_t kRawMovedWindow = 8u;
+	static constexpr uint32_t kRawMovedAlone = 2u;
+	static constexpr uint32_t kRawMovedAloneWindow = 32u;
 	static constexpr uint32_t kPromoteStaleAfter = 4u;
 
 	explicit JitterDriver(SceneJitter &jitter) noexcept : jitter_(jitter) {}
@@ -352,6 +397,8 @@ public:
 	void note_upscaled() noexcept { upscaled_ = true; }
 	void note_reached_game() noexcept { reached_ = true; }
 	void note_waiting() noexcept { waiting_ = true; }
+	void drop_upscaled() noexcept { upscaled_ = false; }
+	const char *pause_reason() const noexcept { return pause_reason_; }
 	const char *refusal() const noexcept;
 	bool earn(const JitterArm &arm) noexcept;
 	void present(uintptr_t swapchain, JitterCounts &counts) noexcept;
@@ -384,6 +431,7 @@ private:
 	uint32_t stale_presents_ = 0;
 	uint32_t raw_history_ = 0;
 	const char *note_ = "";
+	const char *pause_reason_ = "";
 	uint64_t armed_serial_ = 0;
 };
 
@@ -391,9 +439,12 @@ struct JitterFault {
 	bool told_lag = false;
 	int32_t told_drop_at = -1;
 	uint32_t draw_drop_every = 0;
+	uint32_t upscale_drop_every = 0;
 	float odd_told_scale = 1.0f;
 	float draw_scale = 1.0f;
 	float told_sign_x = 1.0f;
+	bool game_jitter_still = false;
+	bool game_jitter_forget = false;
 };
 
 bool parse_jitter_fault(const std::string &text, JitterFault *out);
