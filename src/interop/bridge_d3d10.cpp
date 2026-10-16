@@ -239,6 +239,7 @@ public:
 		release_plane(colour_);
 		release_plane(depth_);
 		release_plane(motion_);
+		release_plane(scene_);
 
 		safe_release(fence12_);
 		safe_release(fence11_);
@@ -296,12 +297,15 @@ public:
 		}
 		const bool want_motion = in.motion_vectors != 0 &&
 			ensure_plane(motion_, in.motion_vectors, L"motion vector", D3D11_BIND_SHADER_RESOURCE);
+		const bool want_scene = in.scene != 0 && ensure_scene_plane(in.scene, in.color);
 
 		if (mode_ == Mode::Keyless) {
 			copy_top_level(cmd_list, in.color, colour_.game);
 			const bool depth_drawn = want_depth && draw_depth(in.depth);
 			if (want_motion)
 				copy_top_level(cmd_list, in.motion_vectors, motion_.game);
+			if (want_scene)
+				copy_top_level(cmd_list, in.scene, scene_.game);
 			queue->flush_immediate_command_list();
 			if (!wait_game()) {
 				last_error = L"the game's Direct3D 10 device did not finish copying the frame in time, "
@@ -313,8 +317,10 @@ public:
 				context11_->CopyResource(depth_.nt.helper, depth_.keyed);
 			if (want_motion)
 				context11_->CopyResource(motion_.nt.helper, motion_.keyed);
+			if (want_scene)
+				context11_->CopyResource(scene_.nt.helper, scene_.keyed);
 			context11_->Flush();
-			return open_engine_frame(depth_drawn, want_motion, out);
+			return open_engine_frame(depth_drawn, want_motion, want_scene, out);
 		}
 
 		steps_.clear();
@@ -323,6 +329,8 @@ public:
 			steps_.push_back({ depth_.mutex_game, kKeyIdle, kKeyHelperPull });
 		if (want_motion)
 			steps_.push_back({ motion_.mutex_game, kKeyIdle, kKeyHelperPull });
+		if (want_scene)
+			steps_.push_back({ scene_.mutex_game, kKeyIdle, kKeyHelperPull });
 		if (!take_all(steps_)) {
 			last_error = L"the game's Direct3D 10 device could not take the shared textures "
 				L"in time, which usually means the graphics driver has stopped responding";
@@ -333,6 +341,8 @@ public:
 			last_error.clear();
 		if (want_motion)
 			copy_top_level(cmd_list, in.motion_vectors, motion_.game);
+		if (want_scene)
+			copy_top_level(cmd_list, in.scene, scene_.game);
 		queue->flush_immediate_command_list();
 		give_all(steps_);
 
@@ -342,6 +352,8 @@ public:
 			steps_.push_back({ depth_.mutex_helper, kKeyHelperPull, kKeyIdle });
 		if (want_motion)
 			steps_.push_back({ motion_.mutex_helper, kKeyHelperPull, kKeyIdle });
+		if (want_scene)
+			steps_.push_back({ scene_.mutex_helper, kKeyHelperPull, kKeyIdle });
 		if (!take_all(steps_)) {
 			last_error = L"the helper Direct3D 11 device could not take the shared textures in time";
 			reset_rings();
@@ -352,13 +364,15 @@ public:
 			context11_->CopyResource(depth_.nt.helper, depth_.keyed);
 		if (want_motion)
 			context11_->CopyResource(motion_.nt.helper, motion_.keyed);
+		if (want_scene)
+			context11_->CopyResource(scene_.nt.helper, scene_.keyed);
 		context11_->Flush();
 		give_all(steps_);
 
-		return open_engine_frame(want_depth, want_motion, out);
+		return open_engine_frame(want_depth, want_motion, want_scene, out);
 	}
 
-	BridgeStep open_engine_frame(bool want_depth, bool want_motion, BridgeFrame &out)
+	BridgeStep open_engine_frame(bool want_depth, bool want_motion, bool want_scene, BridgeFrame &out)
 	{
 		if (!order_engine_behind_helper()) {
 			reset_rings();
@@ -375,6 +389,7 @@ public:
 		out.color = colour_.nt.engine;
 		out.depth = want_depth ? depth_.nt.engine : nullptr;
 		out.motion_vectors = want_motion ? motion_.nt.engine : nullptr;
+		out.scene = want_scene ? scene_.nt.engine : nullptr;
 		out.width = colour_.width;
 		out.height = colour_.height;
 		frame_open_ = true;
@@ -623,6 +638,23 @@ private:
 			return false;
 		}
 		return true;
+	}
+
+	bool ensure_scene_plane(reshade::api::resource scene, reshade::api::resource color)
+	{
+		const reshade::api::resource_desc sd = device_->get_resource_desc(scene);
+		const reshade::api::resource_desc cd = device_->get_resource_desc(color);
+		if (sd.texture.width != cd.texture.width || sd.texture.height != cd.texture.height ||
+			shareable_format(dxgi_format_of(sd.texture.format)) != colour_.format)
+			return false;
+		if (ensure_plane(scene_, scene, L"window before its interface", D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE))
+			return true;
+		if (!last_error.empty()) {
+			diag_state("interop-scene10", DiagLevel::Info, "interop",
+				L"the window before the interface is not carried: " + last_error);
+			last_error.clear();
+		}
+		return false;
 	}
 
 	ID3D10Device *game_device() const noexcept
@@ -969,6 +1001,7 @@ private:
 		reset_mutex(colour_.mutex_helper);
 		reset_mutex(depth_.mutex_helper);
 		reset_mutex(motion_.mutex_helper);
+		reset_mutex(scene_.mutex_helper);
 		for (Readable &r : readables_)
 			reset_mutex(r.pair.mutex_helper);
 	}
@@ -996,6 +1029,7 @@ private:
 	Plane10 colour_{};
 	Plane10 depth_{};
 	Plane10 motion_{};
+	Plane10 scene_{};
 	std::vector<Readable> readables_;
 	std::vector<Handoff> steps_;
 };

@@ -1,6 +1,7 @@
 #include "aeon_sr/core/app.hpp"
 
 #include "aeon_sr/jitter/scene_snapshot.hpp"
+#include "aeon_sr/jitter/vulkan_constants.hpp"
 #include "aeon_sr/jitter/vulkan_viewport_hook.hpp"
 #include "aeon_sr/core/diag_report.hpp"
 #include "aeon_sr/jitter/gl_jitter.hpp"
@@ -9,6 +10,7 @@
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/native_d3d.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
+#include "aeon_sr/core/game_render_scale.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
 #include "aeon_sr/ngx/ngx_override.hpp"
 #include "aeon_sr/core/runtime_search.hpp"
@@ -82,6 +84,20 @@ App::App(HMODULE module)
 			settings_.flight_fault.c_str());
 	else if (flight_fault_.count != 0)
 		diag_logf(DiagLevel::Warn, "flight", L"FlightFault: %hs fired on purpose", settings_.flight_fault.c_str());
+	game_ = games::integration_for_process();
+	if (game_ != nullptr) {
+		std::wstring why;
+		const std::wstring title = widen(game_->entry().title);
+		if (game_->attach(&why)) {
+			game_note_ = game_->note();
+			diag_info("game", title + L": " + game_note_);
+		} else {
+			game_note_ = why;
+			diag_logf(DiagLevel::Warn, "game", L"%ls: its render scale is left to the game (%ls)", title.c_str(),
+				why.c_str());
+		}
+	}
+	update_game_scale_hooks();
 }
 
 namespace {
@@ -114,6 +130,7 @@ void App::persist_settings()
 	if (!settings_.spatial_jitter) {
 		landing_.clear_absorbed();
 		flow_.reset_landing();
+		depth_proof_.reset();
 	}
 
 	invalidate_temporal_history();
@@ -139,6 +156,21 @@ void App::keep_game_jitter_memory() noexcept
 void App::shutdown()
 {
 	keep_game_jitter_memory();
+	reflex_.detach();
+	latency_queue_off();
+	if (latency_timer_ != nullptr) {
+		CloseHandle(static_cast<HANDLE>(latency_timer_));
+		latency_timer_ = nullptr;
+	}
+#if AEONSR_FRAME_GENERATION
+	pace_off();
+	if (pace_timer_ != nullptr) {
+		CloseHandle(static_cast<HANDLE>(pace_timer_));
+		pace_timer_ = nullptr;
+	}
+#endif
+	if (game_ != nullptr)
+		game_->detach();
 	flight_.shutdown();
 	{
 		const FlightRecorder::Cost c = flight_.cost();
@@ -165,6 +197,9 @@ void App::shutdown()
 	shutdown_neural();
 	ngx_.shutdown_device();
 	ngx12_.shutdown_device();
+#if AEONSR_FRAME_GENERATION
+	framegen_.off();
+#endif
 	release_bridge(BridgeRelease::Ordinary);
 	history_.temporal_history_valid = false;
 }
@@ -377,28 +412,68 @@ void App::run_engine_work(reshade::api::effect_runtime *runtime, const FrameInpu
 	scope_list_lost_ = false;
 	interface_restored_ = false;
 	bool registered = false;
-	if (hud_detected_ && !interface_split_ && backend != nullptr && backend != &fsr11_ && backend != &vsr11_)
+	if (hud_detected_ && !interface_split_ && backend != nullptr && backend != &fsr11_ && backend != &vsr11_) {
+		const StageScope register_time(stage_times_, StageTimings::Stage::Register, inputs);
 		registered = hud_restore_.register_input(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state);
+	}
 	trace_cur_.set(ScopeColumn::Register, registered ? 1.0 : 0.0);
 	run_engine_passes(runtime, inputs, plan, backend, params);
 	restore_interface(inputs);
-	if (observed_)
+	if (observed_) {
+		hold_drawn_[observe_serial_ % kHoldDrawn].split = interface_split_;
+		const StageScope observe_end_time(stage_times_, StageTimings::Stage::ObserveEnd, inputs);
 		observer_.end(inputs.engine.device, inputs.engine.cmd, inputs.engine.color, inputs.engine.color_state,
 			hud_detected_ ? hud_restore_.mask() : nullptr, HudRestoreD3D12::kMaskState,
-			inputs.have_motion_vectors ? inputs.engine.motion : nullptr, inputs.engine.motion_state);
+			inputs.have_motion_vectors ? inputs.engine.motion : nullptr, inputs.engine.motion_state, observe_serial_);
+	}
 	observed_ = false;
 	hud_detected_ = false;
 	interface_split_ = false;
-	debug_view_.apply(settings_.debug_view, inputs, depth_how_);
+	const FrameInputs &shown = game_scale_.active && game_scale_.done ? game_scale_shown_ : inputs;
+	debug_view_.apply(settings_.debug_view, shown, depth_how_);
 	if (upscaler_capture_.scope_recording() && !scope_list_lost_)
-		upscaler_capture_.scope_copy(ScopePlane::Final, inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
-			inputs.engine.color_state);
+		upscaler_capture_.scope_copy(ScopePlane::Final, shown.engine.device, shown.engine.cmd, shown.engine.color,
+			shown.engine.color_state);
+}
+
+void App::note_picture_hold()
+{
+	FrameEdges e;
+	while (observer_.take_edges(&e)) {
+		const HoldDrawn &a = hold_drawn_[e.serial % kHoldDrawn], &b = hold_drawn_[(e.serial - 1u) % kHoldDrawn];
+		if (a.serial == e.serial && a.split && !picture_hold_.held())
+			split_cover_.feed(e.shown, e.pixels);
+		const bool moved = e.serial > 1u && a.serial == e.serial && b.serial + 1u == e.serial && a.scene && b.scene &&
+			(a.x != b.x || a.y != b.y);
+		const bool still = e.edges >= PictureHold::kMinEdges &&
+			static_cast<float>(e.changed) <= PictureHold::kHeldShare * static_cast<float>(e.edges);
+		held_frames_ += moved && still ? 1u : 0u;
+		if (moved) {
+			moved_frames_ += 1u;
+			moved_edges_ += e.edges;
+			moved_changed_ += e.changed;
+		}
+		const PictureHold::Change change = picture_hold_.feed(moved, e.edges, e.changed);
+		if (change == PictureHold::Change::None)
+			continue;
+		landing_.clear_absorbed();
+		flow_.reset_landing();
+		if (change == PictureHold::Change::Moves) {
+			history_.reset_pending = true;
+			invalidate_temporal_history();
+		}
+		diag_logf(DiagLevel::Info, "interface", change == PictureHold::Change::Holds
+			? L"interface: the picture holds still while the offset drawn into the scene moves (%u of %u edge pixels "
+				L"changed): the scene does not reach the window, and the frame is shown as the game drew it"
+			: L"interface: the picture moves again (%u of %u edge pixels changed)", e.changed, e.edges);
+	}
 }
 
 void App::detect_interface(const FrameInputs &inputs)
 {
 	hud_detected_ = false;
+	interface_game_ = false;
 	if (!settings_.keep_interface || inputs.engine.device == nullptr || inputs.engine.cmd == nullptr ||
 		inputs.engine.color == nullptr)
 		return;
@@ -408,13 +483,24 @@ void App::detect_interface(const FrameInputs &inputs)
 		f.drawn = drawn.valid;
 		f.x = drawn.valid ? drawn.x : 0.0f;
 		f.y = drawn.valid ? drawn.y : 0.0f;
+		f.game_jitters = !drawn.valid && offset_withheld() && !fault_.withheld_no_restore;
+		f.scene_moved = camera_moving_;
 		f.scene = inputs.engine.scene;
 		f.scene_state = inputs.engine.scene_state;
+		f.alone = jitter_interface_alone(drawn, depth_proof_.armed_proven) || picture_hold_.held();
+		if (f.alone)
+			flight_.cur().hud |= picture_hold_.held() ? kFlightHeld : kFlightAlone;
+		diag_state("interface_alone", DiagLevel::Info, "interface", f.alone
+			? std::wstring(L"interface: the frame draws no scene (a menu, a loading screen); it is shown as the game "
+				L"drew it")
+			: std::wstring(L"interface: the frame draws the scene"));
 		engine_journal_note(L"interface detect");
 		hud_detected_ = hud_restore_.detect(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state, f);
+		interface_game_ = hud_detected_ && f.game_jitters;
 	} else {
 		hud_restore_.reset();
+		interface_game_ = false;
 	}
 	interface_split_ = false;
 	if (hud_detected_ && inputs.engine.scene != nullptr) {
@@ -448,9 +534,9 @@ void App::detect_interface(const FrameInputs &inputs)
 			L"%u; copies %u; presents with a copy %u, without %u, with no frame finished %u", t.in_stream, t.at_present,
 			t.copies, t.taken, t.none, t.empty);
 		diag_logf(DiagLevel::Info, "interface", L"interface: last frame into the window %u scene draws, %u of six "
-			L"vertices or fewer, %u other; elsewhere %u not of the scene (%u of six or fewer), most into %ux%u",
-			census.window_scene, census.window_quads, census.window_other, census.elsewhere, census.elsewhere_quads,
-			census.elsewhere_w, census.elsewhere_h);
+			L"vertices or fewer, %u other; elsewhere %u not of the scene (%u of six or fewer, %u into the interface's own "
+			L"layer), most into %ux%u", census.window_scene, census.window_quads, census.window_other, census.elsewhere,
+			census.elsewhere_quads, census.layer, census.elsewhere_w, census.elsewhere_h);
 		if (census.order_len != 0)
 			diag_logf(DiagLevel::Info, "interface", L"interface: the window's draws in order: %hs", census.order);
 		const FrameObservation o = observer_.take();
@@ -461,11 +547,17 @@ void App::detect_interface(const FrameInputs &inputs)
 				L"shows %.1f%% of the window as drawn and holds %.1f%%; frame to frame the picture sent back changes by "
 				L"%.3f code values on the interface and %.3f on the rest (the game's own frame by %.3f and %.3f), "
 				L"%.2f%% and %.2f%% of those pixels by more than 2; the motion field moves %.1f%% of the rest by over "
-				L"a quarter pixel, %.3f px on average", o.frames, 100.0 * o.hud / o.pixels,
+				L"a quarter pixel, %.3f px on average; the game's frame changed %.2f%% of its edge pixels (%.2f%% on "
+				L"the %u frames the offset drawn moved on), and held still on %u of those", o.frames,
+				100.0 * o.hud / o.pixels,
 				100.0 * o.held / o.pixels, per(o.out_change_interface, o.hud), per(o.out_change_rest, rest),
 				per(o.drawn_change_interface, o.hud), per(o.drawn_change_rest, rest),
 				100.0 * per(o.out_flicker_interface, o.hud), 100.0 * per(o.out_flicker_rest, rest),
-				100.0 * per(o.motion_moving, o.motion_pixels), per(o.motion_rest, o.motion_pixels));
+				100.0 * per(o.motion_moving, o.motion_pixels), per(o.motion_rest, o.motion_pixels),
+				100.0 * per(o.edges_changed, o.edges), 100.0 * per(moved_changed_, moved_edges_), moved_frames_,
+				held_frames_);
+			held_frames_ = moved_frames_ = 0;
+			moved_edges_ = moved_changed_ = 0.0;
 		}
 	}
 	diag_state("interface_split", DiagLevel::Info, "interface", interface_split_
@@ -538,6 +630,9 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 			inputs.depth_provider == DepthProvider::Normalized ? inputs.engine.depth : nullptr,
 			inputs.engine.depth_state, std::move(info));
 	};
+	if (game_scale_.active && (backend == &vsr11_ || backend == &fsr11_ ||
+			(remote_.ready() && runs_remote(backend))))
+		backend = nullptr;
 	if (remote_.ready() && runs_remote(backend)) {
 		if (capturing)
 			capture_input();
@@ -576,6 +671,15 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 	const bool ran = backend != nullptr && backend->run(runtime, inputs, params);
 	stage_times_.end(upscaler_stage, inputs.engine.cmd);
 	trace_cur_.set(ScopeColumn::Ran, ran ? 1.0 : 0.0);
+	if (game_scale_.active) {
+		game_scale_.done = ran;
+		if (!ran) {
+			if (backend != nullptr && upscaler_waiting(backend->status))
+				jitter_.note_waiting();
+			return;
+		}
+	}
+	const FrameInputs &shown = game_scale_.active ? game_scale_shown_ : inputs;
 	if (scope && ran)
 		upscaler_capture_.scope_copy(ScopePlane::Upscaled, inputs.engine.device, inputs.engine.cmd,
 			inputs.engine.color, inputs.engine.color_state);
@@ -585,10 +689,10 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		jitter_.note_waiting();
 	float depth_u = 0.0f, depth_v = 0.0f;
 	jitter_.depth_uv(&depth_u, &depth_v);
-	restore_interface(inputs);
+	restore_interface(shown);
 	engine_journal_note(L"neural pass");
-	const StageScope neural_time(stage_times_, StageTimings::Stage::Neural, inputs);
-	run_neural_render(runtime, inputs, plan.neural, depth_u, depth_v);
+	const StageScope neural_time(stage_times_, StageTimings::Stage::Neural, shown);
+	run_neural_render(runtime, shown, plan.neural, depth_u, depth_v);
 }
 
 void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
@@ -896,14 +1000,14 @@ ViewportClip App::viewport_clip() const noexcept
 void App::fill_uncovered_edges(FrameInputs &inputs)
 {
 	const JitterFrame &drawn = jitter_.drawn();
-	if (!drawn.valid || inputs.engine.color == nullptr || inputs.engine.cmd == nullptr)
+	if (!drawn.valid || picture_hold_.held() || inputs.engine.color == nullptr || inputs.engine.cmd == nullptr)
 		return;
 	const FrameValidRect band = frame_valid_rect(drawn.x, drawn.y, inputs.width, inputs.height, viewport_clip(),
 		jitter_scene_w_, jitter_scene_h_);
 	if (!band.any)
 		return;
-	(void)frame_shift_.apply(inputs.engine.device, inputs.engine.queue, frame_shift_fence_, inputs.engine.cmd,
-		frame_shift_blit_, inputs.engine.color, inputs.engine.color_state, 0.0f, 0.0f, band.uv);
+	(void)frame_shift_.fill_edges(inputs.engine.device, inputs.engine.queue, frame_shift_fence_, inputs.engine.cmd,
+		frame_shift_blit_, inputs.engine.color, inputs.engine.color_state, band);
 }
 
 void App::normalize_depth(FrameInputs &inputs)
@@ -1051,7 +1155,16 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 	flow_.set_depth_logarithmic(depth_how_.logarithmic);
 	flow_.set_colour_space(static_cast<uint32_t>(color_space_));
 	stage_times_.begin(StageTimings::Stage::Flow, dev12, inputs.engine.queue, cmd12);
-	const bool recorded = flow_.record(cmd12, inputs.engine.color, inputs.engine.color_state,
+	ID3D12Resource *flow_color = inputs.engine.color;
+	D3D12_RESOURCE_STATES flow_color_state = inputs.engine.color_state;
+	if (interface_game_ && !interface_split_ && camera_moving_ && !fault_.withheld_no_fill) {
+		ID3D12Resource *filled = nullptr;
+		if (hud_restore_.fill_held(dev12, cmd12, &filled)) {
+			flow_color = filled;
+			flow_color_state = HudRestoreD3D12::kMaskState;
+		}
+	}
+	const bool recorded = flow_.record(cmd12, flow_color, flow_color_state,
 		depth12, inputs.engine.depth_state,
 		quality, true, &flow_error_, true,
 		jitter_.drawn().valid ? jitter_.drawn().x : 0.0f,
@@ -1070,7 +1183,8 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 			game_probe_failed_ = true;
 			diag_logf(DiagLevel::Warn, "jitter", L"jitter: whether the game jitters its own frame cannot be measured: %ls",
 				game_probe_error_.c_str());
-		} else if (game_probe_.record(cmd12, inputs.engine.color, inputs.engine.color_state, depth12,
+		} else if (const StageScope probe_time(stage_times_, StageTimings::Stage::Probe, inputs);
+			game_probe_.record(cmd12, inputs.engine.color, inputs.engine.color_state, depth12,
 				inputs.engine.depth_state, flow_.motion(), OpticalFlowD3D12::kPublishedState, &game_probe_error_)) {
 			const JitterFrame &d = jitter_.drawn();
 			const float nan = std::numeric_limits<float>::quiet_NaN();
@@ -1096,8 +1210,8 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 			const bool same = a.serial == gf.serial && b.serial + 1u == gf.serial && a.x == b.x && a.y == b.y;
 			const bool have_before = c.serial + 2u == gf.serial;
 			game_jitter_.moving = !fault_.game_jitter_still;
-			const GameJitterDetector::Change change = game_jitter_.feed(gf, same, have_before ? b.x - c.x : 0.0f,
-				have_before ? b.y - c.y : 0.0f);
+			const GameJitterDetector::Change change = game_jitter_.feed(gf, same && !picture_hold_.held(),
+				have_before ? b.x - c.x : 0.0f, have_before ? b.y - c.y : 0.0f);
 			if (a.serial == gf.serial && b.serial + 1u == gf.serial && a.scene && b.scene && !move_all_) {
 				const float dx = a.x - b.x, dy = a.y - b.y;
 				const bool still = gf.color_ok && gf.motion_px >= 0.0f &&
@@ -1105,7 +1219,7 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 				const bool carried = !still && gf.carried_color_ok && gf.motion_px <= GameJitterDetector::kMaxMovingMotion &&
 					std::fabs(gf.carried_color_x) <= 2.0f && std::fabs(gf.carried_color_y) <= 2.0f;
 				if (landing_.note_response(still ? gf.color_x : gf.carried_color_x, still ? gf.color_y : gf.carried_color_y,
-						dx, dy, still || carried) == JitterLanding::Verdict::Absorbed) {
+						dx, dy, (still || carried) && !picture_hold_.held()) == JitterLanding::Verdict::Absorbed) {
 					flow_.reset_landing();
 					diag_logf(DiagLevel::Info, "jitter", L"jitter: the picture held still while the offset drawn into it "
 						L"moved (%.2f of it across, %.2f down); the game's frame does not move with it",
@@ -1188,7 +1302,8 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 
 	{
 		float sums[4];
-		const JitterLanding::Verdict verdict = flow_.landing(sums) ? landing_.update(sums, !move_all_)
+		const JitterLanding::Verdict verdict = flow_.landing(sums) ? landing_.update(sums, !move_all_ &&
+			!picture_hold_.held())
 			: JitterLanding::Verdict::None;
 		if (verdict != JitterLanding::Verdict::None)
 			flow_.reset_landing();
@@ -1248,6 +1363,28 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 				f.outside_draws, f.quads_moved, f.quads_kept, f.other_w, f.other_h, f.other_draws, f.other_depth_w,
 				f.other_depth_h, f.other_depth_draws, c.rewritten, c.kept, c.indexed_held,
 				c.pretransformed);
+			const auto proof = [&f](JitterProofWhy w) { return f.proof_why[static_cast<uint32_t>(w)]; };
+			diag_logf(DiagLevel::Info, "jitter", L"jitter: last frame, tested meshes of the scene asked whether its "
+				L"camera divides by depth: %u proven to, %u proven not to; not known: %u not asked (this frame's tries "
+				L"spent), %u whose vertex shader's w was not read, %u placed by a later stage, %u on a deferred "
+				L"context, %u whose constants are not known yet; the camera %hs",
+				proof(JitterProofWhy::Perspective), proof(JitterProofWhy::Flat), proof(JitterProofWhy::NotAsked),
+				proof(JitterProofWhy::NoTerms), proof(JitterProofWhy::Replaced), proof(JitterProofWhy::Deferred),
+				proof(JitterProofWhy::NotRead), scene_jitter().perspective_seen() ? "has been proven to" :
+				"has never been proven to");
+		}
+		if (last_api_ == reshade::api::device_api::vulkan && vulkan_constants().installed()) {
+			const VulkanConstantStats v = vulkan_constants().take_stats();
+			const auto missed = [&v](VulkanReadMiss m) { return v.missed[static_cast<size_t>(m)]; };
+			diag_logf(DiagLevel::Info, "jitter", L"jitter: Vulkan constants, %u of %u calls hooked; read %u from push "
+				L"constants, %u from descriptor sets, %u through a descriptor heap, %u through a descriptor buffer; not "
+				L"read %u (command buffer set nothing seen), %u (nothing bound there), %u (memory not mapped), %u "
+				L"(descriptor not known), %u (heap mapping not followed), %u (command buffer not submitted); %u buffers, "
+				L"%u mappings, %u device addresses known%hs%hs",
+				v.hooked, v.hookable, v.push, v.sets, v.heap, v.descriptor_buffer, missed(VulkanReadMiss::NoState),
+				missed(VulkanReadMiss::NotBound), missed(VulkanReadMiss::NotMapped), missed(VulkanReadMiss::NoDescriptor),
+				missed(VulkanReadMiss::NoMapping), missed(VulkanReadMiss::NotSubmitted), v.buffers, v.mappings, v.addresses,
+				v.first_miss[0] != '\0' ? "; the first not read: " : "", v.first_miss);
 		}
 		landing_reads_at_ = landing_.readings();
 		landing_short_at_ = landing_.short_readings();
@@ -1260,6 +1397,9 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 
 	inputs.engine.motion = flow_.motion();
 	inputs.engine.motion_state = DepthNormalizeD3D12::kPublished;
+	if (upscaler_capture_.scope_recording())
+		upscaler_capture_.scope_copy(ScopePlane::Motion, inputs.engine.device, inputs.engine.cmd, flow_.motion(),
+			OpticalFlowD3D12::kPublishedState);
 	inputs.engine.confidence = flow_.confidence();
 	inputs.engine.global_flow = flow_.global_flow();
 	inputs.have_motion_vectors = true;
@@ -1271,14 +1411,18 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 
 	{
 		const StageScope publish_time(stage_times_, StageTimings::Stage::Publish, inputs);
-		publish_flow_to_game(inputs);
+		const bool on_d3d11 = runtime != nullptr && runtime->get_device() != nullptr &&
+			runtime->get_device()->get_api() == reshade::api::device_api::d3d11;
+		const bool motion_read = on_d3d11 && ((settings_.mv_probe && probes_.motion_write_due()) ||
+			fsr12_.status == UpscalerStatus::InitFailed || active_ == &fsr11_ || active_ == &dlss11_);
+		publish_flow_to_game(inputs, motion_read);
 	}
 
 	flow_note_.clear();
 	note_flow_state();
 }
 
-void App::publish_flow_to_game(FrameInputs &inputs)
+void App::publish_flow_to_game(FrameInputs &inputs, bool motion_read)
 {
 	inputs.motion_vectors = { 0 };
 	inputs.motion_confidence = { 0 };
@@ -1325,10 +1469,12 @@ void App::publish_flow_to_game(FrameInputs &inputs)
 		out = plane.game;
 	};
 
-	carry(flow_game_motion_, flow_.motion(), flow_.width(), flow_.height(),
-		DXGI_FORMAT_R16G16_FLOAT, inputs.motion_vectors);
-	carry(flow_game_confidence_, flow_.confidence(), flow_.width(), flow_.height(),
-		DXGI_FORMAT_R16_FLOAT, inputs.motion_confidence);
+	if (motion_read) {
+		carry(flow_game_motion_, flow_.motion(), flow_.width(), flow_.height(),
+			DXGI_FORMAT_R16G16_FLOAT, inputs.motion_vectors);
+		if (inputs.motion_vectors.handle != 0)
+			probes_.note_motion_written();
+	}
 	carry(flow_game_global_, flow_.global_flow(), 1u, 1u,
 		DXGI_FORMAT_R16G16_FLOAT, inputs.global_flow);
 }
@@ -1498,38 +1644,27 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 	jitter_pause_logged_ = false;
 	const generic_depth_data *const depth = runtime->get_private_data<generic_depth_data>();
 	uint64_t scene_depth = 0;
-	uint32_t tw = 0, th = 0;
+	uint32_t sel_w = 0, sel_h = 0;
 	if (depth != nullptr && depth->selected_depth_stencil.handle != 0) {
 		const reshade::api::resource_desc desc =
 			runtime->get_device()->get_resource_desc(depth->selected_depth_stencil);
-		tw = desc.texture.width;
-		th = desc.texture.height;
-		scene_depth = tw != 0 && th != 0 ? depth->selected_depth_stencil.handle : 0;
+		sel_w = desc.texture.width;
+		sel_h = desc.texture.height;
+		scene_depth = sel_w != 0 && sel_h != 0 ? depth->selected_depth_stencil.handle : 0;
 	}
-	if (learned_scene_dw_ != inputs.width || learned_scene_dh_ != inputs.height || scene_depth != 0) {
-		learned_scene_w_ = learned_scene_h_ = 0;
-		learned_scene_dw_ = inputs.width;
-		learned_scene_dh_ = inputs.height;
-	}
-	if (scene_depth != 0) {
-		depth_scene_w_ = tw;
-		depth_scene_h_ = th;
-		depth_scene_dw_ = inputs.width;
-		depth_scene_dh_ = inputs.height;
-	} else {
-		(void)jitter_learn_scene_size(jitter_.drawn(), inputs.width, inputs.height, &learned_scene_w_,
-			&learned_scene_h_);
-		if (learned_scene_w_ != 0) {
-			tw = learned_scene_w_;
-			th = learned_scene_h_;
-		} else if (depth_scene_w_ != 0 && depth_scene_dw_ == inputs.width && depth_scene_dh_ == inputs.height) {
-			tw = depth_scene_w_;
-			th = depth_scene_h_;
-		} else {
-			tw = inputs.width;
-			th = inputs.height;
-		}
-	}
+	const bool was_composite = scene_size_.by_composite;
+	const uint64_t comp = scene_jitter().composite_size();
+	scene_size_.find(scene_depth, sel_w, sel_h, inputs.width, inputs.height, jitter_.drawn(),
+		static_cast<uint32_t>(comp >> 32), static_cast<uint32_t>(comp & 0xFFFFFFFFu));
+	if (scene_size_.by_composite)
+		scene_depth = 0;
+	if (scene_size_.by_composite != was_composite)
+		diag_logf(DiagLevel::Info, "jitter", scene_size_.by_composite
+			? L"jitter: ReShade selected the window's depth (%ux%u) while the scene is drawn with one of %ux%u, the "
+				L"size the game presents its window from; the scene is found by that size"
+			: L"jitter: the scene is found by ReShade's selection again (%ux%u; it was found at %ux%u)",
+			sel_w, sel_h, scene_size_.comp_w, scene_size_.comp_h);
+	const uint32_t tw = scene_size_.w, th = scene_size_.h;
 	if (tw == 0 || th == 0) {
 		jitter_note_ = "waiting for the game's depth buffer";
 		return;
@@ -1555,7 +1690,11 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 			}
 		}
 		bool remembered = false;
-		if (!fault_.game_jitter_forget && game_memory_.find(game_exe_, tw, th, &remembered)) {
+		if (fault_.game_jitter_assume) {
+			game_jitter_.seed(true);
+			diag_logf(DiagLevel::Warn, "jitter", L"jitter: JitterFault game_jitter_assume: starting as a game that "
+				L"jitters its own frame at %ux%u, and measuring on", tw, th);
+		} else if (!fault_.game_jitter_forget && game_memory_.find(game_exe_, tw, th, &remembered)) {
 			game_jitter_.seed(remembered);
 			diag_logf(DiagLevel::Info, "jitter", remembered
 				? L"jitter: an earlier launch measured that the game jitters its own frame at %ux%u; starting from that, "
@@ -1606,12 +1745,19 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 	const JitterReach reach = JitterReach::SceneTargets;
 	JitterArm arm = make_jitter_arm(history_.jitter_index, j.x, j.y, inputs.width, inputs.height,
 		rw, rh, tw, th, scene_depth, runtime->get_back_buffer(0).handle, reach);
+	if (game_scale_.active) {
+		arm.target_x = arm.x;
+		arm.target_y = arm.y;
+		jitter_scene_w_ = rw;
+		jitter_scene_h_ = rh;
+	}
 	if (landing_.flip_x())
 		arm.target_x = -arm.target_x;
 	if (landing_.flip_y())
 		arm.target_y = -arm.target_y;
 	const bool moved_all = move_all_;
-	move_all_ = jitter_move_all(move_all_, jitter_.drawn());
+	arm.depth_proven = depth_proof_.arm(scene_size_.by_depth, tw, th, jitter_.drawn());
+	move_all_ = jitter_move_all(move_all_, jitter_.drawn(), arm.depth_proven);
 	if (move_all_ && !moved_all) {
 		const JitterFrame &f = jitter_.drawn();
 		diag_logf(DiagLevel::Info, "jitter", L"jitter: the frame that showed no scene: %u draws seen in all, %u at the "
@@ -1626,10 +1772,13 @@ void App::arm_scene_jitter(reshade::api::effect_runtime *runtime, const FrameInp
 	arm.tested_quads = settings_.jitter_tested_quads;
 	arm.scene_quads = settings_.jitter_scene_quads;
 	arm.depth_regrid = settings_.depth_regrid;
+	arm.layers = settings_.keep_interface;
 	diag_state("jitter_move_all", DiagLevel::Info, "jitter", arm.move_window
 		? std::wstring(L"jitter: no draw shows the scene by its depth; everything of the scene's size takes the offset")
 		: std::wstring(L"jitter: the scene is found by its depth"));
 	scene_jitter().back_buffers_into(arm);
+	if (game_scale_.active)
+		jitter_arm_add_back_buffer(arm, game_scale_.stretch.target.handle);
 	if (last_api_ == reshade::api::device_api::opengl && gl_clip_origin_upper_left())
 		arm.target_y = -arm.target_y;
 	TraceArm made;
@@ -1717,12 +1866,15 @@ void App::release_bridge(BridgeRelease how)
 		bool &flag;
 		~Done() { flag = false; }
 	} done{ building_bridge_ };
+	if (reflex_.attached() && reflex_.device() == static_cast<IUnknown *>(engine_.device())) {
+		reflex_.detach();
+		latency_applied_ = 0u;
+	}
 
 	engine_.wait_cpu(engine_.last_submitted());
 	stage_times_.release();
 
 	bridge_util::release_plane(flow_game_motion_);
-	bridge_util::release_plane(flow_game_confidence_);
 	bridge_util::release_plane(flow_game_global_);
 	engine_.set_borrowed_queue(nullptr);
 	remote_.stop();
@@ -1733,9 +1885,13 @@ void App::release_bridge(BridgeRelease how)
 	bridge_device_ = nullptr;
 	frame_shift_.release();
 	frame_shift_blit_.release();
+	release_game_scale();
 	frame_shift_fence_.release();
 	hud_restore_.release();
 	observer_.release();
+#if AEONSR_FRAME_GENERATION
+	framegen_.engine_gone();
+#endif
 	hud_detected_ = false;
 	engine_.shutdown();
 }
@@ -1746,6 +1902,13 @@ void App::on_init_device(reshade::api::device *device)
 		return;
 
 	const auto api = device ? device->get_api() : reshade::api::device_api::d3d11;
+
+	if (api == reshade::api::device_api::vulkan && device != nullptr && settings_.jitter_scene_quads) {
+		if (const HMODULE reshade = reshade::internal::get_reshade_module_handle()) {
+			if (void *const gdpa = reinterpret_cast<void *>(GetProcAddress(reshade, "vkGetDeviceProcAddr")))
+				vulkan_constants().install(reinterpret_cast<void *>(static_cast<uintptr_t>(device->get_native())), gdpa);
+		}
+	}
 
 	if (!adopt_on_init(api, bridge_device_)) {
 		pending_devices_.add(device);
@@ -1807,6 +1970,8 @@ void App::on_destroy_device(reshade::api::device *device)
 {
 	pending_devices_.remove(device);
 	scene_snapshot().release(device);
+	if (device != nullptr && device->get_api() == reshade::api::device_api::vulkan)
+		vulkan_constants().forget_device(device->get_native());
 	if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11)
 		GameStateGuard::release_cached();
 	const std::optional<BridgeRelease> release =
@@ -1814,7 +1979,13 @@ void App::on_destroy_device(reshade::api::device *device)
 	if (!release)
 		return;
 	engine_.wait_cpu(engine_.last_submitted());
+#if AEONSR_FRAME_GENERATION
+	framegen_.device_gone(device);
+#endif
 	jitter_.forget();
+	scene_size_.reset();
+	depth_proof_.reset();
+	move_all_ = false;
 	vulkan_viewport_hook().forget();
 	guides_.release();
 	pipelines_.release();
@@ -1918,6 +2089,12 @@ void App::on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 
 void App::on_destroy_swapchain(reshade::api::swapchain *swapchain, bool )
 {
+#if AEONSR_FRAME_GENERATION
+	framegen_.swapchain_gone(swapchain, engine_);
+#endif
+	if (swapchain != nullptr && swapchain->get_device() != nullptr &&
+		swapchain->get_device()->get_api() == reshade::api::device_api::d3d9)
+		scene_snapshot().release(swapchain->get_device());
 	jitter_.forget();
 	if (bridge_ != nullptr)
 		bridge_->on_swapchain_reset();
@@ -1942,6 +2119,28 @@ void App::on_reloaded_effects(reshade::api::effect_runtime *)
 void App::on_present(reshade::api::effect_runtime *runtime)
 {
 	clock_.tick();
+	if (runtime != nullptr) {
+		const uint64_t tick = GetTickCount64();
+		if (latency_hwnd_ == nullptr || (runtime->get_hwnd() != latency_hwnd_ && tick - latency_hwnd_tick_ > 1000u)) {
+			if (latency_hwnd_ != nullptr && latency_hwnd_ != runtime->get_hwnd()) {
+				reflex_.detach();
+				latency_queue_off();
+				latency_.reset();
+				latency_applied_ = 0u;
+			}
+			latency_hwnd_ = runtime->get_hwnd();
+		}
+		if (runtime->get_hwnd() == latency_hwnd_) {
+			latency_hwnd_tick_ = tick;
+			latency_presented_ = true;
+		}
+	}
+	if (runtime != nullptr && latency_applied_ != 0u && runtime->get_hwnd() == latency_hwnd_) {
+		latency_.ready(latency_clock_ms());
+		reflex_.marker(ReflexMarker::RenderSubmitEnd, reflex_frame_);
+	}
+	drive_game_scale(game_scale_.attempted);
+	game_scale_.attempted = false;
 	set_jitter_shaders_wanted(settings_.spatial_jitter);
 	if (runtime != nullptr) {
 		RuntimeJitterCounts counts(runtime);
@@ -1952,7 +2151,454 @@ void App::on_present(reshade::api::effect_runtime *runtime)
 		}
 	}
 	service_report();
+#if AEONSR_FRAME_GENERATION
+	run_frame_generation(runtime);
+	pace_to_display(runtime);
+#endif
+	if (runtime != nullptr) {
+		if (latency_applied_ != 0u && runtime->get_hwnd() == latency_hwnd_) {
+			latency_.sent(latency_clock_ms());
+			reflex_.marker(ReflexMarker::PresentStart, reflex_frame_);
+		}
+	}
 }
+
+double App::latency_clock_ms() noexcept
+{
+#if AEONSR_FRAME_GENERATION
+	return qpc_ms();
+#else
+	static LARGE_INTEGER f{};
+	if (f.QuadPart == 0)
+		QueryPerformanceFrequency(&f);
+	LARGE_INTEGER t{};
+	QueryPerformanceCounter(&t);
+	return static_cast<double>(t.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+#endif
+}
+
+unsigned int App::latency_mode_now() const noexcept
+{
+#if AEONSR_FRAME_GENERATION
+	if (settings_.frame_generation)
+		return 0u;
+#endif
+	const unsigned int m = settings_.low_latency <= 2u ? settings_.low_latency : 0u;
+	return m == 2u && reflex_refused_ ? 1u : m;
+}
+
+void App::latency_apply(unsigned int mode, reshade::api::swapchain *swapchain)
+{
+	reshade::api::device *const sdev = swapchain != nullptr ? swapchain->get_device() : nullptr;
+	if (sdev != nullptr && sdev->get_api() == reshade::api::device_api::vulkan)
+		mode = 0u;
+	if (mode == 2u && sizeof(void *) == 4 && sdev != nullptr && sdev->get_api() != reshade::api::device_api::d3d11 &&
+		sdev->get_api() != reshade::api::device_api::d3d12) {
+		if (!reflex_waiting_said_) {
+			reflex_waiting_said_ = true;
+			diag_info("latency", L"low latency: on a 32-bit game Reflex would run on the add-on's own device on this API, "
+				L"where it held frames too long; AeonSR's own instead");
+		}
+		mode = 1u;
+	}
+	if (mode == 2u && sdev != nullptr && sdev->get_api() != reshade::api::device_api::d3d11 &&
+		sdev->get_api() != reshade::api::device_api::d3d12 && !engine_.ready()) {
+		if (!reflex_waiting_said_) {
+			reflex_waiting_said_ = true;
+			diag_info("latency", L"low latency: Reflex runs on the add-on's Direct3D 12 device on this API, which is not "
+				L"up (the upscaler is off); AeonSR's own until it is");
+		}
+		mode = 1u;
+	}
+	if (mode == latency_applied_ && (mode != 2u || reflex_.attached()))
+		return;
+	if (mode != 2u && reflex_.attached())
+		reflex_.detach();
+	if (mode != 1u)
+		latency_queue_off();
+	latency_.reset();
+	if (mode == 2u) {
+		IUnknown *device = nullptr;
+		const wchar_t *on = L"";
+		reshade::api::device *const dev = swapchain != nullptr ? swapchain->get_device() : nullptr;
+		const reshade::api::device_api api = dev != nullptr ? dev->get_api() : reshade::api::device_api::d3d11;
+		if (dev != nullptr && (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d12)) {
+			device = reinterpret_cast<IUnknown *>(static_cast<uintptr_t>(dev->get_native()));
+			on = L"the game's device";
+			if (!reflex_game_own_ && reflex_.already_on(device)) {
+				reflex_game_own_ = true;
+				diag_info("latency", L"low latency: the game runs NVIDIA Reflex itself; it is left to it");
+			}
+			if (reflex_game_own_)
+				device = nullptr;
+		} else if (engine_.ready()) {
+			device = engine_.device();
+			on = L"the add-on's Direct3D 12 device, where the game's frame is carried";
+		}
+		if (device == nullptr) {
+			latency_applied_ = 0u;
+			return;
+		}
+		if (!reflex_.attach(device, 0u, device == static_cast<IUnknown *>(engine_.device()) &&
+				!(api == reshade::api::device_api::d3d12))) {
+			reflex_refused_ = true;
+			diag_logf(DiagLevel::Warn, "latency", L"low latency: %ls; AeonSR's own low latency instead",
+				reflex_.why().c_str());
+			mode = 1u;
+		} else {
+			diag_logf(DiagLevel::Info, "latency", L"low latency: NVIDIA Reflex on %ls (%ls); each frame starts after "
+				L"Reflex's sleep", on, widen(api_label(api)).c_str());
+		}
+	} else if (mode == 1u) {
+		diag_info("latency", L"low latency: AeonSR's own; each frame waits before the game reads its input instead "
+			L"of after it");
+	} else if (latency_applied_ != 0u) {
+		diag_info("latency", L"low latency: off");
+	}
+	latency_applied_ = mode;
+	latency_window_ = LatencyWindow{};
+}
+
+void App::latency_queue_off() noexcept
+{
+	if (latency_dxgi_ != nullptr) {
+		auto *const d = static_cast<IDXGIDevice1 *>(latency_dxgi_);
+		d->SetMaximumFrameLatency(latency_dxgi_was_ != 0u ? latency_dxgi_was_ : 3u);
+		d->Release();
+		latency_dxgi_ = nullptr;
+	}
+}
+
+void App::latency_queue(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+{
+	reshade::api::device *const dev = swapchain->get_device();
+	if (dev == nullptr)
+		return;
+	if (dev->get_api() == reshade::api::device_api::d3d11) {
+		if (latency_dxgi_ != nullptr)
+			return;
+		auto *const d3d = reinterpret_cast<IUnknown *>(static_cast<uintptr_t>(dev->get_native()));
+		IDXGIDevice1 *dxgi = nullptr;
+		if (d3d == nullptr || FAILED(d3d->QueryInterface(IID_PPV_ARGS(&dxgi))) || dxgi == nullptr)
+			return;
+		UINT was = 0;
+		dxgi->GetMaximumFrameLatency(&was);
+		if (FAILED(dxgi->SetMaximumFrameLatency(1))) {
+			dxgi->Release();
+			return;
+		}
+		latency_dxgi_ = dxgi;
+		latency_dxgi_was_ = was;
+		diag_logf(DiagLevel::Info, "latency", L"low latency (AeonSR): the game's frames queued in the driver held to "
+			L"one (it allowed %u)", was);
+		return;
+	}
+}
+
+void App::latency_wait_until(double t_ms)
+{
+	const double left = t_ms - latency_clock_ms();
+	if (left <= 0.0)
+		return;
+	if (latency_timer_ == nullptr) {
+		latency_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 , TIMER_ALL_ACCESS);
+		if (latency_timer_ == nullptr)
+			latency_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+	}
+	LARGE_INTEGER due{};
+	due.QuadPart = -static_cast<LONGLONG>(left * 10000.0);
+	if (latency_timer_ != nullptr && SetWaitableTimer(static_cast<HANDLE>(latency_timer_), &due, 0, nullptr, nullptr,
+			FALSE))
+		WaitForSingleObject(static_cast<HANDLE>(latency_timer_), 100);
+	else
+		Sleep(static_cast<DWORD>(left));
+}
+
+void App::on_finish_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+{
+#if AEONSR_FRAME_GENERATION
+	if (swapchain != nullptr && pace_runtime_ != 0 && settings_.pace_to_display && !settings_.frame_generation &&
+		swapchain->get_hwnd() == reinterpret_cast<reshade::api::effect_runtime *>(pace_runtime_)->get_hwnd())
+		pace_gpu_tail(queue, swapchain);
+#endif
+	if (swapchain == nullptr || latency_hwnd_ == nullptr || swapchain->get_hwnd() != latency_hwnd_)
+		return;
+	if (!latency_presented_)
+		return;
+	latency_presented_ = false;
+	const bool bridged = latency_bridged_;
+	latency_bridged_ = false;
+	if (latency_applied_ == 2u && reflex_.attached() && reflex_.device() != static_cast<IUnknown *>(engine_.device()) &&
+		swapchain->get_device() != nullptr && swapchain->get_device()->get_api() != reshade::api::device_api::d3d11 &&
+		swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) {
+		reflex_.detach();
+		latency_applied_ = 0u;
+	}
+	latency_apply(latency_mode_now(), swapchain);
+	if (latency_applied_ == 0u)
+		return;
+	const double now = latency_clock_ms();
+	const reshade::api::device_api api = swapchain->get_device() != nullptr ? swapchain->get_device()->get_api()
+		: reshade::api::device_api::d3d11;
+	const bool drained = bridged && (api == reshade::api::device_api::d3d9 || api == reshade::api::device_api::d3d10 ||
+		api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::opengl);
+	double slot = -1.0;
+#if AEONSR_FRAME_GENERATION
+	if (drained)
+		slot = display_pacer_.next_slot();
+#endif
+	if (latency_applied_ == 2u) {
+		reflex_.marker(ReflexMarker::PresentEnd, reflex_frame_);
+		reflex_.sleep();
+		if (slot >= 0.0)
+			latency_wait_until(latency_.frame_start(latency_clock_ms(), slot));
+		++reflex_frame_;
+		reflex_.marker(ReflexMarker::SimulationStart, reflex_frame_);
+		reflex_.marker(ReflexMarker::SimulationEnd, reflex_frame_);
+		reflex_.marker(ReflexMarker::RenderSubmitStart, reflex_frame_);
+	} else {
+		latency_queue(queue, swapchain);
+		bool paced_elsewhere = false;
+#if AEONSR_FRAME_GENERATION
+		paced_elsewhere = !drained && display_pacer_.engaged();
+#endif
+		if (!paced_elsewhere)
+			latency_wait_until(latency_.frame_start(latency_clock_ms(), slot));
+	}
+	const double started = latency_clock_ms();
+	latency_.started(started);
+#if AEONSR_FRAME_GENERATION
+	display_pacer_.frame_started(started);
+#endif
+	LatencyWindow &w = latency_window_;
+	const uint64_t tick = GetTickCount64();
+	if (w.since == 0)
+		w.since = tick;
+	++w.frames;
+	if (started - now > 0.05) {
+		++w.waited_frames;
+		w.waited += started - now;
+	}
+	if (tick - w.since >= 10000u) {
+		if (latency_applied_ == 2u) {
+			ReflexLatency r;
+			if (reflex_.latency(&r))
+				diag_logf(DiagLevel::Info, "latency", L"low latency (Reflex): last 10 s %u frames, Reflex held %u of them "
+					L"%.2f ms on average before they started; the driver's reports (%u frames): %.2f ms from a frame's "
+					L"start to the GPU finishing it, %.2f ms of it waiting in the queue, %.2f ms on the GPU", w.frames,
+					w.waited_frames, w.waited_frames != 0u ? w.waited / w.waited_frames : 0.0, r.frames, r.pc_ms,
+					r.queue_ms, r.gpu_ms);
+			else
+				diag_logf(DiagLevel::Info, "latency", L"low latency (Reflex): last 10 s %u frames, Reflex held %u of them "
+					L"%.2f ms on average before they started (no driver reports)", w.frames, w.waited_frames,
+					w.waited_frames != 0u ? w.waited / w.waited_frames : 0.0);
+		} else {
+			diag_logf(DiagLevel::Info, "latency", L"low latency (AeonSR): last 10 s %u frames, %u held before they "
+				L"started (%.2f ms on average); a frame's own time %.2f ms (90th percentile), held in Present %.2f ms "
+				L"(median), %u let-gos for a lower frame rate", w.frames, w.waited_frames,
+				w.waited_frames != 0u ? w.waited / w.waited_frames : 0.0, latency_.work_p90_ms(), latency_.hold_ms(),
+				latency_.cooldowns());
+		}
+		w = LatencyWindow{};
+		w.since = tick;
+	}
+}
+
+#if AEONSR_FRAME_GENERATION
+namespace {
+VOID CALLBACK on_pace_gpu_done(PVOID context, BOOLEAN)
+{
+	static_cast<std::atomic<double> *>(context)->store(qpc_ms(), std::memory_order_release);
+}
+}
+
+void App::pace_tail_release() noexcept
+{
+	for (GpuDone &g : pace_done_) {
+		if (g.wait != nullptr) {
+			UnregisterWaitEx(static_cast<HANDLE>(g.wait), INVALID_HANDLE_VALUE);
+			g.wait = nullptr;
+		}
+		if (g.event != nullptr) {
+			CloseHandle(static_cast<HANDLE>(g.event));
+			g.event = nullptr;
+		}
+		g.done_ms.store(-1.0);
+	}
+	if (pace_fence_ != nullptr) {
+		static_cast<ID3D12Fence *>(pace_fence_)->Release();
+		pace_fence_ = nullptr;
+	}
+	pace_fence_device_ = nullptr;
+	pace_fence_value_ = 0;
+	pace_tail_n_ = pace_tail_at_ = 0;
+	display_pacer_.set_gpu_tail(0.0);
+}
+
+void App::pace_gpu_tail(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+{
+	reshade::api::device *const dev = swapchain != nullptr ? swapchain->get_device() : nullptr;
+	if (dev == nullptr || queue == nullptr || dev->get_api() != reshade::api::device_api::d3d12)
+		return;
+	auto *const device = reinterpret_cast<ID3D12Device *>(static_cast<uintptr_t>(dev->get_native()));
+	auto *const q = reinterpret_cast<ID3D12CommandQueue *>(static_cast<uintptr_t>(queue->get_native()));
+	if (device == nullptr || q == nullptr)
+		return;
+	if (pace_fence_ != nullptr && pace_fence_device_ != device)
+		pace_tail_release();
+	if (pace_fence_ == nullptr) {
+		ID3D12Fence *fence = nullptr;
+		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) || fence == nullptr)
+			return;
+		pace_fence_ = fence;
+		pace_fence_device_ = device;
+	}
+	bool fed = false;
+	for (GpuDone &g : pace_done_) {
+		const double done = g.done_ms.exchange(-1.0, std::memory_order_acq_rel);
+		if (done >= 0.0 && done >= g.sent_ms && done - g.sent_ms < 100.0) {
+			pace_tails_[pace_tail_at_] = done - g.sent_ms;
+			pace_tail_at_ = (pace_tail_at_ + 1u) % 32u;
+			pace_tail_n_ = std::min(pace_tail_n_ + 1u, 32u);
+			fed = true;
+		}
+	}
+	if (fed && pace_tail_n_ >= 8u) {
+		double v[32];
+		std::copy(pace_tails_, pace_tails_ + pace_tail_n_, v);
+		std::sort(v, v + pace_tail_n_);
+		display_pacer_.set_gpu_tail(v[(pace_tail_n_ * 9u) / 10u]);
+	}
+	auto *const fence = static_cast<ID3D12Fence *>(pace_fence_);
+	q->Signal(fence, ++pace_fence_value_);
+	GpuDone &slot = pace_done_[pace_fence_value_ % kGpuDoneRing];
+	if (slot.wait != nullptr && fence->GetCompletedValue() < slot.value)
+		return;
+	if (slot.wait != nullptr) {
+		UnregisterWaitEx(static_cast<HANDLE>(slot.wait), INVALID_HANDLE_VALUE);
+		slot.wait = nullptr;
+	}
+	slot.value = pace_fence_value_;
+	if (slot.event == nullptr)
+		slot.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	slot.sent_ms = display_pacer_.last_return_ms();
+	slot.done_ms.store(-1.0, std::memory_order_release);
+	HANDLE wait = nullptr;
+	if (slot.event != nullptr &&
+		SUCCEEDED(fence->SetEventOnCompletion(pace_fence_value_, static_cast<HANDLE>(slot.event))) &&
+		RegisterWaitForSingleObject(&wait, static_cast<HANDLE>(slot.event), on_pace_gpu_done, &slot.done_ms, INFINITE,
+			WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD))
+		slot.wait = wait;
+}
+
+void App::pace_off() noexcept
+{
+	pace_tail_release();
+	if (display_pacer_.engaged())
+		diag_info("pacing", L"pacing: let go, the game's presents go out as it makes them");
+	display_pacer_.reset();
+	pace_clock_.stop();
+	pace_runtime_ = 0;
+	pace_window_ = PaceWindow{};
+}
+
+void App::pace_to_display(reshade::api::effect_runtime *runtime)
+{
+	if (!settings_.pace_to_display || settings_.frame_generation || runtime == nullptr) {
+		if (pace_runtime_ != 0)
+			pace_off();
+		return;
+	}
+	const uintptr_t rt = reinterpret_cast<uintptr_t>(runtime);
+	const uint64_t now_tick = GetTickCount64();
+	if (pace_runtime_ != rt && (pace_runtime_ == 0 || now_tick - pace_runtime_tick_ > 1000u)) {
+		display_pacer_.reset();
+		pace_tail_release();
+		pace_runtime_ = rt;
+	}
+	if (pace_runtime_ != rt)
+		return;
+	pace_runtime_tick_ = now_tick;
+	pace_clock_.watch(static_cast<HWND>(runtime->get_hwnd()));
+	const DisplayGrid grid = pace_clock_.grid();
+	const double now = qpc_ms();
+	const bool was = display_pacer_.engaged();
+	const double at = display_pacer_.plan(now, grid.valid ? grid.period_ms : 0.0, grid.vblank_ms);
+	if (display_pacer_.engaged() != was)
+		diag_logf(DiagLevel::Info, "pacing", display_pacer_.engaged()
+			? L"pacing: the game's frames take %.2f ms on a %.2f ms refresh; one goes out each refresh, just before "
+				L"its vertical blank, so that every refresh shows a frame one refresh after the last"
+			: L"pacing: let go, frames came after the refresh they were due for (%.2f ms each on a %.2f ms refresh)",
+			display_pacer_.work_ms(), grid.period_ms);
+	if (at > now) {
+		if (reshade::api::command_queue *const queue = runtime->get_command_queue())
+			queue->flush_immediate_command_list();
+		if (pace_timer_ == nullptr) {
+			pace_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 , TIMER_ALL_ACCESS);
+			if (pace_timer_ == nullptr)
+				pace_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+		}
+		LARGE_INTEGER due{};
+		due.QuadPart = -static_cast<LONGLONG>((at - now) * 10000.0);
+		if (pace_timer_ != nullptr && SetWaitableTimer(static_cast<HANDLE>(pace_timer_), &due, 0, nullptr, nullptr, FALSE))
+			WaitForSingleObject(static_cast<HANDLE>(pace_timer_), 100);
+		else
+			Sleep(static_cast<DWORD>(at - now));
+	}
+	const double out = qpc_ms();
+	display_pacer_.returned(out);
+	PaceWindow &w = pace_window_;
+	const uint64_t tick = GetTickCount64();
+	if (w.since == 0)
+		w.since = tick;
+	++w.presents;
+	if (at > now) {
+		++w.paced;
+		w.waited += out - now;
+		w.late += out - at > 2.0 ? 1u : 0u;
+	}
+	if (tick - w.since >= 10000u && w.paced != 0u) {
+		diag_logf(DiagLevel::Info, "pacing", L"pacing: last 10 s %u presents, %u placed on a refresh (waits %.2f ms on "
+			L"average, %u woke more than 2 ms late, %u frames came after their refresh); the game's frames %.2f ms, "
+			L"the refresh %.2f ms, presents %.2f ms before its blank%ls", w.presents, w.paced,
+			w.paced != 0u ? w.waited / w.paced : 0.0, w.late,
+			display_pacer_.misses() >= w.misses_at ? display_pacer_.misses() - w.misses_at : display_pacer_.misses(),
+			display_pacer_.work_ms(), grid.period_ms, display_pacer_.lead_ms(),
+			grid.valid ? L"" : L" (no fixed refresh seen)");
+		w = PaceWindow{};
+		w.since = tick;
+		w.misses_at = display_pacer_.misses();
+	} else if (tick - w.since >= 10000u) {
+		w = PaceWindow{};
+		w.since = tick;
+		w.misses_at = display_pacer_.misses();
+	}
+}
+#endif
+
+#if AEONSR_FRAME_GENERATION
+void App::run_frame_generation(reshade::api::effect_runtime *runtime)
+{
+	if (!settings_.frame_generation) {
+		framegen_.off();
+		return;
+	}
+	reshade::api::device *const device = runtime != nullptr ? runtime->get_device() : nullptr;
+	if (device == nullptr || is_engine_device(device))
+		return;
+	if (pending_devices_.take(device))
+		adopt_device(device);
+	ensure_bridge(device);
+	if (bridge_ == nullptr || !bridge_->ready() || bridge_device_ != device) {
+		framegen_.note_blocked(L"frame generation: no route from " + widen(api_label(device->get_api())) +
+			L" to Direct3D 12" + (bridge_error_.empty() ? L"" : L": " + bridge_error_));
+		return;
+	}
+	framegen_.set_color_space(color_space_ == NeuralColorSpace::Pq ? VendorColor::Pq
+		: color_space_ == NeuralColorSpace::ScrgbLinear ? VendorColor::Scrgb : VendorColor::Sdr);
+	framegen_.on_present(runtime, *bridge_, engine_, settings_);
+}
+#endif
 
 void App::on_begin_effects(
 	reshade::api::effect_runtime *runtime,
@@ -1990,7 +2636,7 @@ void App::run_effects_frame(reshade::addon_event event, reshade::api::effect_run
 	if (runtime == nullptr || !runtime->get_effects_state())
 		return;
 	const EffectsFrame frame = effects_frame_of(event, settings_.upscale_effects);
-	if (frame.runs)
+	if (frame.runs && !game_scale_.attempted && !game_scale_holds_present())
 		run_frame(runtime, cmd_list, rtv, frame.after_effects);
 }
 
@@ -2087,6 +2733,17 @@ void App::on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 
 void App::on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+	if (runtime != nullptr && runtime->get_hwnd() == latency_hwnd_) {
+		reflex_.detach();
+		latency_queue_off();
+		latency_.reset();
+		latency_applied_ = 0u;
+		latency_hwnd_ = nullptr;
+	}
+#if AEONSR_FRAME_GENERATION
+	if (pace_runtime_ != 0 && pace_runtime_ == reinterpret_cast<uintptr_t>(runtime))
+		pace_off();
+#endif
 	const std::lock_guard<std::mutex> lock(runtimes_lock_);
 	runtimes_.erase(std::remove_if(runtimes_.begin(), runtimes_.end(),
 		[runtime](const RuntimeDrive &d) { return d.runtime == runtime; }), runtimes_.end());
@@ -2131,6 +2788,8 @@ void App::on_game_present(reshade::api::command_queue *queue, reshade::api::swap
 			L"the add-on takes each frame at the game's present instead");
 	reshade::api::command_list *const cmd_list = queue->get_immediate_command_list();
 	if (cmd_list == nullptr)
+		return;
+	if (game_scale_.attempted || game_scale_holds_present())
 		return;
 	const GameStateGuard keep(device, cmd_list);
 	const reshade::api::resource back_buffer = current_back_buffer_of(swapchain);
@@ -2288,20 +2947,52 @@ void App::run_frame(
 		return;
 	}
 
+	if (game_scale_.active) {
+		const GameScaleStretch &gs = game_scale_.stretch;
+		inputs.color = gs.source;
+		const reshade::api::resource_desc cd = device->get_resource_desc(gs.source);
+		inputs.color_info.width = cd.texture.width;
+		inputs.color_info.height = cd.texture.height;
+		inputs.color_info.format = static_cast<uint32_t>(cd.texture.format);
+		if (gs.depth.handle != 0) {
+			const reshade::api::resource_desc dd = device->get_resource_desc(gs.depth);
+			inputs.depth = gs.depth;
+			inputs.depth_view = reshade::api::resource_view{ 0 };
+			inputs.depth_is_backup = false;
+			inputs.depth_view_withheld = false;
+			inputs.depth_note.clear();
+			inputs.have_depth = true;
+			inputs.depth_provider = DepthProvider::Generic;
+			inputs.depth_info.width = dd.texture.width;
+			inputs.depth_info.height = dd.texture.height;
+			inputs.depth_info.format = static_cast<uint32_t>(dd.texture.format);
+		}
+	}
+
 	BridgeInputs bin = bridge_inputs_of(inputs, after_effects);
 	SceneSnapshotTaken snap;
 	if (settings_.keep_interface)
 		scene_snapshot().prepare(runtime->get_device());
 	if (settings_.keep_interface) {
 		scene_snapshot().end_frame_at_present();
-		const bool have = scene_snapshot().take(jitter_.drawn().serial, &snap) && jitter_.drawn().valid;
-		if (split_gate_.step(have)) {
+		const bool took = scene_snapshot().take(jitter_.drawn().serial, &snap);
+		const bool covered = split_cover_.present();
+		if (split_cover_.started) {
+			split_cover_.started = false;
+			diag_logf(DiagLevel::Info, "interface", L"interface: the window before the interface left out for the next "
+				L"%u frames: what it leaves to the restore covered more than half the window on %u of the last %u frames "
+				L"that used it, a pass over the whole picture after the copy rather than an interface; the restore puts "
+				L"back what holds still meanwhile", SplitCover::kRefuse, SplitCover::kOver, SplitCover::kWindow);
+		}
+		if (split_gate_present(split_gate_, jitter_.drawn().valid, took) && covered &&
+			!game_scale_.active) {
 			bin.scene = snap.resource;
 			bin.scene_state = snap.state;
 		}
 	}
 	BridgeFrame bframe;
 	const BridgeStep step = bridge_->begin(runtime, cmd_list, bin, bframe);
+	latency_bridged_ = step == BridgeStep::Ok;
 	if (step != BridgeStep::Ok) {
 		const std::wstring why = std::wstring(L"the frame could not be carried to the engine "
 			L"device, it stopped at ") + widen(bridge_step_label(step)) +
@@ -2334,6 +3025,13 @@ void App::run_frame(
 		inputs.width = bframe.width;
 	if (bframe.height != 0)
 		inputs.height = bframe.height;
+	if (game_scale_.active && !enter_game_scale(inputs)) {
+		(void)bridge_->end(runtime, cmd_list, inputs.color);
+		engine_.use_ring(EngineDevice::Ring::Frame);
+		flight_.cur().blocked = FlightBlocked::BridgeFailed;
+		note_frame_blocked(L"the game's render scale could not be taken: the add-on's copy of its frame was not made");
+		return;
+	}
 	trace_cur_.set(ScopeColumn::Seq, static_cast<double>(++engine_frames_));
 	stage_times_.enabled = settings_.gpu_timings;
 	stage_times_.start_frame();
@@ -2344,6 +3042,7 @@ void App::run_frame(
 	}
 	stage_times_.begin(StageTimings::Stage::Total, inputs.engine.device, inputs.engine.queue, inputs.engine.cmd);
 	upscaler_capture_.scope_begin(inputs.engine.device, inputs.engine.queue);
+	upscaler_capture_.scope_motion_size(flow_.width(), flow_.height());
 	if (upscaler_capture_.scope_recording())
 		upscaler_capture_.scope_copy(ScopePlane::Drawn, inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state);
@@ -2353,12 +3052,28 @@ void App::run_frame(
 	}
 	{
 		const StageScope observe_time(stage_times_, StageTimings::Stage::Observe, inputs);
-		observed_ = observer_.begin(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
-			inputs.engine.color_state);
+		observed_ = !game_scale_.active && observer_.begin(inputs.engine.device, inputs.engine.cmd,
+			inputs.engine.color, inputs.engine.color_state);
+		if (observed_) {
+			const JitterFrame &drawn = jitter_.drawn();
+			HoldDrawn &h = hold_drawn_[++observe_serial_ % kHoldDrawn];
+			h.serial = observe_serial_;
+			h.split = false;
+			h.scene = drawn.valid && drawn.moved != 0;
+			h.x = drawn.x;
+			h.y = drawn.y;
+		}
+		note_picture_hold();
 	}
 	{
 		const StageScope interface_time(stage_times_, StageTimings::Stage::Interface, inputs);
-		detect_interface(inputs);
+		if (game_scale_.active) {
+			hud_detected_ = false;
+			interface_game_ = false;
+			interface_split_ = false;
+		} else {
+			detect_interface(inputs);
+		}
 	}
 	if (settings_.keep_interface)
 		trace_cur_.set(ScopeColumn::Restore, hud_detected_ ? 1.0 : 0.0);
@@ -2374,9 +3089,11 @@ void App::run_frame(
 	update_native_dlss();
 	update_ngx_layers();
 	run_internal_flow(runtime, inputs);
-	if (hud_detected_ && inputs.have_motion_vectors && inputs.engine.motion != nullptr)
+	if (hud_detected_ && inputs.have_motion_vectors && inputs.engine.motion != nullptr) {
+		const StageScope clear_time(stage_times_, StageTimings::Stage::Clear, inputs);
 		(void)hud_restore_.clear_motion(inputs.engine.device, inputs.engine.cmd, inputs.engine.motion,
 			inputs.engine.motion_state);
+	}
 	last_inputs_ = inputs;
 	probes_.tick_motion(pctx, settings_, inputs, history_.last_motion_px);
 
@@ -2417,8 +3134,9 @@ void App::run_frame(
 		camera_gate_.reset();
 		camera_moving_ = false;
 	}
-	const FramePlan plan = plan_frame(settings_, signals_of(inputs, color_space_, jitter_.drawn(), offset_withheld(),
-		camera_moving_), slots, history_, frame_time_ms);
+	FrameSignals sig = signals_of(inputs, color_space_, jitter_.drawn(), offset_withheld(), camera_moving_);
+	sig.withheld_interface_learned = interface_game_ && hud_restore_.camera_learned();
+	const FramePlan plan = plan_frame(settings_, sig, slots, history_, frame_time_ms);
 	history_ = plan.next;
 	last_plan_ = plan;
 	{
@@ -2479,19 +3197,27 @@ void App::run_frame(
 	fsr12_.want_provider = settings_.fsr_provider;
 
 	UpscalerParams params = plan.params;
+	if (game_scale_.active) {
+		params.render_width = game_scale_.stretch.render_w;
+		params.render_height = game_scale_.stretch.render_h;
+	}
 	if (jitter_fault_any(fault_) && (plan.jitter_decision == JitterDecision::Drawn ||
 			plan.jitter_decision == JitterDecision::Split) &&
 		apply_told_fault(fault_, fault_clock(0), plan.jitter_decision == JitterDecision::Split, told_prev_set,
 			told_prev_x, told_prev_y, &params.jitter_x, &params.jitter_y))
 		trace_cur_.set(ScopeColumn::FaultActive, 1.0);
 
-	if (active_is_dlss()) {
+	if (active_is_dlss() && !game_scale_.active) {
 		const StageScope mask_time(stage_times_, StageTimings::Stage::Mask, inputs);
 		params.bias_mask = guides_.bias_mask(pctx, settings_, inputs).handle;
 		last_bias_mask_bound_ = params.bias_mask != 0;
 	}
 
+	ID3D12Resource *const render_motion = inputs.engine.motion;
+	if (game_scale_.active)
+		game_scale_motion(inputs);
 	run_engine_work(runtime, inputs, plan, active_, params);
+	inputs.engine.motion = render_motion;
 	if (jitter_fault_hit(fault_.upscale_drop_every, fault_clock(0)))
 		jitter_.drop_upscaled();
 
@@ -2512,15 +3238,275 @@ bool App::finish_frame(reshade::api::effect_runtime *runtime,
 	if (bridge_ == nullptr || !inputs.engine.ready())
 		return false;
 	stage_times_.end(StageTimings::Stage::Total, inputs.engine.cmd);
-	const BridgeStep step = bridge_->end(runtime, cmd_list, inputs.color);
-	if (step == BridgeStep::Ok)
+	const reshade::api::resource back = !game_scale_.active ? inputs.color
+		: game_scale_.done ? game_scale_.stretch.target : game_scale_.stretch.source;
+	const BridgeStep step = bridge_->end(runtime, cmd_list, back);
+	if (step != BridgeStep::Ok && game_scale_.active)
+		game_scale_.done = false;
+	if (step == BridgeStep::Ok) {
+		engine_.use_ring(EngineDevice::Ring::Frame);
 		return true;
+	}
 	engine_.abandon_list();
+	engine_.use_ring(EngineDevice::Ring::Frame);
 	flight_.cur().blocked = FlightBlocked::BridgeFailed;
 	diag_state("interop", DiagLevel::Warn, "interop",
 		L"the upscaled frame did not reach the game: " + widen(bridge_step_label(step)) +
 		(bridge_->last_error.empty() ? L"" : L" - " + bridge_->last_error));
 	return false;
+}
+
+bool App::game_scale_backend_takes() const noexcept
+{
+	if (settings_.backend == static_cast<unsigned>(BackendChoice::Vsr))
+		return false;
+	if (active_ == &fsr11_ || active_ == &vsr11_)
+		return false;
+	return !(active_ != nullptr && remote_.ready() && runs_remote(active_));
+}
+
+void App::update_game_scale_hooks()
+{
+	const bool want = settings_.game_render_scale || game_integrated();
+	if (want && !game_scale_hooks_) {
+		game_scale_hooks_ = true;
+		register_game_render_scale([this](const GameScaleStretch &s) { return run_game_scale(s); });
+		diag_info("scale", game_integrated()
+			? L"render scale: the game's stretch is taken over (the game's integration sets its render scale)"
+			: L"render scale: watching for the game's own (Use the game's render scale is on)");
+	}
+	set_game_render_scale_enabled(want);
+	set_game_render_scale_full(game_integrated() ? game_->routes_full_size() : settings_.game_render_scale);
+}
+
+void App::drive_game_scale(bool stretch_ran)
+{
+	if (game_ == nullptr || !game_->attached())
+		return;
+	games::ScaleDriverInput in;
+	in.attached = true;
+	in.upscaling = settings_.game_render_scale && settings_.enabled &&
+		settings_.backend != static_cast<unsigned>(BackendChoice::None) && game_scale_backend_takes();
+	in.mode_scale = games::render_scale_for_mode(settings_.upscale_mode);
+	in.stretch_ran = stretch_ran;
+	in.upscaled = stretch_ran && game_scale_.done;
+	in.applied = stretch_ran ? game_->applied_render_scale() : 0.0f;
+	games::ScaleDriverEvent ev = games::ScaleDriverEvent::None;
+	const float answer = game_driver_.step(in, &ev);
+	game_->set_render_scale(answer);
+	const char *const title = game_->entry().title;
+	switch (ev) {
+	case games::ScaleDriverEvent::Asked:
+		game_note_ = game_->note();
+		diag_logf(DiagLevel::Info, "game", L"%hs: drawn at %.0f%% of its resolution (Upscaler input)", title,
+			100.0 * answer);
+		break;
+	case games::ScaleDriverEvent::Retried:
+		game_note_ = game_->note();
+		diag_logf(DiagLevel::Info, "game", L"%hs: asked again to draw at %.0f%%", title, 100.0 * answer);
+		break;
+	case games::ScaleDriverEvent::HandedBack:
+		diag_logf(DiagLevel::Info, "game", L"%hs: its own render scale setting is back (no upscaler)", title);
+		break;
+	case games::ScaleDriverEvent::NotTaken:
+		game_note_ = L"the upscaler did not take the game's frame, so the game draws at its own setting for now";
+		diag_logf(DiagLevel::Warn, "game", L"%hs: the upscaler took none of the game's frames for %u presents; the "
+			L"game draws at its own setting and is asked again in %u", title, games::ScaleDriver::kGiveUp,
+			games::ScaleDriver::kRest);
+		break;
+	case games::ScaleDriverEvent::NotFollowed:
+		game_note_ = L"the game did not draw at the render scale asked of it, so it draws at its own setting for now";
+		diag_logf(DiagLevel::Warn, "game", L"%hs: asked for %.3f, it drew at %.3f on %u frames in a row; the game draws "
+			L"at its own setting and is asked again in %u presents", title, in.mode_scale, in.applied,
+			games::ScaleDriver::kMismatches, games::ScaleDriver::kRest);
+		break;
+	default:
+		break;
+	}
+}
+
+bool App::run_game_scale(const GameScaleStretch &s)
+{
+	if (game_scale_.active || game_scale_.attempted || s.cmd == nullptr ||
+		!(settings_.game_render_scale || game_integrated()) ||
+		!settings_.enabled || settings_.backend == static_cast<unsigned>(BackendChoice::None) ||
+		!game_scale_backend_takes())
+		return false;
+	reshade::api::device *const device = s.cmd->get_device();
+	if (device == nullptr || is_engine_device(device))
+		return false;
+	const reshade::api::resource_desc sd = device->get_resource_desc(s.source);
+	const reshade::api::resource_desc td = device->get_resource_desc(s.target);
+	if (sd.texture.width != td.texture.width || sd.texture.height != td.texture.height ||
+		sd.texture.format != td.texture.format || sd.texture.samples != 1 || td.texture.samples != 1 ||
+		sd.texture.levels != 1 || td.texture.levels != 1 || sd.texture.depth_or_layers != 1 ||
+		td.texture.depth_or_layers != 1) {
+		diag_state("game_scale_shape", DiagLevel::Warn, "scale", L"render scale: the game stretches between two "
+			L"textures that differ in size or format; its own stretch is left to draw the frame");
+		return false;
+	}
+	reshade::api::effect_runtime *runtime = nullptr;
+	{
+		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		for (const RuntimeDrive &d : runtimes_) {
+			if (d.device == device) {
+				runtime = d.runtime;
+				break;
+			}
+		}
+	}
+	if (runtime == nullptr)
+		return false;
+	game_scale_.active = true;
+	game_scale_.done = false;
+	game_scale_.stretch = s;
+	const bool before_aa = s.before.handle != 0 &&
+		(game_integrated() ? game_->reads_before_game_aa() : settings_.game_render_scale_before_aa);
+	if (before_aa)
+		game_scale_.stretch.source = s.before;
+	if (before_aa != game_scale_before_aa_said_) {
+		game_scale_before_aa_said_ = before_aa;
+		diag_info("scale", before_aa
+			? L"render scale: the upscaler reads the game's frame from before its anti-aliasing"
+			: L"render scale: the upscaler reads the game's frame as its last pass left it");
+	}
+	{
+		const GameStateGuard keep(device, s.cmd);
+		run_frame(runtime, s.cmd, reshade::api::resource_view{ 0 }, false);
+	}
+	game_scale_.active = false;
+	game_scale_.attempted = true;
+	(game_scale_.done ? game_scale_frames_ : game_scale_fallbacks_) += 1u;
+	if (game_scale_.done != game_scale_said_) {
+		game_scale_said_ = game_scale_.done;
+		diag_logf(DiagLevel::Info, "scale", game_scale_.done
+			? L"render scale: the game draws its scene at %ux%u of %ux%u (%.0f%%); the upscaler takes it there and the "
+				L"game's interface is drawn over its picture at full size"
+			: L"render scale: the game draws its scene at %ux%u of %ux%u (%.0f%%); the upscaler did not run, so the "
+				L"game's own stretch draws the frame",
+			s.render_w, s.render_h, s.width, s.height, 100.0 * s.render_w / (s.width != 0 ? s.width : 1u));
+	}
+	const uint64_t now = GetTickCount64();
+	if (now >= game_scale_report_at_ + 10000u) {
+		if (game_scale_report_at_ != 0)
+			diag_logf(DiagLevel::Info, "scale", L"render scale: last 10 s %u frames upscaled from %ux%u to %ux%u, %u drawn "
+				L"by the game's own stretch", game_scale_frames_, s.render_w, s.render_h, s.width, s.height,
+				game_scale_fallbacks_);
+		game_scale_report_at_ = now;
+		game_scale_frames_ = game_scale_fallbacks_ = 0;
+	}
+	return game_scale_.done;
+}
+
+namespace {
+
+void copy_corner12(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, D3D12_RESOURCE_STATES src_state,
+	ID3D12Resource *dst, D3D12_RESOURCE_STATES dst_state, uint32_t w, uint32_t h)
+{
+	barrier12(cmd, src, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	barrier12(cmd, dst, dst_state, D3D12_RESOURCE_STATE_COPY_DEST);
+	D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+	to.pResource = dst;
+	to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	from.pResource = src;
+	from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	const D3D12_BOX box{ 0, 0, 0, w, h, 1 };
+	cmd->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+	barrier12(cmd, dst, D3D12_RESOURCE_STATE_COPY_DEST, dst_state);
+	barrier12(cmd, src, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
+}
+
+bool ensure_tex12(EngineDevice &engine, ID3D12Device *device, ID3D12Resource **tex, uint32_t w, uint32_t h,
+	DXGI_FORMAT fmt, D3D12_RESOURCE_STATES state)
+{
+	if (*tex != nullptr) {
+		const D3D12_RESOURCE_DESC d = (*tex)->GetDesc();
+		if (d.Width == w && d.Height == h && d.Format == fmt)
+			return true;
+		engine.wait_cpu(engine.last_submitted());
+		(*tex)->Release();
+		*tex = nullptr;
+	}
+	return create_tex12(device, w, h, fmt, false, state, tex);
+}
+
+}
+
+bool App::enter_game_scale(FrameInputs &inputs)
+{
+	const GameScaleStretch &gs = game_scale_.stretch;
+	ID3D12Device *const dev = inputs.engine.device;
+	ID3D12GraphicsCommandList *const cmd = inputs.engine.cmd;
+	ID3D12Resource *const plane = inputs.engine.color;
+	if (dev == nullptr || cmd == nullptr || plane == nullptr)
+		return false;
+	const D3D12_RESOURCE_DESC pd = plane->GetDesc();
+	const uint32_t rw = gs.render_w, rh = gs.render_h;
+	if (rw == 0 || rh == 0 || rw > pd.Width || rh > pd.Height)
+		return false;
+	if (!ensure_tex12(engine_, dev, &game_scale_color_, rw, rh, pd.Format, inputs.engine.color_state))
+		return false;
+	copy_corner12(cmd, plane, inputs.engine.color_state, game_scale_color_, inputs.engine.color_state, rw, rh);
+	ID3D12Resource *depth = nullptr;
+	if (inputs.engine.depth != nullptr) {
+		const D3D12_RESOURCE_DESC dd = inputs.engine.depth->GetDesc();
+		if (rw <= dd.Width && rh <= dd.Height &&
+			ensure_tex12(engine_, dev, &game_scale_depth_, rw, rh, dd.Format, inputs.engine.depth_state)) {
+			copy_corner12(cmd, inputs.engine.depth, inputs.engine.depth_state, game_scale_depth_,
+				inputs.engine.depth_state, rw, rh);
+			depth = game_scale_depth_;
+		}
+	}
+	inputs.engine.output = plane;
+	inputs.engine.output_state = inputs.engine.color_state;
+	inputs.engine.color = game_scale_color_;
+	inputs.engine.depth = depth;
+	if (depth == nullptr)
+		inputs.have_depth = false;
+	inputs.engine.scene = nullptr;
+	inputs.width = rw;
+	inputs.height = rh;
+	return true;
+}
+
+void App::game_scale_motion(FrameInputs &inputs)
+{
+	const GameScaleStretch &gs = game_scale_.stretch;
+	ID3D12Device *const dev = inputs.engine.device;
+	ID3D12GraphicsCommandList *const cmd = inputs.engine.cmd;
+	if (inputs.have_motion_vectors && inputs.engine.motion != nullptr && dev != nullptr && cmd != nullptr) {
+		const D3D12_RESOURCE_DESC md = inputs.engine.motion->GetDesc();
+		if (game_scale_blit_.ensure(dev) &&
+			ensure_tex12(engine_, dev, &game_scale_motion_, gs.width, gs.height, md.Format,
+				inputs.engine.motion_state)) {
+			barrier12(cmd, game_scale_motion_, inputs.engine.motion_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			const bool drawn = game_scale_blit_.draw_fullscreen(dev, cmd, inputs.engine.motion, game_scale_motion_,
+				md.Format, gs.width, gs.height);
+			barrier12(cmd, game_scale_motion_, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.engine.motion_state);
+			if (drawn)
+				inputs.engine.motion = game_scale_motion_;
+		}
+	}
+	FrameInputs &s = game_scale_shown_;
+	s = inputs;
+	s.engine.color = inputs.engine.output;
+	s.engine.color_state = inputs.engine.output_state;
+	s.engine.output = nullptr;
+	s.width = gs.width;
+	s.height = gs.height;
+}
+
+void App::release_game_scale() noexcept
+{
+	ID3D12Resource **const all[] = { &game_scale_color_, &game_scale_depth_, &game_scale_motion_ };
+	for (ID3D12Resource **r : all) {
+		if (*r != nullptr) {
+			(*r)->Release();
+			*r = nullptr;
+		}
+	}
+	game_scale_blit_.release();
+	game_scale_shown_ = FrameInputs{};
 }
 
 std::string App::scope_header()
@@ -2554,6 +3540,28 @@ PanelState App::panel_state(bool for_overlay)
 {
 	const bool d3d12 = last_api_ == reshade::api::device_api::d3d12;
 	PanelState s;
+	if (game_ != nullptr) {
+		s.game_title = game_->entry().title;
+		s.game_integrated = game_->attached();
+		s.game_note = game_note_;
+	}
+	{
+		const GameScaleState g = game_render_scale_state();
+		if (settings_.game_render_scale && !game_scale_watching_)
+			game_scale_watch_ = GameScaleWatch{ g.presents, g.missed_corner };
+		game_scale_watching_ = settings_.game_render_scale;
+		const bool api_ok = last_api_ == reshade::api::device_api::d3d10 || last_api_ == reshade::api::device_api::d3d11;
+		s.game_scale_verdict = game_scale_verdict(settings_.game_render_scale, api_ok, g, game_scale_watch_);
+	}
+	if (settings_.game_render_scale || game_integrated()) {
+		const GameScaleState g = game_render_scale_state();
+		if (g.replaced != 0 && g.found_frame + 90u >= g.presents) {
+			s.game_scale_render_w = g.render_w;
+			s.game_scale_render_h = g.render_h;
+			s.game_scale_w = g.width;
+			s.game_scale_h = g.height;
+		}
+	}
 	s.d3d12 = d3d12;
 	s.build_stamp = __DATE__ " " __TIME__;
 	s.version = AEONSR_VERSION_STR;
@@ -2860,6 +3868,9 @@ PanelState App::panel_state(bool for_overlay)
 
 	s.upscaler_label = upscaler_display_name(s.active_name, s.active_is_fsr,
 		diag_narrow(s.fsr_provider_version));
+#if AEONSR_FRAME_GENERATION
+	s.framegen = framegen_.readout();
+#endif
 	return s;
 }
 
@@ -2895,6 +3906,7 @@ void App::apply_panel_actions(const PanelActions &actions)
 	if (actions.persist) {
 		diag_set_verbose(settings_.verbose_log);
 		persist_settings();
+		update_game_scale_hooks();
 	}
 }
 
@@ -3113,6 +4125,7 @@ void App::service_report()
 	b.files = {
 		{ "AeonSR.log", diag_log_path() },
 		{ "AeonSRHost.log", join_path(dir, L"AeonSRHost.log") },
+		{ "AeonSRHost-window.log", join_path(dir, L"AeonSRHost-window.log") },
 		{ "ReShade.log", join_path(base, L"ReShade.log") },
 		{ "AeonSR.ini", ini_path_ },
 		{ "ReShade.ini", join_path(base, L"ReShade.ini") },

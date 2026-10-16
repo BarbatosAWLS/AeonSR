@@ -28,9 +28,15 @@ public:
 	bool apply(ID3D12Device *device, ID3D12CommandQueue *queue, Gpu12Fence &fence, ID3D12GraphicsCommandList *cmd,
 		BlitPipelineD3D12 &blit, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state, float u, float v,
 		const float *valid_uv = nullptr, bool catmull_rom = false);
+	bool fill_edges(ID3D12Device *device, ID3D12CommandQueue *queue, Gpu12Fence &fence,
+		ID3D12GraphicsCommandList *cmd, BlitPipelineD3D12 &blit, ID3D12Resource *color,
+		D3D12_RESOURCE_STATES color_state, const FrameValidRect &band);
 	void release() noexcept;
 
 private:
+	bool ensure_scratch(ID3D12Device *device, ID3D12CommandQueue *queue, Gpu12Fence &fence,
+		const D3D12_RESOURCE_DESC &cd);
+
 	static constexpr D3D12_RESOURCE_STATES kState =
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 

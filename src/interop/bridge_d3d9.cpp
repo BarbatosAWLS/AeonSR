@@ -1,3 +1,4 @@
+#include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/interop_bridges.hpp"
 #include "aeon_sr/interop/native_d3d.hpp"
 
@@ -223,6 +224,7 @@ public:
 		readables_.clear();
 
 		release_plane(color_);
+		release_plane(scene_);
 		release_plane(depth_);
 		release_plane(motion_);
 
@@ -279,6 +281,7 @@ public:
 		safe_release(game_color);
 		if (!have_color)
 			return BridgeStep::Import;
+		ID3D12Resource *const scene12 = in.scene.handle != 0 ? carry_scene(in.scene, cd, color_fmt) : nullptr;
 
 		ID3D12Resource *const depth12 = in.depth.handle != 0 ? carry_depth(in.depth) : nullptr;
 		ID3D12Resource *const motion12 = in.motion_vectors.handle != 0
@@ -291,7 +294,7 @@ public:
 		}
 
 		if (!cross_hop_in(depth12 != nullptr && depth12 == depth_.shared.engine,
-				motion12 != nullptr && motion12 == motion_.shared.engine))
+				motion12 != nullptr && motion12 == motion_.shared.engine, scene12 != nullptr))
 			return BridgeStep::Import;
 
 		out.cmd = engine_->begin_list();
@@ -300,6 +303,7 @@ public:
 			return BridgeStep::Begin;
 		}
 		out.color = color_.shared.engine;
+		out.scene = scene12;
 		out.depth = depth12;
 		out.motion_vectors = motion12;
 		out.width = color_.width;
@@ -600,6 +604,23 @@ private:
 		return ok;
 	}
 
+	ID3D12Resource *carry_scene(reshade::api::resource scene, const D3DSURFACE_DESC &color_desc, D3DFORMAT color_fmt)
+	{
+		IDirect3DSurface9 *src = surface_of(scene);
+		D3DSURFACE_DESC sd{};
+		const bool ok = src != nullptr && SUCCEEDED(src->GetDesc(&sd)) && sd.Width == color_desc.Width &&
+			sd.Height == color_desc.Height &&
+			ensure_plane(scene_, sd.Width, sd.Height, color_fmt, true, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) &&
+			carry_in(src, scene, scene_);
+		safe_release(src);
+		if (!ok && !last_error.empty()) {
+			diag_state("interop-scene9", DiagLevel::Info, "interop",
+				L"the window before the interface is not carried: " + last_error);
+			last_error.clear();
+		}
+		return ok ? scene_.shared.engine : nullptr;
+	}
+
 	ID3D12Resource *carry_depth(reshade::api::resource depth)
 	{
 		IDirect3DTexture9 *tex = texture_of(depth);
@@ -665,10 +686,10 @@ private:
 		return ok ? motion_.shared.engine : nullptr;
 	}
 
-	bool cross_hop_in(bool have_depth, bool have_motion)
+	bool cross_hop_in(bool have_depth, bool have_motion, bool have_scene)
 	{
-		Plane9 *const planes[3] = { &color_, have_depth ? &depth_ : nullptr,
-			have_motion ? &motion_ : nullptr };
+		Plane9 *const planes[4] = { &color_, have_depth ? &depth_ : nullptr,
+			have_motion ? &motion_ : nullptr, have_scene ? &scene_ : nullptr };
 		bool any = false;
 		for (Plane9 *const p : planes) {
 			if (p == nullptr || p->hop == nullptr)
@@ -982,6 +1003,7 @@ private:
 	IDirect3DVertexDeclaration9 *decl_ = nullptr;
 
 	Plane9 color_{};
+	Plane9 scene_{};
 	Plane9 depth_{};
 	Plane9 motion_{};
 	std::vector<Readable> readables_;

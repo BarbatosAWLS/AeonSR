@@ -212,6 +212,10 @@ const char *StageTimings::label(Stage s) noexcept
 	case Stage::Upscaler: return "upscaler";
 	case Stage::Neural: return "neural";
 	case Stage::Restore: return "interface restore";
+	case Stage::Probe: return "jitter probe";
+	case Stage::Clear: return "clear motion";
+	case Stage::Register: return "register";
+	case Stage::ObserveEnd: return "observe end";
 	case Stage::Count: break;
 	}
 	return "?";

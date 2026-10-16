@@ -39,7 +39,9 @@ struct XessD3D12Backend : UpscalerBackend {
 	bool run_native(ID3D12Device *device, ID3D12GraphicsCommandList *cmd12,
 		ID3D12Resource *backbuffer, ID3D12Resource *motion_vectors,
 		D3D12_RESOURCE_STATES backbuffer_state,
-		const UpscalerParams &params);
+		const UpscalerParams &params,
+		ID3D12Resource *output = nullptr,
+		D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_COMMON);
 
 	void install_api_for_test(const XessApi &api) noexcept { api_ = api; }
 
@@ -80,6 +82,8 @@ private:
 	uint32_t prepared_w_ = 0, prepared_h_ = 0;
 	uint32_t prepared_quality_ = 0xFFFFFFFFu;
 	float prepared_scale_ = -1.0f;
+	uint32_t explicit_width_ = 0, explicit_height_ = 0;
+	uint32_t created_render_w_ = 0, created_render_h_ = 0;
 
 	static constexpr int kIdle = 0, kRunning = 1, kFinished = 2;
 	std::thread init_thread_;

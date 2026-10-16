@@ -36,6 +36,8 @@ inline constexpr uint16_t flight_bit(FlightTrigger t) noexcept { return static_c
 inline constexpr uint8_t kFlightRestore = 1u;
 inline constexpr uint8_t kFlightSplit = 2u;
 inline constexpr uint8_t kFlightRegistered = 4u;
+inline constexpr uint8_t kFlightAlone = 8u;
+inline constexpr uint8_t kFlightHeld = 16u;
 
 inline constexpr float kFlightNone = std::numeric_limits<float>::quiet_NaN();
 

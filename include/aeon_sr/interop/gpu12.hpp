@@ -55,6 +55,10 @@ struct StageTimings {
 		Upscaler,
 		Neural,
 		Restore,
+		Probe,
+		Clear,
+		Register,
+		ObserveEnd,
 		Count
 	};
 	static const char *label(Stage s) noexcept;

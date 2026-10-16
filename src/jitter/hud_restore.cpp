@@ -35,7 +35,9 @@ cbuffer C : register(b0)
 	float split;
 	float history;
 	float bounded;
-	float3 pad_;
+	float game;
+	float alone;
+	float pad1_;
 };
 
 Texture2D<float4> frame_now : register(t0);
@@ -120,7 +122,8 @@ void CSMask(uint3 id : SV_DispatchThreadID)
 				if ((x == 0 && y == 0) || any(q < 0) || any(q >= dim))
 					continue;
 				const uint t = state_in.Load(int3(q, 0));
-				if (((t & kMember) != 0 || candidate(t)) && abs(luma(frame_now.Load(int3(q, 0)).rgb) - l) > flat)
+				const bool still = (t & kMember) != 0 || candidate(t) || (game > 0.5 && (t & kSame) != 0);
+				if (still && abs(luma(frame_now.Load(int3(q, 0)).rgb) - l) > flat)
 					member = true;
 			}
 		}
@@ -131,8 +134,8 @@ void CSMask(uint3 id : SV_DispatchThreadID)
 	state_out[p] = (s & (kRun | kSame)) | (budget << 8) | (member ? kMember : 0u) | (interface_drawn ? kOver : 0u);
 	if ((s & kSame) != 0 && (gain > 0.5 || drawn < 0.5))
 		stable_out[p] = frame_now.Load(int3(p, 0));
-	const bool shown = (s & kSame) != 0 && ((s & kRun) != 0 || drawn < 0.5);
-	mask_out[p] = interface_drawn ? 1.0 : !member ? 0.0 : (shown ? 1.0 : 128.0 / 255.0);
+	const bool shown = game > 0.5 || ((s & kSame) != 0 && ((s & kRun) != 0 || drawn < 0.5));
+	mask_out[p] = alone > 0.5 || interface_drawn ? 1.0 : !member ? 0.0 : (shown ? 1.0 : 128.0 / 255.0);
 }
 
 static const float kTransDecay = 0.85;
@@ -178,12 +181,28 @@ float transparency(int2 p, float3 f, float3 s)
 	return lerp(b, min(r, b), w);
 }
 
+bool proven_still(int2 p, uint s)
+{
+	if (game < 0.5 || !candidate(s))
+		return false;
+	const int2 dim = int2(size);
+	const float l = luma(frame_now.Load(int3(p, 0)).rgb);
+	static const int2 kSides[4] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+	[unroll] for (int k = 0; k < 4; ++k) {
+		const int2 q = p + kSides[k];
+		if (all(q >= 0) && all(q < dim) && abs(luma(frame_now.Load(int3(q, 0)).rgb) - l) > flat)
+			return true;
+	}
+	return false;
+}
+
 bool still_under_interface(int2 p)
 {
 	const uint s = state_in.Load(int3(p, 0));
-	return (s & kMember) != 0 && (s & kOver) == 0;
+	return ((s & kMember) != 0 && (s & kOver) == 0 && (game < 0.5 || (s & kSame) != 0)) || proven_still(p, s);
 }
-
+)"
+R"(
 [numthreads(8, 8, 1)]
 void CSClear(uint3 id : SV_DispatchThreadID)
 {
@@ -206,16 +225,33 @@ VSOut VSMain(uint i : SV_VertexID)
 	return o;
 }
 
+bool rim_of_shown(int2 p)
+{
+	if (game < 0.5)
+		return false;
+	const int2 dim = int2(size);
+	[unroll] for (int y = -1; y <= 1; ++y)
+		[unroll] for (int x = -1; x <= 1; ++x) {
+			const int2 q = p + int2(x, y);
+			if (all(q >= 0) && all(q < dim) && mask_in.Load(int3(q, 0)) > 0.75)
+				return true;
+		}
+	return false;
+}
+
 float4 PSComposite(VSOut i) : SV_Target
 {
 	const int2 p = int2(i.pos.xy);
 	const float m = mask_in.Load(int3(p, 0));
-	if (m < 0.25)
-		discard;
+	if (m < 0.25) {
+		if (!rim_of_shown(p))
+			discard;
+		return float4(frame_now.Load(int3(p, 0)).rgb, 0.0);
+	}
 	if (m <= 0.75)
 		return float4(stable_in.Load(int3(p, 0)).rgb, 0.0);
 	const float3 f = frame_now.Load(int3(p, 0)).rgb;
-	if (split < 0.5)
+	if (split < 0.5 || alone > 0.5)
 		return float4(f, 0.0);
 	const float3 s = scene_now.Load(int3(p, 0)).rgb;
 	const float t = transparency(p, f, s);
@@ -244,9 +280,51 @@ float4 PSClear(VSOut i) : SV_Target
 		discard;
 	return 0.0;
 }
+
+[numthreads(8, 8, 1)]
+void CSHeld(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= (uint)size.x || id.y >= (uint)size.y)
+		return;
+	const int2 p = int2(id.xy);
+	const bool h = mask_in.Load(int3(p, 0)) >= 0.25 || proven_still(p, state_in.Load(int3(p, 0)));
+	mask_out[id.xy] = h ? 1.0 : 0.0;
+}
+
+bool held(int2 q)
+{
+	return mask_in.Load(int3(q, 0)) >= 0.5;
+}
+
+float4 PSFill(VSOut i) : SV_Target
+{
+	const int2 p = int2(i.pos.xy);
+	const float4 f = frame_now.Load(int3(p, 0));
+	if (!held(p))
+		return f;
+	const int2 dim = int2(size);
+	static const int2 kDirs[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
+		int2(1, 1), int2(-1, -1), int2(1, -1), int2(-1, 1) };
+	float4 sum = 0.0;
+	float wsum = 0.0;
+	[unroll] for (int k = 0; k < 8; ++k) {
+		[loop] for (int d = 1; d <= 512; d *= 2) {
+			const int2 q = p + kDirs[k] * d;
+			if (any(q < 0) || any(q >= dim))
+				break;
+			if (!held(q)) {
+				const float w = 1.0 / float(d);
+				sum += frame_now.Load(int3(q, 0)) * w;
+				wsum += w;
+				break;
+			}
+		}
+	}
+	return wsum > 0.0 ? sum / wsum : f;
+}
 )";
 
-const char *const kEntry[] = { "PSComposite", "PSRegister", "PSClear" };
+const char *const kEntry[] = { "PSComposite", "PSRegister", "PSClear", "PSFill" };
 
 ID3DBlob *compile(const char *entry, const char *target)
 {
@@ -356,7 +434,8 @@ DXGI_FORMAT stable_format(DXGI_FORMAT f) noexcept
 
 bool HudRestoreD3D12::ensure_pipeline(ID3D12Device *device)
 {
-	if (root_ != nullptr && evidence_ != nullptr && mask_ != nullptr && clear_ != nullptr && trans_pso_ != nullptr)
+	if (root_ != nullptr && evidence_ != nullptr && mask_ != nullptr && clear_ != nullptr && trans_pso_ != nullptr &&
+		held_pso_ != nullptr)
 		return true;
 	if (pipeline_failed_ || device == nullptr)
 		return false;
@@ -392,7 +471,7 @@ bool HudRestoreD3D12::ensure_pipeline(ID3D12Device *device)
 		IID_PPV_ARGS(&root_)));
 	rel(sig);
 
-	ID3DBlob *cs[4]{};
+	ID3DBlob *cs[5]{};
 	ID3DBlob *vs = nullptr;
 	ID3DBlob *ps[KindCount]{};
 	if (ok) {
@@ -400,15 +479,17 @@ bool HudRestoreD3D12::ensure_pipeline(ID3D12Device *device)
 		cs[1] = compile("CSMask", "cs_5_0");
 		cs[2] = compile("CSClear", "cs_5_0");
 		cs[3] = compile("CSTrans", "cs_5_0");
+		cs[4] = compile("CSHeld", "cs_5_0");
 		vs = compile("VSMain", "vs_5_0");
-		ok = cs[0] != nullptr && cs[1] != nullptr && cs[2] != nullptr && cs[3] != nullptr && vs != nullptr;
+		ok = cs[0] != nullptr && cs[1] != nullptr && cs[2] != nullptr && cs[3] != nullptr && cs[4] != nullptr &&
+			vs != nullptr;
 		for (uint32_t k = 0; ok && k < KindCount; ++k) {
 			ps[k] = compile(kEntry[k], "ps_5_0");
 			ok = ps[k] != nullptr;
 		}
 	}
-	ID3D12PipelineState **const outs[4] = { &evidence_, &mask_, &clear_, &trans_pso_ };
-	for (uint32_t k = 0; ok && k < 4; ++k) {
+	ID3D12PipelineState **const outs[5] = { &evidence_, &mask_, &clear_, &trans_pso_, &held_pso_ };
+	for (uint32_t k = 0; ok && k < 5; ++k) {
 		D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
 		cd.pRootSignature = root_;
 		cd.CS = { cs[k]->GetBufferPointer(), cs[k]->GetBufferSize() };
@@ -469,12 +550,15 @@ bool HudRestoreD3D12::ensure_targets(ID3D12Device *device, uint32_t w, uint32_t 
 	retire(scenes_[1]);
 	retire(trans_[0]);
 	retire(trans_[1]);
+	retire(filled_);
+	retire(held_);
 	prev_split_ = false;
 	w_ = w;
 	h_ = h;
 	format_ = format;
 	have_prev_ = false;
 	has_mask_ = false;
+	camera_frames_ = 0;
 	targets_failed_ = !create_tex12(device, w, h, format, false, kSrv, &frames_[0]) ||
 		!create_tex12(device, w, h, format, false, kSrv, &frames_[1]) ||
 		!create_tex12(device, w, h, stable_format(format), true, kSrv, &stable_) ||
@@ -616,7 +700,9 @@ void HudRestoreD3D12::constants(float *c) const noexcept
 		static_cast<float>(std::clamp(tuning.need, 1u, 255u)), static_cast<float>(tuning.cost),
 		static_cast<float>(std::min(tuning.cap, 255u)), tuning.flat,
 		tuning.register_ring ? 1.0f : 0.0f, frame_.drawn ? 1.0f : 0.0f, frame_.scene != nullptr ? 1.0f : 0.0f,
-		trans_history_ ? 1.0f : 0.0f, bounded_format(format_) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+		trans_history_ ? 1.0f : 0.0f, bounded_format(format_) ? 1.0f : 0.0f,
+		frame_.game_jitters && !frame_.drawn ? 1.0f : 0.0f, frame_.alone ? 1.0f : 0.0f, 0.0f };
+	static_assert(sizeof(v) % 16u == 0u, "the constant buffer is whole 16-byte registers");
 	std::memcpy(c, v, sizeof(v));
 }
 
@@ -640,7 +726,10 @@ bool HudRestoreD3D12::detect(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 	barrier12(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
 
 	const float step = std::max(std::fabs(frame.x - prev_x_), std::fabs(frame.y - prev_y_));
-	gain_ = have_prev_ && frame.drawn && prev_drawn_ && step >= kHudRestoreMinStep;
+	const bool camera = !frame.drawn && frame.game_jitters && frame.scene_moved && !prev_drawn_ && prev_game_jitters_;
+	gain_ = have_prev_ && ((frame.drawn && prev_drawn_ && step >= kHudRestoreMinStep) || camera);
+	if (have_prev_ && camera && camera_frames_ < 0xFFFFFFFFu)
+		++camera_frames_;
 	frame_ = frame;
 	if (frame_.scene != nullptr) {
 		const D3D12_RESOURCE_DESC sd = frame_.scene->GetDesc();
@@ -735,6 +824,7 @@ bool HudRestoreD3D12::detect(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 	cur_ = now;
 	have_prev_ = true;
 	prev_drawn_ = frame.drawn;
+	prev_game_jitters_ = frame.game_jitters;
 	prev_x_ = frame.x;
 	prev_y_ = frame.y;
 	has_mask_ = true;
@@ -752,8 +842,8 @@ bool HudRestoreD3D12::draw(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	const Slot slot = next_slot();
 	write_srv(device, slot, 0, frames_[cur_]);
 	write_srv(device, slot, 1, nullptr);
-	write_srv(device, slot, 2, core_);
-	write_srv(device, slot, 3, kind == Clear ? state_[0] : nullptr);
+	write_srv(device, slot, 2, kind == Fill ? held_ : core_);
+	write_srv(device, slot, 3, kind == Clear || kind == Fill ? state_[0] : nullptr);
 	write_srv(device, slot, 4, stable_);
 	write_srv(device, slot, 5, frame_.scene != nullptr ? trans_[trans_cur_] : nullptr);
 	write_srv(device, slot, 6, frame_.scene != nullptr ? scenes_[cur_] : nullptr);
@@ -812,7 +902,7 @@ bool HudRestoreD3D12::clear_motion(ID3D12Device *device, ID3D12GraphicsCommandLi
 
 	const Slot slot = next_slot();
 	for (uint32_t i = 0; i < kSrvCount; ++i)
-		write_srv(device, slot, i, i == 3 ? state_[0] : nullptr);
+		write_srv(device, slot, i, i == 3 ? state_[0] : i == 0 ? frames_[cur_] : nullptr);
 	for (uint32_t i = 0; i < kUavCount; ++i)
 		write_uav(device, slot, i, i == 2 ? motion : nullptr);
 	float c[kConstantCount];
@@ -843,11 +933,44 @@ bool HudRestoreD3D12::composite(ID3D12Device *device, ID3D12GraphicsCommandList 
 	return draw(device, cmd, Composite, color, state);
 }
 
+bool HudRestoreD3D12::fill_held(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource **out)
+{
+	*out = nullptr;
+	if (!has_mask_ || device == nullptr || cmd == nullptr)
+		return false;
+	if (filled_ == nullptr && !create_tex12(device, w_, h_, format_, false, kSrv, &filled_))
+		return false;
+	if (held_ == nullptr && !create_tex12(device, w_, h_, DXGI_FORMAT_R8_UNORM, true, kSrv, &held_))
+		return false;
+	const Slot slot = next_slot();
+	for (uint32_t i = 0; i < kSrvCount; ++i)
+		write_srv(device, slot, i, i == 0 ? frames_[cur_] : i == 2 ? core_ : i == 3 ? state_[0] : nullptr);
+	for (uint32_t i = 0; i < kUavCount; ++i)
+		write_uav(device, slot, i, i == 1 ? held_ : nullptr);
+	float c[kConstantCount];
+	constants(c);
+	barrier12(cmd, held_, kSrv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	cmd->SetComputeRootSignature(root_);
+	cmd->SetDescriptorHeaps(1, &srv_heap_);
+	cmd->SetComputeRoot32BitConstants(0, kConstantCount, c, 0);
+	cmd->SetComputeRootDescriptorTable(1, slot.srv_gpu);
+	cmd->SetComputeRootDescriptorTable(2, slot.uav_gpu);
+	cmd->SetPipelineState(held_pso_);
+	cmd->Dispatch((w_ + 7u) / 8u, (h_ + 7u) / 8u, 1u);
+	barrier12(cmd, held_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrv);
+	if (!draw(device, cmd, Fill, filled_, kSrv))
+		return false;
+	*out = filled_;
+	return true;
+}
+
 void HudRestoreD3D12::reset() noexcept
 {
 	have_prev_ = false;
 	has_mask_ = false;
 	prev_drawn_ = false;
+	prev_game_jitters_ = false;
+	camera_frames_ = 0;
 	prev_x_ = prev_y_ = 0.0f;
 	gain_ = false;
 	prev_split_ = false;
@@ -863,6 +986,7 @@ void HudRestoreD3D12::release() noexcept
 	rel(evidence_);
 	rel(mask_);
 	rel(trans_pso_);
+	rel(held_pso_);
 	rel(clear_);
 	rel(root_);
 	release_blob(vs_);
@@ -871,7 +995,7 @@ void HudRestoreD3D12::release() noexcept
 	rel(srv_heap_);
 	rel(rtv_heap_);
 	ID3D12Resource **const all[] = { &frames_[0], &frames_[1], &stable_, &state_[0], &state_[1], &core_,
-		&scenes_[0], &scenes_[1], &trans_[0], &trans_[1] };
+		&scenes_[0], &scenes_[1], &trans_[0], &trans_[1], &filled_, &held_ };
 	for (ID3D12Resource **r : all)
 		rel(*r);
 	trans_cur_ = 0;

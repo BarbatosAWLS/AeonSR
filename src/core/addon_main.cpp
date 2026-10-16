@@ -3,11 +3,18 @@
 #include "aeon_sr/core/diag_report.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
+#include "aeon_sr/core/game_render_scale.hpp"
+#include "aeon_sr/core/pipeline_trace.hpp"
 #include "aeon_sr/upscalers/native_dlss.hpp"
 #include "aeon_sr/core/register_compat.hpp"
 #include "aeon_sr/jitter/scene_jitter_hooks.hpp"
 #include "aeon_sr/core/settings.hpp"
 #include "aeon_sr/interop/d3d9ex_upgrade.hpp"
+#if AEONSR_FRAME_GENERATION
+#include "aeon_sr/framegen/frame_generation.hpp"
+#include "aeon_sr/framegen/overlay_presenter.hpp"
+#include "aeon_sr/framegen/present_sync.hpp"
+#endif
 
 #include <atomic>
 #include <cwchar>
@@ -34,8 +41,22 @@ std::wstring d3d9ex_attempts(const d3d9ex::Result &r)
 	return s;
 }
 
+bool from_own_window() noexcept
+{
+#if AEONSR_FRAME_GENERATION
+	return overlay_on_own_thread();
+#else
+	return false;
+#endif
+}
+
 bool on_create_device(reshade::api::device_api api, uint32_t &api_version)
 {
+#if AEONSR_FRAME_GENERATION
+	if (overlay_creating_device())
+		return false;
+#endif
+	scene_jitter_device_coming(api);
 	if (api != reshade::api::device_api::d3d9)
 		return false;
 	d3d9ex::disarm();
@@ -49,6 +70,13 @@ bool on_create_device(reshade::api::device_api api, uint32_t &api_version)
 
 void on_init_device(reshade::api::device *device)
 {
+#if AEONSR_FRAME_GENERATION
+	if (overlay_creating_device()) {
+		if (device != nullptr)
+			overlay_note_own_device(device->get_native());
+		return;
+	}
+#endif
 	if (device != nullptr && device->get_api() == reshade::api::device_api::d3d9) {
 		d3d9ex::disarm();
 		const d3d9ex::Result r = d3d9ex::take_result();
@@ -71,12 +99,18 @@ void on_init_device(reshade::api::device *device)
 
 void on_destroy_device(reshade::api::device *device)
 {
+#if AEONSR_FRAME_GENERATION
+	if (device != nullptr && overlay_forget_own_device(device->get_native()))
+		return;
+#endif
 	if (auto *a = app())
 		a->on_destroy_device(device);
 }
 
 void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_init_swapchain(swapchain, resize);
 }
@@ -100,6 +134,12 @@ bool fill_d3d9_refresh(reshade::api::device_api api, reshade::api::swapchain_des
 
 bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *)
 {
+	if (from_own_window())
+		return false;
+#if AEONSR_FRAME_GENERATION
+	if (api == reshade::api::device_api::vulkan)
+		FrameGeneration::note_vulkan_present_mode(desc.present_mode);
+#endif
 	const bool refresh = fill_d3d9_refresh(api, desc);
 	if (!request_swapchain_usage(api, desc))
 		return refresh;
@@ -110,6 +150,8 @@ bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_d
 
 void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_destroy_swapchain(swapchain, resize);
 }
@@ -120,6 +162,8 @@ void on_begin_effects(
 	reshade::api::resource_view rtv,
 	reshade::api::resource_view rtv_srgb)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_begin_effects(runtime, cmd_list, rtv, rtv_srgb);
 }
@@ -130,30 +174,40 @@ void on_finish_effects(
 	reshade::api::resource_view rtv,
 	reshade::api::resource_view rtv_srgb)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_finish_effects(runtime, cmd_list, rtv, rtv_srgb);
 }
 
 void on_reloaded_effects(reshade::api::effect_runtime *runtime)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_reloaded_effects(runtime);
 }
 
 void on_present(reshade::api::effect_runtime *runtime)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_present(runtime);
 }
 
 void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_init_effect_runtime(runtime);
 }
 
 void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_destroy_effect_runtime(runtime);
 }
@@ -161,8 +215,18 @@ void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 void on_game_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
 	const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
+	if (from_own_window())
+		return;
 	if (auto *a = app())
 		a->on_game_present(queue, swapchain);
+}
+
+void on_finish_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+{
+	if (from_own_window())
+		return;
+	if (auto *a = app())
+		a->on_finish_present(queue, swapchain);
 }
 
 void draw_main_overlay(reshade::api::effect_runtime *runtime)
@@ -273,7 +337,17 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
 	reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
 	reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
 	reshade::register_event<reshade::addon_event::present>(on_game_present);
+	reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
 	register_scene_jitter_hooks();
+	if (App *const a = app(); a != nullptr && a->settings().pipeline_trace) {
+		const std::string &d = a->settings().pipeline_trace_dir;
+		std::wstring dir(d.begin(), d.end());
+		while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/'))
+			dir.pop_back();
+		if (dir.empty())
+			dir = join_path(module_directory(addon_module), L"captures");
+		register_pipeline_trace(a->settings().pipeline_trace_key, dir);
+	}
 
 	reshade::register_overlay("Aeon SR", draw_main_overlay);
 	reshade::register_overlay("OSD", draw_osd);
@@ -288,6 +362,11 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE 
 		g_driver_fault_handler = nullptr;
 	}
 	d3d9ex::disarm();
+	unregister_pipeline_trace();
+	unregister_game_render_scale();
+#if AEONSR_FRAME_GENERATION
+	present_sync::unhook();
+#endif
 	destroy_app();
 	diag_set_sink(nullptr);
 	diag_info("aeonsr", L"add-on unloaded");

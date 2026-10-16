@@ -23,7 +23,7 @@ void safe_release(T *&p) noexcept
 	}
 }
 
-constexpr uint32_t kMaxLumaMips = 8;
+constexpr uint32_t kMaxLumaMips = 6;
 constexpr uint32_t kRingSize = 8192;
 constexpr uint32_t kSrvCount = 11;
 constexpr uint32_t kUavCount = 3;
@@ -38,7 +38,7 @@ enum : uint32_t {
 	kSlotLumaMipSrv = kSlotLumaSrv + 2,
 	kSlotLumaUav = kSlotLumaMipSrv + 2 * kMaxLumaMips,
 	kSlotFlow = kSlotLumaUav + 2 * kMaxLumaMips,
-	kStagingCount = kSlotFlow + 52
+	kStagingCount = kSlotFlow + 54
 };
 
 std::wstring widen_ascii(const char *text)
@@ -110,6 +110,7 @@ constexpr DXGI_FORMAT kUavRegisterFormat[kUavCount] = {
 constexpr uint32_t kModelStats = 80;
 static_assert(kModelStats % 4u == 0u, "store_terms reduces the terms in four equal parts (kTermParts)");
 static_assert(kModelStats <= 80u, "sums_ holds one column per term");
+constexpr uint32_t kTermsBlock = flow_entries::kTermsBlock;
 constexpr uint32_t kPartialRows = 4096;
 static_assert(kPartialRows <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, "one column of partial rows");
 constexpr uint32_t kModelIterations = 4;
@@ -150,7 +151,7 @@ void OpticalFlowD3D12::release_textures()
 	Tex *const all[] = { &luma_[0], &luma_[1], &l4_, &l3_[0], &l3_[1], &l2_[0], &l2_[1],
 		&l1_[0], &l1_[1], &l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_,
 		&prev_flow_, &global_, &conf_quarter_, &prev_conf_, &motion_, &confidence_,
-		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_ };
+		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_ };
 	for (Tex *t : all) {
 		safe_release(t->res);
 		*t = Tex{};
@@ -582,7 +583,7 @@ void OpticalFlowD3D12::make_flow_views()
 	Tex *const flow[] = { &l4_, &l3_[0], &l3_[1], &l2_[0], &l2_[1], &l1_[0], &l1_[1],
 		&l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_, &prev_flow_, &global_,
 		&conf_quarter_, &prev_conf_, &motion_, &confidence_,
-		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_ };
+		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_ };
 	static_assert(sizeof(flow) / sizeof(flow[0]) * 2 == kStagingCount - kSlotFlow,
 		"every flow texture needs an SRV and a UAV slot");
 	for (uint32_t i = 0; i < sizeof(flow) / sizeof(flow[0]); ++i) {
@@ -607,7 +608,7 @@ void OpticalFlowD3D12::make_flow_views()
 void OpticalFlowD3D12::make_model_textures()
 {
 	const uint32_t w = width_, h = height_;
-	const uint32_t rows = groups(level_size(w, 1), 16) * groups(level_size(h, 1), 16);
+	const uint32_t rows = groups(level_size(w, 1), kTermsBlock) * groups(level_size(h, 1), kTermsBlock);
 	const uint64_t bytes_before = device_bytes_;
 	std::wstring error;
 	const bool fail_for_test = fail_model_textures_for_test > 0;
@@ -622,14 +623,15 @@ void OpticalFlowD3D12::make_model_textures()
 		make_tex(theta_[1], 16, 2, DXGI_FORMAT_R32_FLOAT, 1, &error) &&
 		make_tex(alpha_q_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16_FLOAT, 1, &error) &&
 		make_tex(theta_pub_, 16, 8, DXGI_FORMAT_R32_FLOAT, 1, &error) &&
-		make_tex(kept_motion_, w, h, DXGI_FORMAT_R16G16_FLOAT, 1, &error);
+		make_tex(kept_motion_, w, h, DXGI_FORMAT_R16G16_FLOAT, 1, &error) &&
+		make_tex(along_q_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16G16_FLOAT, 1, &error);
 	if (model_textures_) {
 		model_retry_ms_ = 0;
 		return;
 	}
 	model_textures_failed_at_ = GetTickCount64();
 	model_retry_ms_ = model_retry_ms_ == 0 ? texture_retry_ms : (std::min)(2u * model_retry_ms_, 60000u);
-	for (Tex *t : { &struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_ }) {
+	for (Tex *t : { &struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_ }) {
 		safe_release(t->res);
 		*t = Tex{};
 	}
@@ -844,8 +846,8 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 	m.inv_src_y = m.inv_dst_y;
 	m.norm_x = 2.0f * static_cast<float>(width_) / static_cast<float>(height_);
 	m.px_per_unit = 0.5f * static_cast<float>(height_);
-	m.terms_gx = groups(qw, 16);
-	m.terms_gy = groups(qh, 16);
+	m.terms_gx = groups(qw, kTermsBlock);
+	m.terms_gy = groups(qh, kTermsBlock);
 	m.partial_rows = kPartialRows;
 	m.model_flags = (model_cold_ ? 1u : 0u) | (base.model_flags & 14u);
 
@@ -880,8 +882,8 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 			t.dst_h = level_size(height_, mip);
 			t.inv_dst_x = 1.0f / static_cast<float>(t.dst_w);
 			t.inv_dst_y = 1.0f / static_cast<float>(t.dst_h);
-			t.terms_gx = groups(t.dst_w, 16);
-			t.terms_gy = groups(t.dst_h, 16);
+			t.terms_gx = groups(t.dst_w, kTermsBlock);
+			t.terms_gy = groups(t.dst_h, kTermsBlock);
 		}
 		to_state(cmd, cur, read_state);
 		to_state(cmd, partials_, write_state);
@@ -934,16 +936,18 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 	to_state(cmd, theta_pub_, read_state);
 
 	to_state(cmd, alpha_q_, write_state);
+	to_state(cmd, along_q_, write_state);
 	{
 		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
 			none, staging(kSlotLumaSrv + parity_), staging(kSlotLumaSrv + (parity_ ^ 1u)),
 			srv_of(dense_[1]), none, none,
 			staging(kSlotDepth), none, srv_of(struct_q_), srv_of(theta_pub_), none
 		};
-		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, uav_of(alpha_q_), none };
+		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { uav_of(along_q_), uav_of(alpha_q_), none };
 		dispatch(cmd, kDecision, m, srvs, kSrvCount, uavs, kUavCount, groups(qw, 8), groups(qh, 8));
 	}
 	to_state(cmd, alpha_q_, read_state);
+	to_state(cmd, along_q_, read_state);
 
 	Constants f = m;
 	f.dst_w = width_;
@@ -961,7 +965,7 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 	to_state(cmd, confidence_, write_state);
 	{
 		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
-			none, none, none, srv_of(dense_[1]), cross ? srv_of(kept_motion_) : none, none,
+			none, none, none, srv_of(dense_[1]), cross ? srv_of(kept_motion_) : none, srv_of(along_q_),
 			staging(kSlotDepth), srv_of(conf_quarter_), srv_of(struct_q_), srv_of(theta_pub_), srv_of(alpha_q_)
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { uav_of(motion_), uav_of(confidence_), none };
@@ -1340,6 +1344,7 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	to_state(cmd, theta_[0], kPublishedState);
 	to_state(cmd, theta_pub_, kPublishedState);
 	to_state(cmd, alpha_q_, kPublishedState);
+	to_state(cmd, along_q_, kPublishedState);
 
 	if (theta_pub_.res != nullptr && ++landing_tick_ >= kLandingPeriod) {
 		landing_tick_ = 0;

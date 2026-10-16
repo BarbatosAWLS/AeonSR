@@ -102,15 +102,17 @@ bool DlssD3D12Backend::run(
 		return false;
 	}
 
-	rt->run(inputs.engine.cmd,
+	const bool wrote = rt->run(inputs.engine.cmd,
 		inputs.engine.color,
 		inputs.engine.color_state,
 		inputs.engine.motion,
 		inputs.engine.depth,
-		native_handle<ID3D12Resource>(params.bias_mask));
+		native_handle<ID3D12Resource>(params.bias_mask),
+		inputs.engine.output,
+		inputs.engine.output_state);
 
 	sync_status(*this, *rt);
-	return !rt->crashed;
+	return !rt->crashed && (inputs.engine.output == nullptr || wrote);
 }
 
 }

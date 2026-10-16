@@ -47,6 +47,13 @@ public:
 	void request_scope(const std::wstring &dir, uint32_t frames, uint64_t max_bytes = kScopeMaxBytes,
 		uint32_t planes = kScopeAllPlanes);
 	bool scope_recording() const noexcept { return scope_left_ > 0; }
+	void scope_motion_size(uint32_t w, uint32_t h) noexcept
+	{
+		if (!scope_sized_) {
+			scope_motion_w_ = w;
+			scope_motion_h_ = h;
+		}
+	}
 	bool scope_busy() const;
 	void scope_cancel() { scope_close_all(); }
 	uint32_t scope_next() const noexcept { return scope_next_; }
@@ -126,6 +133,7 @@ private:
 	uint32_t scope_wanted_ = kScopeAllPlanes;
 	bool scope_sized_ = false;
 	D3D12_RESOURCE_DESC scope_color_{};
+	uint32_t scope_motion_w_ = 0, scope_motion_h_ = 0;
 	ScopeSlot scope_slots_[kScopeStagePlanes];
 	uint64_t scope_frame_bytes_ = 0;
 	std::vector<ID3D12Resource *> scope_pool_;

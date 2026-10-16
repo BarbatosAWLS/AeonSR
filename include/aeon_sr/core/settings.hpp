@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef AEONSR_FRAME_GENERATION
+#define AEONSR_FRAME_GENERATION 0
+#endif
+
 #include <Windows.h>
 
 #include <cstdint>
@@ -35,8 +39,14 @@ inline constexpr float kJitterAmount = 1.0f;
 inline constexpr unsigned int kScopeFramesDefault = 48u;
 inline constexpr unsigned int kScopeFramesMax = 1024u;
 inline constexpr unsigned int kScopeKeyDefault = 0x7Au;
+inline constexpr unsigned int kPipelineTraceKeyDefault = 0x76u;
 
 float vsr_scale_for_mode(UpscaleMode mode) noexcept;
+
+#if AEONSR_FRAME_GENERATION
+inline constexpr unsigned int kFrameGenerationLimitMax = 500u;
+inline constexpr unsigned int kFrameGenerationMultiplierMax = 6u;
+#endif
 
 inline constexpr unsigned int kFunctionalRenderPresets[] = { 0u, 5u, 6u, 10u, 11u, 12u, 13u };
 
@@ -46,7 +56,7 @@ inline constexpr unsigned int kNeuralStyleCount = 3u;
 inline constexpr float kNeuralIntensityDefault = 1.0f;
 
 inline constexpr float kNeuralStructureDefault = 1.0f;
-inline constexpr float kNeuralToneDefault = 1.0f;
+inline constexpr float kNeuralToneDefault = 0.0f;
 
 inline constexpr float kNeuralSkinMin = -1.0f;
 inline constexpr float kNeuralSkinMax = 1.0f;
@@ -135,6 +145,10 @@ struct Settings {
 
 	bool spatial_jitter = true;
 
+	bool pace_to_display = false;
+
+	unsigned int low_latency = 0;
+
 	unsigned int upscale_mode = 0;
 
 	inline static constexpr unsigned int kBackendUnset = 0xFFFFFFFFu;
@@ -155,14 +169,31 @@ struct Settings {
 	unsigned int scope_frames = kScopeFramesDefault;
 	std::string scope_dir;
 	unsigned int scope_key = kScopeKeyDefault;
+	bool pipeline_trace = false;
+	bool game_render_scale = false;
+	bool game_render_scale_before_aa = false;
+	unsigned int pipeline_trace_key = kPipelineTraceKeyDefault;
+	std::string pipeline_trace_dir;
 	std::string jitter_fault;
 	unsigned int report_key = 0;
 	std::string flight_fault;
 	bool keep_interface = true;
 	bool force_system_memory = false;
 
+#if AEONSR_FRAME_GENERATION
+	bool frame_generation = false;
+	unsigned int frame_generation_limit = 0;
+	unsigned int frame_generator = 0;
+	unsigned int frame_generation_multiplier = 0;
+	bool frame_generation_own_window = true;
+	bool frame_generation_window_host = true;
+	unsigned int frame_generation_dump = 0;
+	std::string frame_generation_dump_dir;
+#endif
+
 	bool neural_render = false;
 	unsigned int neural_style = 0;
+	unsigned int neural_model = 0;
 
 	float neural_intensity = kNeuralIntensityDefault;
 	float neural_local_structure = kNeuralStructureDefault;

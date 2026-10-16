@@ -630,10 +630,14 @@ bool Fsr4D3D12Backend::ensure_scratch(ID3D12GraphicsCommandList * , uint32_t w, 
 		return false;
 
 	uint32_t rw = 0, rh = 0;
-	if (render_scale_ > 0.0f)
+	if (explicit_width_ != 0 && explicit_height_ != 0 && explicit_width_ <= w && explicit_height_ <= h) {
+		rw = explicit_width_;
+		rh = explicit_height_;
+	} else if (render_scale_ > 0.0f) {
 		scaled_render_size(w, h, render_scale_, &rw, &rh);
-	else if (!query_render_size(w, h, ffx_quality_for(quality_mode_), rw, rh))
+	} else if (!query_render_size(w, h, ffx_quality_for(quality_mode_), rw, rh)) {
 		return false;
+	}
 
 	if (output_tex_ != nullptr && width_ == w && height_ == h && render_width_ == rw &&
 		render_height_ == rh && scratch_format_ == fmt &&
@@ -688,7 +692,7 @@ bool Fsr4D3D12Backend::run(
 
 	return run_native(inputs.engine.device, inputs.engine.queue, inputs.engine.cmd,
 		inputs.engine.color, inputs.engine.motion, depth,
-		inputs.engine.color_state, params);
+		inputs.engine.color_state, params, inputs.engine.output, inputs.engine.output_state);
 }
 
 bool Fsr4D3D12Backend::run_native(
@@ -697,7 +701,8 @@ bool Fsr4D3D12Backend::run_native(
 	ID3D12Resource *backbuffer, ID3D12Resource *motion_vectors,
 	ID3D12Resource *depth,
 	D3D12_RESOURCE_STATES backbuffer_state,
-	const UpscalerParams &params)
+	const UpscalerParams &params,
+	ID3D12Resource *output, D3D12_RESOURCE_STATES output_state)
 {
 	if (crashed)
 		return false;
@@ -706,6 +711,10 @@ bool Fsr4D3D12Backend::run_native(
 
 	quality_mode_ = params.quality_mode;
 	render_scale_ = params.render_scale;
+	explicit_width_ = params.render_width;
+	explicit_height_ = params.render_height;
+	if (explicit_width_ != 0 && explicit_height_ != 0)
+		render_scale_ = 1.0f;
 	sharpness_ = params.sharpness;
 	frame_time_ms_ = params.frame_time_ms;
 	set_color_space(params.color_space);
@@ -720,7 +729,9 @@ bool Fsr4D3D12Backend::run_native(
 		status = UpscalerStatus::NeedMotionVectors;
 		return false;
 	}
-	const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
+	ID3D12Resource *const target = output != nullptr ? output : backbuffer;
+	const D3D12_RESOURCE_STATES target_state = output != nullptr ? output_state : backbuffer_state;
+	const D3D12_RESOURCE_DESC bb_desc = target->GetDesc();
 	backbuffer_format_ = bb_desc.Format;
 	const DXGI_FORMAT fmt = upscaler_scratch_format(bb_desc.Format);
 	const uint32_t w = static_cast<uint32_t>(bb_desc.Width);
@@ -743,21 +754,27 @@ bool Fsr4D3D12Backend::run_native(
 
 	bool ok = true;
 
-	barrier12(cmd12, backbuffer, backbuffer_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-	cmd12->CopyResource(color_full_, backbuffer);
-
-	barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	const bool in_place = output != nullptr || reads_like_copy12(backbuffer, backbuffer_format_);
+	const D3D12_RESOURCE_STATES read_state =
+		in_place ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+	ID3D12Resource *const color_src = in_place ? backbuffer : color_full_;
+	barrier12(cmd12, backbuffer, backbuffer_state, read_state);
+	if (!in_place) {
+		cmd12->CopyResource(color_full_, backbuffer);
+		barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	}
 	const float shift_x = params.jitter_in_frame ? 0.0f : params.jitter_x;
 	const float shift_y = params.jitter_in_frame ? 0.0f : params.jitter_y;
 	const float jitter_u = render_width_ > 0 ? -shift_x / static_cast<float>(render_width_) : 0.0f;
 	const float jitter_v = render_height_ > 0 ? -shift_y / static_cast<float>(render_height_) : 0.0f;
 
 	barrier12(cmd12, color_copy_, kFfxSrvState, D3D12_RESOURCE_STATE_RENDER_TARGET);
-	ok = blit_.draw_fullscreen(d3d12, cmd12, color_full_,
+	ok = blit_.draw_fullscreen(d3d12, cmd12, color_src,
 		color_copy_, scratch_format_, render_width_, render_height_,
 		0.0f, 0u, jitter_u, jitter_v);
 	barrier12(cmd12, color_copy_, D3D12_RESOURCE_STATE_RENDER_TARGET, kFfxSrvState);
-	barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+	if (!in_place)
+		barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 	if (!ok) {
 		status = UpscalerStatus::EvaluateFailed;
 		last_error = L"failed to blit color into FSR scratch";
@@ -827,13 +844,18 @@ bool Fsr4D3D12Backend::run_native(
 		}
 	}
 
-	barrier12(cmd12, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	if (output != nullptr) {
+		barrier12(cmd12, backbuffer, read_state, backbuffer_state);
+		barrier12(cmd12, target, target_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	} else {
+		barrier12(cmd12, backbuffer, read_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}
 	if (ok)
 		ok = blit_.draw_fullscreen(d3d12, cmd12, output_tex_,
-			backbuffer, backbuffer_format_, width_, height_, params.sharpness);
+			target, backbuffer_format_, width_, height_, params.sharpness);
 
-	if (backbuffer_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
-		barrier12(cmd12, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer_state);
+	if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+		barrier12(cmd12, target, D3D12_RESOURCE_STATE_RENDER_TARGET, target_state);
 
 	if (ok) {
 		status = UpscalerStatus::Ready;

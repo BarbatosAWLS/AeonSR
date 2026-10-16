@@ -44,32 +44,36 @@ RWTexture2D<float> Dnext : register(u4);
 RWTexture2D<float> Lnext : register(u5);
 
 #define K 28
-groupshared float gs[K * 256];
+#define PARTS 4
+#define PART (K / PARTS)
+groupshared float gs[PART * 256];
+groupshared float gsum[K];
 
 float luma_at(int2 p) { return dot(Ccur[p].rgb, float3(0.2126, 0.7152, 0.0722)); }
 
 void reduce_group(uint gi, float v[K])
 {
-	for (uint k = 0; k < K; ++k)
-		gs[k * 256u + gi] = v[k];
-	GroupMemoryBarrierWithGroupSync();
-	for (uint s = 128u; s > 0u; s >>= 1) {
-		if (gi < s) {
-			for (uint k = 0; k < K; ++k)
-				gs[k * 256u + gi] += gs[k * 256u + gi + s];
+	[unroll] for (uint part = 0; part < PARTS; ++part) {
+		[unroll] for (uint e = 0; e < PART; ++e)
+			gs[e * 256u + gi] = v[part * PART + e];
+		GroupMemoryBarrierWithGroupSync();
+		for (uint s = 128u; s > 0u; s >>= 1) {
+			for (uint j = gi; j < s * PART; j += 256u) {
+				const uint e2 = j / s, i = j - e2 * s;
+				gs[e2 * 256u + i] += gs[e2 * 256u + i + s];
+			}
+			GroupMemoryBarrierWithGroupSync();
 		}
+		if (gi < PART)
+			gsum[part * PART + gi] = gs[gi * 256u];
 		GroupMemoryBarrierWithGroupSync();
 	}
 }
 
-[numthreads(16, 16, 1)]
-void Accumulate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+void add_pixel(uint2 xy, inout float v[K])
 {
-	float v[K];
-	[unroll] for (uint k = 0; k < K; ++k)
-		v[k] = 0.0;
-	const int2 p = int2(id.xy);
-	const bool inside = all(id.xy < size);
+	const int2 p = int2(xy);
+	const bool inside = all(xy < size);
 	float z = 0.0, l = 0.0;
 	if (inside) {
 		z = Dcur[p];
@@ -88,7 +92,7 @@ void Accumulate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 g
 			const float d = (z - zp) / gm;
 			if (abs(d) <= 2.0) {
 				const float ux = gx / gm, uy = gy / gm;
-				v[0] = ux * ux; v[1] = ux * uy; v[2] = uy * uy; v[3] = ux * d; v[4] = uy * d; v[5] = 1.0;
+				v[0] += ux * ux; v[1] += ux * uy; v[2] += uy * uy; v[3] += ux * d; v[4] += uy * d; v[5] += 1.0;
 			}
 		}
 		const float ll = luma_at(p - int2(1, 0)), lr = luma_at(p + int2(1, 0));
@@ -100,7 +104,7 @@ void Accumulate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 g
 			const float d = (l - lp) / hm;
 			if (abs(d) <= 2.0) {
 				const float ux = hx / hm, uy = hy / hm;
-				v[6] = ux * ux; v[7] = ux * uy; v[8] = uy * uy; v[9] = ux * d; v[10] = uy * d; v[11] = 1.0;
+				v[6] += ux * ux; v[7] += ux * uy; v[8] += uy * uy; v[9] += ux * d; v[10] += uy * d; v[11] += 1.0;
 			}
 		}
 		const float2 mv = Mv[p] * float2(size);
@@ -119,8 +123,8 @@ void Accumulate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 g
 				if (abs(d) <= 2.0) {
 					const float ux = gx / gm, uy = gy / gm;
 					const float w = ml > 0.25 ? (ux * n.x + uy * n.y) * (ux * n.x + uy * n.y) : 1.0;
-					v[14] = w * ux * ux; v[15] = w * ux * uy; v[16] = w * uy * uy; v[17] = w * ux * d; v[18] = w * uy * d;
-					v[19] = w;
+					v[14] += w * ux * ux; v[15] += w * ux * uy; v[16] += w * uy * uy; v[17] += w * ux * d; v[18] += w * uy * d;
+					v[19] += w;
 				}
 			}
 			if (hm > 0.01) {
@@ -128,28 +132,39 @@ void Accumulate(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex, uint3 g
 				if (abs(d) <= 2.0) {
 					const float ux = hx / hm, uy = hy / hm;
 					const float w = ml > 0.25 ? (ux * n.x + uy * n.y) * (ux * n.x + uy * n.y) : 1.0;
-					v[20] = w * ux * ux; v[21] = w * ux * uy; v[22] = w * uy * uy; v[23] = w * ux * d; v[24] = w * uy * d;
-					v[25] = w;
+					v[20] += w * ux * ux; v[21] += w * ux * uy; v[22] += w * uy * uy; v[23] += w * ux * d; v[24] += w * uy * d;
+					v[25] += w;
 				}
 			}
 		}
 	}
 	if (inside) {
 		const float2 m = Mv[p] * float2(size);
-		v[12] = length(m);
-		v[13] = 1.0;
-		v[26] = -m.x;
-		v[27] = -m.y;
-	}
-	reduce_group(gi, v);
-	if (gi == 0u) {
-		const uint at = (gid.y * groups_x + gid.x) * K;
-		[unroll] for (uint k = 0; k < K; ++k)
-			Blocks[at + k] = gs[k * 256u];
+		v[12] += length(m);
+		v[13] += 1.0;
+		v[26] += -m.x;
+		v[27] += -m.y;
 	}
 	if (inside) {
 		Dnext[p] = z;
 		Lnext[p] = l;
+	}
+}
+
+[numthreads(16, 16, 1)]
+void Accumulate(uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+	float v[K];
+	[unroll] for (uint k = 0; k < K; ++k)
+		v[k] = 0.0;
+	const uint2 base = gid.xy * 32u + gtid.xy;
+	[loop] for (uint t = 0; t < 4u; ++t)
+		add_pixel(base + uint2(t & 1u, t >> 1u) * 16u, v);
+	reduce_group(gi, v);
+	if (gi == 0u) {
+		const uint at = (gid.y * groups_x + gid.x) * K;
+		[unroll] for (uint k = 0; k < K; ++k)
+			Blocks[at + k] = gsum[k];
 	}
 }
 
@@ -166,7 +181,7 @@ void Reduce(uint gi : SV_GroupIndex)
 	reduce_group(gi, v);
 	if (gi == 0u) {
 		[unroll] for (uint k = 0; k < K; ++k)
-			Result[k] = asuint(gs[k * 256u]);
+			Result[k] = asuint(gsum[k]);
 		Result[K] = serial;
 	}
 }
@@ -370,8 +385,8 @@ bool GameJitterProbeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t
 	release_com(partials_);
 	width_ = width;
 	height_ = height;
-	groups_x_ = (width + 15u) / 16u;
-	groups_y_ = (height + 15u) / 16u;
+	groups_x_ = (width + 31u) / 32u;
+	groups_y_ = (height + 31u) / 32u;
 	bool made = true;
 	for (int i = 0; i < 2; ++i) {
 		prev_depth_[i] = make_texture(device_, width, height, DXGI_FORMAT_R32_FLOAT);

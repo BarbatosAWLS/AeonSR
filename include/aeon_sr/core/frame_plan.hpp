@@ -23,6 +23,7 @@ struct FrameSignals {
 	bool jitter_drawn_ambiguous = false;
 	bool jitter_drawn_empty = false;
 	bool jitter_withheld = false;
+	bool withheld_interface_learned = false;
 	bool camera_moving = false;
 
 	NeuralColorSpace color_space = NeuralColorSpace::Sdr;
@@ -96,6 +97,12 @@ struct FramePlan {
 Jitter split_pair_point(uint32_t drawn_index, float amount) noexcept;
 
 bool split_uses_catmull_rom(bool setting, BackendChoice backend) noexcept;
+
+bool split_while_moving(unsigned int upscale_mode) noexcept;
+
+bool input_downscaled(const Settings &settings) noexcept;
+
+bool withheld_resamples(const Settings &settings, const FrameSignals &signals, BackendChoice backend) noexcept;
 
 struct CameraMotionGate {
 	static constexpr float kOn = 0.5f;

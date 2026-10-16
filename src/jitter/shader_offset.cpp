@@ -1465,7 +1465,7 @@ namespace wterms4 {
 constexpr uint32_t kOpAdd = 0, kOpCall = 4, kOpCallC = 5, kOpDp2 = 15, kOpDp3 = 16, kOpDp4 = 17, kOpEndIf = 21,
 	kOpEndLoop = 22, kOpEndSwitch = 23, kOpIf = 31, kOpLabel = 44, kOpLoop = 48, kOpMad = 50, kOpCustomData = 53,
 	kOpMov = 54, kOpMul = 56, kOpRet = 62, kOpRetC = 63, kOpSwitch = 76, kOpInterfaceCall = 120,
-	kOpDclOutputSiv = 103;
+	kOpDclOutputSiv = 103, kOpDclConstantBuffer = 89;
 constexpr uint32_t kTypeTemp = 0, kTypeInput = 1, kTypeOutput = 2, kTypeImm32 = 4, kTypeImm64 = 5,
 	kTypeConstantBuffer = 8, kTypeImmediateConstantBuffer = 9;
 constexpr uint32_t kNamePosition = 1;
@@ -1476,6 +1476,7 @@ struct Operand {
 	uint32_t type = 0;
 	uint32_t index0 = 0;
 	uint32_t index1 = 0;
+	uint32_t index2 = 0;
 	uint32_t dim = 0;
 	uint8_t mask = 0;
 	uint8_t swizzle[4]{ 0, 1, 2, 3 };
@@ -1497,6 +1498,7 @@ struct Instr {
 struct Shader {
 	std::vector<Instr> code;
 	int pos = -1;
+	std::vector<std::pair<uint32_t, uint32_t>> spaces;
 };
 
 size_t operand(const uint32_t *t, size_t k, size_t end, Operand &o, int depth = 0)
@@ -1563,6 +1565,8 @@ size_t operand(const uint32_t *t, size_t k, size_t end, Operand &o, int depth = 
 				o.index0 = t[k + n];
 			else if (d == 1u)
 				o.index1 = t[k + n];
+			else
+				o.index2 = t[k + n];
 			n += 1;
 		} else if (rep == 1u || rep == 4u) {
 			n += 2;
@@ -1604,6 +1608,12 @@ bool read(const uint32_t *t, size_t len, Shader &out)
 			if (op == kOpDclOutputSiv && ilen >= 4 && ((t[i + 1] >> 12) & 0xFFu) == kTypeOutput &&
 				(t[i + 1] >> 31) == 0 && t[i + 3] == kNamePosition)
 				out.pos = static_cast<int>(t[i + 2]);
+			if (op == kOpDclConstantBuffer) {
+				Operand o;
+				const size_t used = operand(t, i + 1, end, o);
+				if (used != 0 && o.type == kTypeConstantBuffer && o.dim == 3u && i + 1 + used + 2 <= end)
+					out.spaces.emplace_back(o.index0, t[i + 1 + used + 1]);
+			}
 			i = end;
 			continue;
 		}
@@ -1686,16 +1696,38 @@ struct Tracer {
 
 	bool name(const Operand &k, uint8_t lane) noexcept
 	{
-		if (k.type != kTypeConstantBuffer || k.dim != 2u || k.index0 >= kD3D10OffsetSlots || k.index1 >= 4096u)
+		if (k.type != kTypeConstantBuffer)
+			return false;
+		uint32_t slot = 0, reg = 0, space = 0;
+		if (k.dim == 2u && k.index0 < kD3D10OffsetSlots) {
+			slot = k.index0;
+			reg = k.index1;
+		} else if (k.dim == 3u) {
+			bool declared = false;
+			for (const auto &sp : s.spaces) {
+				if (sp.first == k.index0) {
+					space = sp.second;
+					declared = true;
+				}
+			}
+			if (!declared)
+				return false;
+			slot = k.index1;
+			reg = k.index2;
+		} else {
+			return false;
+		}
+		if (reg >= 4096u)
 			return false;
 		for (uint32_t i = 0; i < out.count; ++i) {
-			if (out.slot[i] == k.index0 && out.reg[i] == k.index1 && out.lane[i] == lane)
+			if (out.slot[i] == slot && out.space[i] == space && out.reg[i] == reg && out.lane[i] == lane)
 				return true;
 		}
 		if (out.count == DxbcWTerms::kMax)
 			return false;
-		out.slot[out.count] = static_cast<uint8_t>(k.index0);
-		out.reg[out.count] = static_cast<uint16_t>(k.index1);
+		out.slot[out.count] = slot;
+		out.space[out.count] = space;
+		out.reg[out.count] = static_cast<uint16_t>(reg);
 		out.lane[out.count] = lane;
 		++out.count;
 		return true;
@@ -2107,10 +2139,27 @@ int dxbc_w_terms_perspective(const DxbcWTerms &terms, DxbcConstantRead read, voi
 {
 	if (read == nullptr)
 		return -1;
+	struct Unspaced {
+		DxbcConstantRead read;
+		void *user;
+	} u{ read, user };
+	return dxbc_w_terms_perspective_spaced(
+		terms,
+		[](void *p, uint32_t space, uint32_t slot, uint32_t reg, float out[4]) {
+			const Unspaced &x = *static_cast<const Unspaced *>(p);
+			return space == 0u && x.read(x.user, slot, reg, out);
+		},
+		&u);
+}
+
+int dxbc_w_terms_perspective_spaced(const DxbcWTerms &terms, DxbcSpacedConstantRead read, void *user) noexcept
+{
+	if (read == nullptr)
+		return -1;
 	bool unknown = false;
 	for (uint32_t i = 0; i < terms.count && i < DxbcWTerms::kMax; ++i) {
 		float v[4] = {};
-		if (terms.lane[i] > 3u || !read(user, terms.slot[i], terms.reg[i], v)) {
+		if (terms.lane[i] > 3u || !read(user, terms.space[i], terms.slot[i], terms.reg[i], v)) {
 			unknown = true;
 			continue;
 		}

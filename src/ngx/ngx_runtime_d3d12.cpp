@@ -308,7 +308,8 @@ bool NgxRuntimeD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w,
 bool NgxRuntimeD3D12::run(ID3D12GraphicsCommandList *cmd,
 	ID3D12Resource *backbuffer, D3D12_RESOURCE_STATES backbuffer_state,
 	ID3D12Resource *motion_vectors,
-	ID3D12Resource *depth, ID3D12Resource *bias_mask)
+	ID3D12Resource *depth, ID3D12Resource *bias_mask,
+	ID3D12Resource *output, D3D12_RESOURCE_STATES output_state)
 {
 	if (crashed)
 		return false;
@@ -318,7 +319,9 @@ bool NgxRuntimeD3D12::run(ID3D12GraphicsCommandList *cmd,
 		return false;
 	diag_trace("dlss", L"D3D12 run: begin");
 	engine_journal_note(L"DLSS run");
-	const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
+	ID3D12Resource *const target = output != nullptr ? output : backbuffer;
+	const D3D12_RESOURCE_STATES target_state = output != nullptr ? output_state : backbuffer_state;
+	const D3D12_RESOURCE_DESC bb_desc = target->GetDesc();
 	backbuffer_format = bb_desc.Format;
 	const DXGI_FORMAT fmt = upscaler_scratch_format(bb_desc.Format);
 	const uint32_t w = static_cast<uint32_t>(bb_desc.Width);
@@ -339,10 +342,15 @@ bool NgxRuntimeD3D12::run(ID3D12GraphicsCommandList *cmd,
 		return false;
 	}
 
-	barrier12(cmd, backbuffer, backbuffer_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-	cmd->CopyResource(color_full, backbuffer);
-
-	barrier12(cmd, color_full, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	const bool in_place = output != nullptr || reads_like_copy12(backbuffer, backbuffer_format);
+	const D3D12_RESOURCE_STATES read_state =
+		in_place ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+	ID3D12Resource *const color_src = in_place ? backbuffer : color_full;
+	barrier12(cmd, backbuffer, backbuffer_state, read_state);
+	if (!in_place) {
+		cmd->CopyResource(color_full, backbuffer);
+		barrier12(cmd, color_full, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	}
 	barrier12(cmd, color_copy, kNgxSrvState, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
 	jitter_x = cfg.jitter_x;
@@ -352,12 +360,13 @@ bool NgxRuntimeD3D12::run(ID3D12GraphicsCommandList *cmd,
 	const float shift_y = cfg.jitter_in_frame ? 0.0f : jitter_y;
 	const float jitter_u = render_width > 0 ? -shift_x / static_cast<float>(render_width) : 0.0f;
 	const float jitter_v = render_height > 0 ? -shift_y / static_cast<float>(render_height) : 0.0f;
-	bool ok = blit_.draw_fullscreen(device, cmd, color_full,
+	bool ok = blit_.draw_fullscreen(device, cmd, color_src,
 		color_copy, scratch_format, render_width, render_height, 0.0f, 0u,
 		jitter_u, jitter_v);
 
 	barrier12(cmd, color_copy, D3D12_RESOURCE_STATE_RENDER_TARGET, kNgxSrvState);
-	barrier12(cmd, color_full, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+	if (!in_place)
+		barrier12(cmd, color_full, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 	if (!ok) {
 		status = UpscalerStatus::EvaluateFailed;
 		last_error = L"failed to blit color into UAV scratch";
@@ -367,14 +376,19 @@ bool NgxRuntimeD3D12::run(ID3D12GraphicsCommandList *cmd,
 	if (ok)
 		ok = evaluate_inputs(cmd, color_copy, depth, motion_vectors, bias_mask, jitter_u, jitter_v);
 
-	barrier12(cmd, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	if (output != nullptr) {
+		barrier12(cmd, backbuffer, read_state, backbuffer_state);
+		barrier12(cmd, target, target_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	} else {
+		barrier12(cmd, backbuffer, read_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}
 	if (ok) {
 		diag_trace("dlss", L"D3D12 run: composite");
 		ok = blit_.draw_fullscreen(device, cmd, output_tex,
-			backbuffer, backbuffer_format, width, height, cfg.sharpness);
+			target, backbuffer_format, width, height, cfg.sharpness);
 	}
-	if (backbuffer_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
-		barrier12(cmd, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer_state);
+	if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+		barrier12(cmd, target, D3D12_RESOURCE_STATE_RENDER_TARGET, target_state);
 
 	if (ok) {
 		status = UpscalerStatus::Ready;

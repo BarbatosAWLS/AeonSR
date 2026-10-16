@@ -11,6 +11,8 @@ inline constexpr uint32_t kSrvPerSlot = 4;
 void barrier12(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
 	D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
 
+bool reads_like_copy12(ID3D12Resource *res, DXGI_FORMAT as) noexcept;
+
 void engine_journal_note(const wchar_t *note) noexcept;
 void engine_journal_dump() noexcept;
 bool create_tex12(ID3D12Device *device, uint32_t w, uint32_t h, DXGI_FORMAT fmt,
@@ -86,7 +88,7 @@ struct BlitPipelineD3D12 {
 		ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h,
 		float sharpness = 0.0f,
 		uint32_t debug_mode = 0, float jitter_u = 0.0f, float jitter_v = 0.0f,
-		const float *valid_uv = nullptr, bool catmull_rom = false);
+		const float *valid_uv = nullptr, bool catmull_rom = false, const D3D12_RECT *scissor = nullptr);
 
 	bool draw_debug_view(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *field,
 		ID3D12Resource *frame, ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h,

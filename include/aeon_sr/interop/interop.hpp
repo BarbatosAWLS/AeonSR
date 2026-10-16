@@ -64,8 +64,8 @@ public:
 
 	int queue_priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
 
-	enum class Ring : uint32_t { Frame = 0, FrameGeneration = 1 };
-	static constexpr uint32_t kRings = 2;
+	enum class Ring : uint32_t { Frame = 0, FrameGeneration = 1, Remote = 2 };
+	static constexpr uint32_t kRings = 3;
 	bool use_ring(Ring ring) noexcept
 	{
 		if (list_open_)

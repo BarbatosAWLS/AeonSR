@@ -49,7 +49,9 @@ struct NgxRuntimeD3D12 : NgxSession {
 		D3D12_RESOURCE_STATES backbuffer_state,
 		ID3D12Resource *motion_vectors,
 		ID3D12Resource *depth,
-		ID3D12Resource *bias_mask);
+		ID3D12Resource *bias_mask,
+		ID3D12Resource *output = nullptr,
+		D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_COMMON);
 
 	bool ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w, uint32_t h, DXGI_FORMAT color_format);
 	void destroy_feature();

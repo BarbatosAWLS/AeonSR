@@ -59,6 +59,15 @@ void engine_journal_dump() noexcept
 	}
 }
 
+bool reads_like_copy12(ID3D12Resource *res, DXGI_FORMAT as) noexcept
+{
+	if (res == nullptr)
+		return false;
+	const D3D12_RESOURCE_DESC d = res->GetDesc();
+	return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 &&
+		d.DepthOrArraySize == 1 && (d.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 && d.Format == as;
+}
+
 void barrier12(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
 	D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
 {
@@ -363,7 +372,8 @@ BlitPipelineD3D12::PsoPair *BlitPipelineD3D12::prepare_draw(ID3D12Device *device
 bool BlitPipelineD3D12::draw_fullscreen(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	ID3D12Resource *effect,
 	ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h,
-	float sharpness, uint32_t debug_mode, float jitter_u, float jitter_v, const float *valid_uv, bool catmull_rom)
+	float sharpness, uint32_t debug_mode, float jitter_u, float jitter_v, const float *valid_uv, bool catmull_rom,
+	const D3D12_RECT *scissor)
 {
 	if (!ensure(device) || cmd == nullptr || effect == nullptr || dst == nullptr)
 		return false;
@@ -371,6 +381,8 @@ bool BlitPipelineD3D12::draw_fullscreen(ID3D12Device *device, ID3D12GraphicsComm
 	PsoPair *const pair = prepare_draw(device, cmd, effect, nullptr, nullptr, nullptr, dst, dst_format, dst_w, dst_h);
 	if (pair == nullptr)
 		return false;
+	if (scissor != nullptr)
+		cmd->RSSetScissorRects(1, scissor);
 
 	const float constants[kBlitConstantCount] = {
 		0.0f, 0.0f,

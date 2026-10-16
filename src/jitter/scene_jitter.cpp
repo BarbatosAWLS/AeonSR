@@ -50,8 +50,8 @@ bool scene_bound(const JitterListState &s, const JitterArm &arm) noexcept
 	if (arm.reach == JitterReach::SceneTargets) {
 		const bool sized = s.target != 0 && scene_sized(arm, s.target_w, s.target_h);
 		if (into_back_buffer || (s.target != 0 && s.target_window))
-			return (scene_depth && (s.depth_test || !s.scene_tested)) || (arm.move_window && sized);
-		return scene_depth || (arm.scene_targets && s.target_scene && sized) || (arm.size_targets && sized);
+			return (scene_depth && (s.depth_test || (!s.scene_tested && s.sky_first))) || (arm.move_window && sized);
+		return scene_depth || (arm.scene_targets && s.target_scene && sized) || (arm.size_targets && sized && !s.layer);
 	}
 	return scene_depth && s.depth_test && !into_back_buffer;
 }
@@ -185,6 +185,8 @@ JitterArm disarmed(const JitterArm &arm) noexcept
 	kept.tested_quads = arm.tested_quads;
 	kept.scene_quads = arm.scene_quads;
 	kept.depth_regrid = arm.depth_regrid;
+	kept.layers = arm.layers;
+	kept.depth_proven = arm.depth_proven;
 	kept.back_buffer = arm.back_buffer;
 	kept.back_buffer_count = arm.back_buffer_count;
 	for (uint32_t i = 0; i < arm.back_buffer_count; ++i)
@@ -235,16 +237,18 @@ void count_moved_draws(JitterDrawCounts &c, uint64_t serial, uint32_t n) noexcep
 	c.overflow += n;
 }
 
-void count_scene_draw(JitterDrawCounts &c, uint64_t bound_serial, bool aliased) noexcept
+void count_scene_draw(JitterDrawCounts &c, uint64_t bound_serial, bool aliased, uint32_t n) noexcept
 {
+	if (n == 0)
+		return;
 	if (bound_serial == 0) {
-		++c.plain;
+		c.plain += n;
 		if (aliased)
-			++c.plain_aliased;
+			c.plain_aliased += n;
 	} else
-		count_moved_draws(c, bound_serial);
+		count_moved_draws(c, bound_serial, n);
 	if (aliased)
-		++c.aliased;
+		c.aliased += n;
 }
 
 namespace {
@@ -292,9 +296,12 @@ void add_draw_counts(JitterDrawCounts &into, const JitterDrawCounts &from) noexc
 	into.plain_aliased += from.plain_aliased;
 	into.by_target += from.by_target;
 	into.depth_draws += from.depth_draws;
+	into.depth_tested += from.depth_tested;
 	into.outside_draws += from.outside_draws;
 	into.interface_kept += from.interface_kept;
 	into.interface_kept_outside += from.interface_kept_outside;
+	for (uint32_t i = 0; i < kJitterProofWhyCount; ++i)
+		into.proof_why[i] += from.proof_why[i];
 	into.all_draws += from.all_draws;
 	into.quads_moved += from.quads_moved;
 	into.quads_kept += from.quads_kept;
@@ -318,9 +325,12 @@ JitterDrawCounts replayed_draw_counts(const JitterDrawCounts &c) noexcept
 	r.plain_aliased = c.plain_aliased;
 	r.by_target = c.by_target;
 	r.depth_draws = c.depth_draws;
+	r.depth_tested = c.depth_tested;
 	r.outside_draws = c.outside_draws;
 	r.interface_kept = c.interface_kept;
 	r.interface_kept_outside = c.interface_kept_outside;
+	for (uint32_t i = 0; i < kJitterProofWhyCount; ++i)
+		r.proof_why[i] = c.proof_why[i];
 	r.all_draws = c.all_draws;
 	r.quads_kept = c.quads_kept;
 	r.replayed = c.replayed + c.overflow;
@@ -429,9 +439,76 @@ void jitter_on_depth_test(JitterListState &s, bool enabled) noexcept
 	s.depth_test = enabled;
 }
 
-bool jitter_move_all(bool was_on, const JitterFrame &frame) noexcept
+bool jitter_move_all(bool was_on, const JitterFrame &frame, bool depth_proven) noexcept
 {
+	if (depth_proven)
+		return false;
 	return frame.empty || (was_on && frame.depth_draws == 0 && frame.outside_draws == 0);
+}
+
+bool jitter_interface_alone(const JitterFrame &frame, bool depth_proven) noexcept
+{
+	return depth_proven && frame.empty && frame.all_draws != 0 && frame.plain == 0 && frame.replayed == 0 &&
+		frame.depth_draws == 0 && frame.outside_draws == 0;
+}
+
+bool JitterDepthProof::arm(bool by_depth, uint32_t w, uint32_t h, const JitterFrame &drawn) noexcept
+{
+	if (by_depth && w != 0 && h != 0 && drawn.depth_tested != 0) {
+		proven_w = w;
+		proven_h = h;
+	}
+	armed_proven = by_depth && proven_w != 0 && proven_w == w && proven_h == h;
+	return armed_proven;
+}
+
+void JitterSceneSize::find(uint64_t scene_depth, uint32_t sel_w, uint32_t sel_h, uint32_t dw, uint32_t dh,
+	const JitterFrame &drawn, uint32_t cw, uint32_t ch) noexcept
+{
+	by_depth = false;
+	const bool window_selected = scene_depth != 0 && sel_w == dw && sel_h == dh;
+	const bool other_shape = cw != 0 && ch != 0 && (cw != dw || ch != dh);
+	if (by_composite && !(window_selected && other_shape && cw == comp_w && ch == comp_h && dw == comp_dw &&
+			dh == comp_dh))
+		by_composite = false;
+	if (!by_composite && window_selected && other_shape && drawn.depth_tested == 0 &&
+		drawn.other_depth_w == cw && drawn.other_depth_h == ch && drawn.other_depth_draws >= kJitterLearnDraws) {
+		by_composite = true;
+		comp_w = cw;
+		comp_h = ch;
+		comp_dw = dw;
+		comp_dh = dh;
+	}
+	if (by_composite) {
+		w = comp_w;
+		h = comp_h;
+		return;
+	}
+	if (learned_dw != dw || learned_dh != dh || scene_depth != 0) {
+		learned_w = learned_h = 0;
+		learned_dw = dw;
+		learned_dh = dh;
+	}
+	if (scene_depth != 0) {
+		w = depth_w = sel_w;
+		h = depth_h = sel_h;
+		depth_dw = dw;
+		depth_dh = dh;
+		by_depth = true;
+		return;
+	}
+	(void)jitter_learn_scene_size(drawn, dw, dh, &learned_w, &learned_h);
+	if (learned_w != 0) {
+		w = learned_w;
+		h = learned_h;
+	} else if (depth_w != 0 && depth_dw == dw && depth_dh == dh) {
+		w = depth_w;
+		h = depth_h;
+		by_depth = true;
+	} else {
+		w = dw;
+		h = dh;
+	}
 }
 
 bool jitter_draw_into_window(const JitterListState &s, const JitterArm &arm) noexcept
@@ -631,9 +708,22 @@ void SceneJitter::stop_now() noexcept
 	pending_ = JitterArm{};
 	pending_set_ = false;
 	in_frame_.store(false);
+	frame_image_.store(0);
+	promoted_forced_.store(false);
 	scene_known_.store(false);
 	frame_.fetch_add(1);
 	version_.fetch_add(1);
+}
+
+bool SceneJitter::scene_tested_in_frame(uint64_t serial, bool on_list) const noexcept
+{
+	if (!scene_tested(serial))
+		return false;
+	if (!lags_.load())
+		return true;
+	if (!frames_delimited())
+		return on_list;
+	return scene_tested_boundary_.load(std::memory_order_relaxed) == boundaries_.load();
 }
 
 void SceneJitter::set_present_lags(bool lags) noexcept
@@ -666,18 +756,65 @@ void SceneJitter::note_presented(uint64_t target) noexcept
 
 void SceneJitter::note_presentation() noexcept
 {
-	const uint64_t from = last_pass_target_.load(std::memory_order_relaxed);
+	note_presentation_from(last_pass_target_.load(std::memory_order_relaxed));
+}
+
+void SceneJitter::note_presentation_from(uint64_t from, bool composite) noexcept
+{
 	if (from == 0 || presented_target(from))
 		return;
 	uint32_t seen = 0;
 	{
 		const std::lock_guard<std::mutex> lock(presentation_lock_);
+		uint64_t *const history = composite ? composite_seen_ : presentations_;
+		uint32_t &next = composite ? composite_seen_next_ : presentation_next_;
 		for (uint32_t i = 0; i < kPresentedHistory; ++i)
-			seen += presentations_[i] == from ? 1u : 0u;
-		presentations_[presentation_next_++ % kPresentedHistory] = from;
+			seen += history[i] == from ? 1u : 0u;
+		history[next++ % kPresentedHistory] = from;
 	}
-	if (seen != 0)
+	if (seen == 0)
+		return;
+	if (!composite) {
 		note_presented(from);
+		return;
+	}
+	composite_[composite_next_.fetch_add(1, std::memory_order_relaxed) % kJitterPresentedTargets].store(from,
+		std::memory_order_release);
+	for (uint32_t i = 0; i < kJitterSceneTargets; ++i) {
+		uint64_t t = from;
+		scene_targets_[i].compare_exchange_strong(t, 0, std::memory_order_acq_rel);
+	}
+}
+
+void SceneJitter::forget_composite(uint64_t target) noexcept
+{
+	if (target == 0)
+		return;
+	for (uint32_t i = 0; i < kJitterPresentedTargets; ++i) {
+		uint64_t t = target;
+		composite_[i].compare_exchange_strong(t, 0, std::memory_order_acq_rel);
+	}
+	const std::lock_guard<std::mutex> lock(presentation_lock_);
+	for (uint64_t &p : composite_seen_)
+		if (p == target)
+			p = 0;
+}
+
+void SceneJitter::note_composite_size(uint64_t from, uint32_t w, uint32_t h) noexcept
+{
+	if (from != 0 && w != 0 && h != 0 && composite_window(from))
+		composite_size_.store((static_cast<uint64_t>(w) << 32) | h, std::memory_order_release);
+}
+
+bool SceneJitter::composite_window(uint64_t target) const noexcept
+{
+	if (target == 0)
+		return false;
+	for (uint32_t i = 0; i < kJitterPresentedTargets; ++i) {
+		if (composite_[i].load(std::memory_order_acquire) == target)
+			return true;
+	}
+	return false;
 }
 
 bool SceneJitter::presented_target(uint64_t target) const noexcept
@@ -688,7 +825,7 @@ bool SceneJitter::presented_target(uint64_t target) const noexcept
 		if (presented_[i].load(std::memory_order_acquire) == target)
 			return true;
 	}
-	return false;
+	return composite_window(target);
 }
 
 void SceneJitter::forget_target(uint64_t resource) noexcept
@@ -702,6 +839,8 @@ void SceneJitter::forget_target(uint64_t resource) noexcept
 	for (uint32_t i = 0; i < kJitterPresentedTargets; ++i) {
 		uint64_t t = resource;
 		presented_[i].compare_exchange_strong(t, 0, std::memory_order_acq_rel);
+		t = resource;
+		composite_[i].compare_exchange_strong(t, 0, std::memory_order_acq_rel);
 	}
 }
 
@@ -732,11 +871,16 @@ void SceneJitter::forget_scene_targets() noexcept
 {
 	for (uint32_t i = 0; i < kJitterSceneTargets; ++i)
 		scene_targets_[i].store(0, std::memory_order_release);
-	for (uint32_t i = 0; i < kJitterPresentedTargets; ++i)
+	for (uint32_t i = 0; i < kJitterPresentedTargets; ++i) {
 		presented_[i].store(0, std::memory_order_release);
+		composite_[i].store(0, std::memory_order_release);
+	}
+	composite_size_.store(0, std::memory_order_release);
 	last_pass_target_.store(0, std::memory_order_relaxed);
 	const std::lock_guard<std::mutex> lock(presentation_lock_);
 	for (uint64_t &p : presentations_)
+		p = 0;
+	for (uint64_t &p : composite_seen_)
 		p = 0;
 }
 
@@ -744,12 +888,19 @@ void SceneJitter::watch_swapchain(const uint64_t *images, uint32_t count) noexce
 {
 	forget_sizes();
 	forget_scene_targets();
+	frame_image_.store(0);
 	std::unique_lock<std::shared_mutex> lock(lock_);
 	swapchain_count_ = 0;
 	for (uint32_t i = 0; images != nullptr && i < count && swapchain_count_ < kJitterBackBuffers; ++i) {
 		if (images[i] != 0)
 			swapchain_[swapchain_count_++] = images[i];
 	}
+}
+
+bool SceneJitter::swapchain_watched() const noexcept
+{
+	std::shared_lock<std::shared_mutex> lock(lock_);
+	return swapchain_count_ != 0;
 }
 
 bool SceneJitter::swapchain_image(uint64_t resource) const noexcept
@@ -775,25 +926,42 @@ void SceneJitter::note_render_pass(uint64_t target, bool depth) noexcept
 {
 	if (!lags_.load())
 		return;
+	const bool chain = swapchain_image(target);
 	if (!depth) {
-		if (swapchain_image(target))
+		if (chain) {
+			frame_image_.store(target);
 			in_frame_.store(false);
+		}
 		return;
 	}
+	if (chain && frame_image_.load() == target)
+		return;
 	if (in_frame_.exchange(true))
 		return;
 	boundaries_.fetch_add(1);
 	std::unique_lock<std::shared_mutex> lock(lock_);
-	if (pending_set_)
+	if (pending_set_) {
 		++promotions_.at_boundary;
+		promoted_forced_.store(false, std::memory_order_relaxed);
+	}
 	promote_locked();
+}
+
+void SceneJitter::note_chain_written(uint64_t target) noexcept
+{
+	if (!lags_.load() || !swapchain_image(target))
+		return;
+	frame_image_.store(target);
+	in_frame_.store(false);
 }
 
 void SceneJitter::promote_now(bool forced) noexcept
 {
 	std::unique_lock<std::shared_mutex> lock(lock_);
-	if (pending_set_)
+	if (pending_set_) {
 		++(forced ? promotions_.forced : promotions_.between_frames);
+		promoted_forced_.store(forced, std::memory_order_relaxed);
+	}
 	promote_locked();
 }
 
@@ -988,9 +1156,12 @@ JitterFrame SceneJitter::take_frame() noexcept
 
 	f.by_target = c.by_target;
 	f.depth_draws = c.depth_draws;
+	f.depth_tested = c.depth_tested;
 	f.outside_draws = c.outside_draws;
 	f.interface_kept = c.interface_kept;
 	f.interface_kept_outside = c.interface_kept_outside;
+	for (uint32_t i = 0; i < kJitterProofWhyCount; ++i)
+		f.proof_why[i] = c.proof_why[i];
 	f.all_draws = c.all_draws;
 	f.quads_moved = c.quads_moved;
 	f.quads_kept = c.quads_kept;
@@ -1373,6 +1544,12 @@ bool parse_jitter_fault(const std::string &text, JitterFault *out)
 			f.game_jitter_still = true;
 		else if (name == "game_jitter_forget" && value.empty())
 			f.game_jitter_forget = true;
+		else if (name == "game_jitter_assume" && value.empty())
+			f.game_jitter_assume = true;
+		else if (name == "withheld_no_restore" && value.empty())
+			f.withheld_no_restore = true;
+		else if (name == "withheld_no_fill" && value.empty())
+			f.withheld_no_fill = true;
 		else if (name == "told_sign_x" && value.empty())
 			f.told_sign_x = -1.0f;
 		else if (name == "told_sign_x" && fault_number(value, &v) && std::fabs(v) <= 8.0)
@@ -1412,6 +1589,12 @@ std::string jitter_fault_text(const JitterFault &f)
 		add("game_jitter_still", "", 0.0);
 	if (f.game_jitter_forget)
 		add("game_jitter_forget", "", 0.0);
+	if (f.game_jitter_assume)
+		add("game_jitter_assume", "", 0.0);
+	if (f.withheld_no_restore)
+		add("withheld_no_restore", "", 0.0);
+	if (f.withheld_no_fill)
+		add("withheld_no_fill", "", 0.0);
 	return s.empty() ? "none" : s;
 }
 
@@ -1419,7 +1602,8 @@ bool jitter_fault_any(const JitterFault &f) noexcept
 {
 	return f.told_lag || f.told_drop_at >= 0 || f.draw_drop_every != 0 || f.upscale_drop_every != 0 ||
 		f.odd_told_scale != 1.0f ||
-		f.draw_scale != 1.0f || f.told_sign_x != 1.0f || f.game_jitter_still || f.game_jitter_forget;
+		f.draw_scale != 1.0f || f.told_sign_x != 1.0f || f.game_jitter_still || f.game_jitter_forget ||
+		f.game_jitter_assume || f.withheld_no_restore || f.withheld_no_fill;
 }
 
 bool jitter_fault_hit(uint32_t every, uint32_t frame) noexcept

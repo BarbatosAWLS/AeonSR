@@ -733,6 +733,116 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 	}
 }
 
+#if AEONSR_FRAME_GENERATION
+void draw_framegen_section(const PanelState &state, Settings &settings, PanelActions &actions)
+{
+	if (ui::toggle("Frame generation", &settings.frame_generation))
+		actions.persist = true;
+	hint("Adds frames made from the game's own for smoother motion.\n"
+		"Costs a little input delay; moving edges can shimmer slightly.");
+
+	const FrameGenReadout &f = state.framegen;
+	const bool running = settings.frame_generation && f.generating;
+	static const RowOption kGeneratorOptions[] = {
+		{ "AeonSR", "Runs on any graphics card, at any multiplier", ui::Brand::Neutral },
+		{ "FSR", "AMD's frame generation. Runs on any graphics card, up to 2x", ui::Brand::Amd },
+		{ "XeSS", "Intel's frame generation. Runs on any graphics card, up to 2x", ui::Brand::Intel },
+		{ "DLSS", "NVIDIA's frame generation. GeForce RTX 40 up to 2x, RTX 50 up to 6x", ui::Brand::Nvidia },
+	};
+	if (button_row_index<kFrameGeneratorCount>("Generator", &settings.frame_generator, kGeneratorOptions,
+			"Which frame generation makes the frames.\n"
+			"If the one chosen cannot run, AeonSR's is used and the panel says why.", false, running))
+		actions.persist = true;
+
+	static const RowOption kMultiplyOptions[] = {
+		{ "Auto", "As many frames as the screen's refresh has room for, none when the game is as fast" },
+		{ "2x", nullptr }, { "3x", nullptr }, { "4x", nullptr }, { "5x", nullptr }, { "6x", nullptr },
+	};
+	static const unsigned int kMultiplyValues[] = { 0u, 2u, 3u, 4u, 5u, 6u };
+	static_assert(IM_ARRAYSIZE(kMultiplyValues) == static_cast<int>(kFrameGenerationMultiplierMax),
+		"the row must offer Auto and every multiplier up to kFrameGenerationMultiplierMax");
+	if (button_row_value("Multiply by", &settings.frame_generation_multiplier, kMultiplyOptions, kMultiplyValues,
+			"Frames shown for every real one. The screen still shows at most its refresh rate.",
+			running && !f.through_game_present))
+		actions.persist = true;
+	if (running && f.through_game_present)
+		note("2x here: the frames go through the game's own present");
+	if (running && f.own_window && f.own_asked >= 2 && f.own_steps_max >= 1 && f.own_asked > f.own_steps_max)
+		note("%s goes up to %ux here", frame_generator_label(f.generator), f.own_steps_max);
+
+	int limit = static_cast<int>(settings.frame_generation_limit);
+	if (ui::slider_int("Frame rate limit", &limit, 0, 240, limit == 0 ? "Off" : "%d fps")) {
+		settings.frame_generation_limit = static_cast<unsigned int>(std::clamp(limit, 0, 240));
+	}
+	if (ImGui::IsItemDeactivatedAfterEdit())
+		actions.persist = true;
+	if (running && f.own_window && f.even_cap_fps != 0) {
+		char cap[160];
+		std::snprintf(cap, sizeof cap, "Caps the game's real frames.\nAt %u fps motion is even on this %.0f Hz screen.",
+			f.even_cap_fps, f.screen_hz);
+		hint(cap);
+	} else {
+		hint("Caps the game's real frames. A cap that divides the screen's refresh\n"
+			"(30 or 20 fps on 60 Hz, 25 on 75 Hz) gives the most even motion.");
+	}
+
+	if (settings.frame_generation) {
+		if (!f.status.empty())
+			line("%s", narrow_lossy(f.status).c_str());
+		if (f.real_fps > 0.0) {
+			if (f.own_window && f.added_latency_ms > 0.0)
+				line("Real %.0f fps, shown %.0f fps, +%.0f ms delay", f.real_fps, f.shown_fps, f.added_latency_ms);
+			else
+				line("Real %.0f fps, shown %.0f fps", f.real_fps, f.shown_fps);
+			std::string more;
+			char b[256];
+			if (f.generating && f.own_window && f.own_steps == 1) {
+				more += "Nothing made: the game is as fast as the screen.";
+			} else if (f.generating) {
+				std::snprintf(b, sizeof b, "Made by %s%s%s", frame_generator_label(f.generator),
+					f.generator_version.empty() ? "" : " ", narrow_lossy(f.generator_version).c_str());
+				more += b;
+				if (f.own_window && f.own_steps >= 2)
+					std::snprintf(b, sizeof b, " at %ux%s.", f.own_steps, f.own_auto ? " (Auto)" : "");
+				else if (f.own_window)
+					std::snprintf(b, sizeof b, " at every refresh (Auto).");
+				else
+					std::snprintf(b, sizeof b, ".");
+				more += b;
+			}
+			if (f.own_window && f.screen_latency_ms > 0.0 && f.added_latency_ms > 0.0) {
+				std::snprintf(b, sizeof b, "\nA real frame reaches the screen %.0f ms after the game presents it;\n"
+					"%.0f ms of that is frame generation.", f.screen_latency_ms, f.added_latency_ms);
+				more += b;
+			}
+			if (f.own_window)
+				more += "\nReShade's own FPS counter and screenshots see the real frames only.";
+			if (!f.route.empty())
+				more += "\nPresented with " + f.route + ".";
+			if (!more.empty())
+				hint(more.c_str());
+		}
+	}
+
+	ui::subsection("Pacing and latency");
+	if (ui::toggle("Even frame pacing", &settings.pace_to_display))
+		actions.persist = true;
+	hint("When the game runs a little faster than the screen (up to 2.5x its refresh),\n"
+		"shows one frame per refresh so motion is even. Frame generation paces its own frames.");
+
+	static const RowOption kLatencyOptions[] = {
+		{ "Off", "Frames start when the game starts them", ui::Brand::Neutral },
+		{ "AeonSR", "AeonSR's own: the frame waits before the game reads your input, not after.\n"
+			"Any graphics card", ui::Brand::Neutral },
+		{ "Reflex", "NVIDIA Reflex, on every graphics API. Needs a GeForce card;\n"
+			"elsewhere AeonSR's own is used", ui::Brand::Nvidia },
+	};
+	if (button_row_index<3>("Low latency", &settings.low_latency, kLatencyOptions,
+			"Less delay between your input and the screen. Frame generation, when on, paces its own frames."))
+		actions.persist = true;
+}
+#endif
+
 void draw_experiments_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	ui::subsection("Upscaler input");
@@ -758,6 +868,74 @@ void draw_experiments_section(const PanelState &state, Settings &settings, Panel
 	}
 	if (upscaler_off(settings))
 		note("Needs an upscaler on (Temporal Anti-Aliasing).");
+	const GameScaleVerdict verdict = state.game_scale_verdict;
+	const bool wrong_api = verdict == GameScaleVerdict::WrongApi;
+	{
+		const ui::Dim dim(upscaler_off(settings) || wrong_api);
+		bool scale_on = settings.game_render_scale;
+		if (ui::toggle("Use the game's render scale", &scale_on) && (!wrong_api || !scale_on)) {
+			settings.game_render_scale = scale_on;
+			actions.reset = true;
+			actions.invalidate_history = true;
+			actions.persist = true;
+		}
+		if (state.game_integrated)
+			hint("The game really draws a smaller picture, at the size Mode above asks for:\n"
+				"Aeon SR sets the game's own image quality, and the upscaler brings the picture\n"
+				"back to full size. The game's interface stays at full resolution.\n"
+				"Off, the game draws at its own setting.");
+		else
+			hint("For games with their own render scale (image quality, resolution scale):\n"
+				"lower it in the game and the game really draws a smaller picture, so it runs\n"
+				"faster, and the upscaler brings it back to full size. The game's interface\n"
+				"stays at full resolution. Mode above has no effect while this is in use.");
+	}
+	if (state.game_integrated) {
+		if (!settings.game_render_scale)
+			note("%s is supported: turn this on and Mode above sets the game's own image quality.",
+				state.game_title.c_str());
+		else if (upscaler_off(settings))
+			note("%s: with no upscaler on, the game draws at its own setting.", state.game_title.c_str());
+		else if (state.game_scale_render_w == 0 && !state.game_note.empty())
+			note("%s: %s.", state.game_title.c_str(), narrow_lossy(state.game_note).c_str());
+		else
+			note("%s: the game itself draws at the size Mode asks for.", state.game_title.c_str());
+		if (settings.game_render_scale && state.game_scale_render_w != 0)
+			note("Drawn at %ux%u, brought to %ux%u by the upscaler.", state.game_scale_render_w,
+				state.game_scale_render_h, state.game_scale_w, state.game_scale_h);
+	} else {
+		if (!state.game_title.empty())
+			note("%s: its render scale is left to the game (%s).", state.game_title.c_str(),
+				narrow_lossy(state.game_note).c_str());
+		switch (verdict) {
+		case GameScaleVerdict::WrongApi:
+			note("Not supported in this game: it runs on %s, and this works only in Direct3D 10 and 11 games.",
+				state.api_name != nullptr ? state.api_name : "another graphics API");
+			break;
+		case GameScaleVerdict::Working:
+		case GameScaleVerdict::Idle:
+			if (state.game_scale_render_w != 0 && state.game_scale_render_w < state.game_scale_w)
+				note("Working: the game draws at %ux%u; the upscaler brings it to %ux%u.", state.game_scale_render_w,
+					state.game_scale_render_h, state.game_scale_w, state.game_scale_h);
+			else if (state.game_scale_render_w != 0)
+				note("Working, at the game's 100%%: lower its own render scale to make it draw less.");
+			else
+				note("Supported in this game; not in use on this screen (menus and loading screens).");
+			break;
+		case GameScaleVerdict::Looking:
+			note("Looking for the game's render scale. Play for a moment with it below 100%%.");
+			break;
+		case GameScaleVerdict::OtherCorner:
+			note("Not supported in this game: it shrinks a picture, but not the one it draws the scene in.");
+			break;
+		case GameScaleVerdict::NotFound:
+			note("Not supported in this game: in 30 s of play it never drew a smaller picture to stretch. "
+				"(At 100%% of its own render scale a game draws none: lower it first.)");
+			break;
+		case GameScaleVerdict::Off:
+			break;
+		}
+	}
 
 	ui::subsection("Neural screenshot (DLSS 5)");
 	{
@@ -1105,8 +1283,9 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 	} else if (state.jitter_in_frame) {
 		note("Jitter: drawn into the game, %u of %u draws moved",
 			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws);
-	} else if (settings.spatial_jitter && state.jitter_withheld && !state.jitter_active) {
-		note("Jitter: on, not drawn - the game jitters its own frame");
+	} else if (settings.spatial_jitter && state.jitter_withheld) {
+		note(state.jitter_active ? "Jitter: on, not drawn - the game jitters its own frame, resampled as it is scaled down"
+			: "Jitter: on, not drawn - the game jitters its own frame");
 	} else if (settings.spatial_jitter && !state.jitter_refused && !state.jitter_active) {
 		note("Jitter: on, idle this frame");
 	} else if (settings.spatial_jitter && !state.jitter_refused && state.jitter_note[0] != '\0') {
@@ -1255,7 +1434,7 @@ void draw_taa_section(const PanelState &state, Settings &settings, PanelActions 
 	}
 	hint("Turns the upscaler on. Neural rendering has its own switch.");
 
-	if (button_row_index<kBackendChoiceCount>("Upscaler", &settings.backend, kBackendOptions,
+	if (button_row_index<kBackendChoiceCount>("##upscaler", &settings.backend, kBackendOptions,
 			"Which upscaler to use.", true, upscaler_lit(state, settings))) {
 		actions.persist = true;
 		actions.reset = true;
@@ -1307,6 +1486,21 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 		draw_neural_section(state, settings, actions);
 		ui::section_end();
 	}
+#if AEONSR_FRAME_GENERATION
+	static const char *const kFgShort[kFrameGeneratorCount] = { "AeonSR", "FSR", "XeSS", "DLSS" };
+	const FrameGenerator fg_maker = settings.frame_generation && state.framegen.generating ? state.framegen.generator
+		: static_cast<FrameGenerator>(settings.frame_generator);
+	const ui::Brand fg_brand = fg_maker == FrameGenerator::Dlss ? ui::Brand::Nvidia
+		: fg_maker == FrameGenerator::Fsr ? ui::Brand::Amd
+		: fg_maker == FrameGenerator::Xess ? ui::Brand::Intel : ui::Brand::Neutral;
+	if (ui::section("Frame generation (experimental)", ui::icon::kFrames, "Frame generation (experimental)", false,
+			nullptr, nullptr, settings.frame_generation ? kFgShort[static_cast<unsigned int>(fg_maker) % kFrameGeneratorCount]
+				: nullptr, fg_brand,
+			settings.frame_generation && state.framegen.generating, true)) {
+		draw_framegen_section(state, settings, actions);
+		ui::section_end();
+	}
+#endif
 	if (ui::section("Experiments", ui::icon::kExperiments, "Experiments", false)) {
 		draw_experiments_section(state, settings, actions);
 		ui::section_end();

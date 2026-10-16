@@ -8,21 +8,22 @@ packages copy each vendor's licence into `Licenses/`.
 
 ---
 
-## AMD FidelityFX: `amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_loader_dx12.dll`
+## AMD FidelityFX: `amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_framegeneration_dx12.dll`
 
-Shipped in the release packages, unmodified. Both files are AMD's own signed
+Shipped in the release packages, unmodified. All three files are AMD's own signed
 binaries from the AMD FidelityFX SDK v2.3.0 (submodule `external/FidelityFX-SDK`,
 `Kits/FidelityFX/signedbin/`,
 <https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.3.0>). The
 SDK's `docs/license.md`, packaged as `Licenses/AMD_FidelityFX_LICENSE.md`, lists
-both files under the MIT licence below.
+all three under the MIT licence below.
 
 | File | SHA-256 (first 16) |
 | --- | --- |
 | `amd_fidelityfx_upscaler_dx12.dll` | `D0DCCCC74A43C44B` |
 | `amd_fidelityfx_loader_dx12.dll` | `E2D85AA05A9BD9ED` |
+| `amd_fidelityfx_framegeneration_dx12.dll` | `02297BEEDD285E82` |
 
-The FidelityFX API headers in `third_party/ffx/include` and the FidelityFX DX11
+The FidelityFX API and frame generation headers in `third_party/ffx/include` and the FidelityFX DX11
 headers in `third_party/ffx_dx11/include` (from
 <https://github.com/optiscaler/FidelityFX-SDK-DX11>) are under the same licence
 and keep AMD's notice in each file.
@@ -51,15 +52,15 @@ places in `runtime/fsr4-int8/`. Such builds (for example community FSR 4 INT8
 builds) are not included, are not covered by the licence above, and are used at
 the user's own risk.
 
-## NVIDIA DLSS SDK: `nvngx_dlss.dll`, NGX headers, `nvsdk_ngx_s.lib`
+## NVIDIA DLSS SDK: `nvngx_dlss.dll`, `nvngx_dlssg.dll`, NGX headers, `nvsdk_ngx_s.lib`
 
 From the NVIDIA DLSS SDK, <https://github.com/NVIDIA/DLSS> (tag `v310.9.1`),
 submodule `external/DLSS`. The headers and `nvsdk_ngx_s.lib` are used to build the
-add-on; `nvngx_dlss.dll` is shipped unmodified in the release packages as part of
-Aeon SR. They are governed by the **NVIDIA RTX SDKs License** that accompanies the
+add-on; `nvngx_dlss.dll` and `nvngx_dlssg.dll` (DLSS Frame Generation) are shipped
+unmodified in the release packages as part of Aeon SR. They are governed by the **NVIDIA RTX SDKs License** that accompanies the
 SDK as `LICENSE.txt`, packaged as `Licenses/NVIDIA_DLSS_LICENSE.txt`.
 
-This application uses **NVIDIA DLSS** and the **NVIDIA NGX SDK**. NVIDIA, NVIDIA
+This application uses **NVIDIA DLSS**, **NVIDIA DLSS Frame Generation** and the **NVIDIA NGX SDK**. NVIDIA, NVIDIA
 RTX and NVIDIA GeForce RTX are trademarks and/or registered trademarks of NVIDIA
 Corporation in the United States and other countries.
 
@@ -73,7 +74,7 @@ community build, at their own risk (see `README.md`).
 `src/ngx/ngx_shim.cpp`, built as `ngxshim/nvngx.dll`, is Aeon SR's own code, not
 NVIDIA's.
 
-## Intel XeSS: `libxess.dll`, `libxess_dx11.dll`
+## Intel XeSS: `libxess.dll`, `libxess_dx11.dll`, `libxess_fg.dll`, `libxell.dll`
 
 Shipped unmodified in the release packages, from the Intel XeSS SDK,
 <https://github.com/intel/xess> (tag `v3.0.2`), submodule `external/xess`.
@@ -81,7 +82,8 @@ Copyright (c) Intel Corporation, distributed under the **Intel Simplified Softwa
 License (Version October 2022)**, packaged as `Licenses/Intel_XeSS_LICENSE.txt`.
 
 The declarations in `third_party/xess/include` are Aeon SR's own, written against
-the public XeSS API.
+the public XeSS API. The XeSS Frame Generation and XeLL headers are not in this
+repository: the build reads them from the SDK submodule (`external/xess/inc`).
 
 ## ReShade
 

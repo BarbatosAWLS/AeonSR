@@ -337,6 +337,110 @@ std::string neural_kernels_cards(const NeuralRuntimeKernels &kernels)
 	return out;
 }
 
+namespace {
+
+std::vector<NeuralModelEntry> models_in(const unsigned char *b, size_t size)
+{
+	std::vector<NeuralModelEntry> out;
+	if (size < 0x40u || b[0] != 'M' || b[1] != 'Z')
+		return out;
+	const uint32_t pe = rd32(b + 0x3C);
+	if (pe > size - 24u || rd32(b + pe) != 0x00004550u)
+		return out;
+	const size_t opt = pe + 24u;
+	if (size - opt < 32u || rd16(b + opt) != 0x20Bu)
+		return out;
+	const uint64_t base = rd64(b + opt + 24u);
+	const size_t table = opt + rd16(b + pe + 20u);
+	struct Section {
+		char name[9] = {};
+		uint32_t va = 0, vsize = 0, raw = 0, rawsize = 0;
+	};
+	std::vector<Section> sections;
+	for (uint32_t i = 0; i < rd16(b + pe + 6u); ++i) {
+		const size_t s = table + 40u * i;
+		if (s > size || size - s < 40u)
+			return out;
+		Section x;
+		memcpy(x.name, b + s, 8);
+		x.vsize = rd32(b + s + 8);
+		x.va = rd32(b + s + 12);
+		x.rawsize = rd32(b + s + 16);
+		x.raw = rd32(b + s + 20);
+		if (x.raw > size || x.rawsize > size - x.raw)
+			return out;
+		sections.push_back(x);
+	}
+	const auto offset_of = [&](uint64_t va) -> size_t {
+		if (va < base)
+			return SIZE_MAX;
+		const uint64_t rva = va - base;
+		for (const Section &s : sections) {
+			if (rva >= s.va && rva - s.va < s.rawsize)
+				return static_cast<size_t>(s.raw + (rva - s.va));
+		}
+		return SIZE_MAX;
+	};
+	const auto text_at = [&](uint64_t va, std::string *text) {
+		const size_t at = offset_of(va);
+		if (at == SIZE_MAX)
+			return false;
+		text->clear();
+		for (size_t i = at; i < size && i - at < 200u; ++i) {
+			if (b[i] == 0u)
+				return !text->empty();
+			if (b[i] < 0x20u || b[i] > 0x7Eu)
+				return false;
+			text->push_back(static_cast<char>(b[i]));
+		}
+		return false;
+	};
+	const Section *rdata = nullptr;
+	for (const Section &s : sections) {
+		if (strcmp(s.name, ".rdata") == 0)
+			rdata = &s;
+	}
+	if (rdata == nullptr)
+		return out;
+	const unsigned char *const lo = b + rdata->raw;
+	const unsigned char *const hi = lo + rdata->rawsize;
+	static const char kType[] = "WEIGHTS_";
+	std::vector<std::pair<size_t, NeuralModelEntry>> found;
+	for (const unsigned char *p = lo + 1; p + sizeof(kType) <= hi; ++p) {
+		p = std::search(p, hi, kType, kType + sizeof(kType) - 1);
+		if (p == hi)
+			break;
+		if (p[-1] != 0u)
+			continue;
+		const uint64_t type_va = base + rdata->va + static_cast<uint64_t>(p - lo);
+		unsigned char pattern[8];
+		for (int k = 0; k < 8; ++k)
+			pattern[k] = static_cast<unsigned char>(type_va >> (8 * k));
+		for (const unsigned char *q = lo; q + 8 <= hi; ++q) {
+			q = std::search(q, hi, pattern, pattern + 8);
+			if (q == hi)
+				break;
+			if (q - lo < 16 || (q - b) % 8 != 0)
+				continue;
+			const unsigned char *const d = q - 16;
+			NeuralModelEntry m;
+			std::string type;
+			if (!text_at(rd64(d), &m.name) || !text_at(type_va, &type) || !text_at(rd64(d + 24), &m.resource))
+				continue;
+			m.id = rd32(d + 8);
+			found.emplace_back(static_cast<size_t>(d - b), std::move(m));
+		}
+	}
+	std::sort(found.begin(), found.end(), [](const auto &x, const auto &y) { return x.first < y.first; });
+	for (auto &f : found) {
+		if (neural_model_named(out, f.second.id) == nullptr)
+			out.push_back(std::move(f.second));
+	}
+	return out;
+}
+
+}
+
 NeuralRuntimeIdentity neural_identity_in(const char *bytes, size_t size)
 {
 	NeuralRuntimeIdentity out;
@@ -385,7 +489,28 @@ NeuralRuntimeIdentity neural_identity_in(const char *bytes, size_t size)
 			break;
 		}
 	}
+	out.models = models_in(b, size);
 	return out;
+}
+
+uint32_t neural_model_to_ask(const std::vector<NeuralModelEntry> &models, uint32_t wanted) noexcept
+{
+	uint32_t newest = 0u;
+	for (const NeuralModelEntry &m : models) {
+		if (wanted != 0u && m.id == wanted)
+			return wanted;
+		newest = std::max(newest, m.id);
+	}
+	return newest != 0u ? newest : 1u;
+}
+
+const NeuralModelEntry *neural_model_named(const std::vector<NeuralModelEntry> &models, uint32_t id) noexcept
+{
+	for (const NeuralModelEntry &m : models) {
+		if (m.id == id)
+			return &m;
+	}
+	return nullptr;
 }
 
 uint32_t neural_constant_return(const unsigned char *code, size_t size) noexcept

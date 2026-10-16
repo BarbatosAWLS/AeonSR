@@ -380,6 +380,10 @@ void flight_csv_row(std::string &out, const FlightRecord &r, const FlightNotes &
 			hud += hud.empty() ? "split" : "+split";
 		if (r.hud & kFlightRegistered)
 			hud += hud.empty() ? "registered" : "+registered";
+		if (r.hud & kFlightAlone)
+			hud += hud.empty() ? "alone" : "+alone";
+		if (r.hud & kFlightHeld)
+			hud += hud.empty() ? "held" : "+held";
 		put_text(out, hud.c_str());
 	}
 	put_text(out, flight_host_name(r.host));

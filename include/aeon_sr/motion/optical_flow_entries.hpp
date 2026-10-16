@@ -15,6 +15,8 @@ constexpr const char *kNames[kCount] = {
 	"CSThetaPublish",
 };
 
+constexpr uint32_t kTermsBlock = 32;
+
 constexpr const char *kQualityDefine[2] = { "1", "2" };
 
 }

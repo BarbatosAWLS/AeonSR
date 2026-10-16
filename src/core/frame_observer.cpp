@@ -15,6 +15,7 @@ namespace {
 enum : uint32_t {
 	kPixels = 0, kInterface, kHeld, kFlickerInterface, kFlickerRest, kMoving, kMotionPixels,
 	kOutInterface = 8, kOutRest = 10, kDrawnInterface = 12, kDrawnRest = 14, kMotionRest = 16,
+	kEdges = 18, kEdgesChanged = 19,
 };
 constexpr double kFixed = 16.0;
 
@@ -36,7 +37,7 @@ Texture2D<float> mask : register(t4);
 Texture2D<float2> motion : register(t5);
 RWByteAddressBuffer sums : register(u0);
 
-groupshared uint g_count[7];
+groupshared uint g_count[9];
 groupshared uint g_sum[5];
 
 float luma(float3 c)
@@ -64,7 +65,7 @@ void CSClear(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
-	if (gi < 7u)
+	if (gi < 9u)
 		g_count[gi] = 0u;
 	if (gi < 5u)
 		g_sum[gi] = 0u;
@@ -74,7 +75,16 @@ void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 		const float m = have_mask > 0.5 ? mask.Load(p) : 0.0;
 		const bool hud = m > 0.75, held = m > 0.25 && !hud;
 		const float dout = abs(luma(out_now.Load(p).rgb) - luma(out_prev.Load(p).rgb));
-		const float ddrawn = abs(luma(drawn_now.Load(p).rgb) - luma(drawn_prev.Load(p).rgb));
+		const float ln = luma(drawn_now.Load(p).rgb);
+		const float ddrawn = abs(ln - luma(drawn_prev.Load(p).rgb));
+		const uint2 last = uint2(size) - 1u;
+		const float lr = luma(drawn_now.Load(int3(min(id.x + 1u, last.x), id.y, 0)).rgb);
+		const float ld = luma(drawn_now.Load(int3(id.x, min(id.y + 1u, last.y), 0)).rgb);
+		if (abs(lr - ln) + abs(ld - ln) > 4.0) {
+			InterlockedAdd(g_count[7], 1u);
+			if (ddrawn > 0.01)
+				InterlockedAdd(g_count[8], 1u);
+		}
 		InterlockedAdd(g_count[0], 1u);
 		if (hud)
 			InterlockedAdd(g_count[1], 1u);
@@ -98,6 +108,8 @@ void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 	GroupMemoryBarrierWithGroupSync();
 	if (gi < 7u && g_count[gi] != 0u)
 		sums.InterlockedAdd(gi * 4u, g_count[gi]);
+	if ((gi == 7u || gi == 8u) && g_count[gi] != 0u)
+		sums.InterlockedAdd((gi + 11u) * 4u, g_count[gi]);
 	if (gi < 5u)
 		add64(8u + gi * 2u, g_sum[gi]);
 }
@@ -246,6 +258,16 @@ void FrameObserverD3D12::collect() noexcept
 		};
 		if (c[kPixels] == 0u)
 			continue;
+		if (held_count_ < kReadback) {
+			FrameEdges &e = held_[held_count_++];
+			e.serial = serial_[k];
+			e.edges = c[kEdges];
+			e.changed = c[kEdgesChanged];
+			e.pixels = c[kPixels];
+			e.shown = c[kInterface];
+		}
+		acc_.edges += c[kEdges];
+		acc_.edges_changed += c[kEdgesChanged];
 		++acc_.frames;
 		acc_.pixels += c[kPixels];
 		acc_.hud += c[kInterface];
@@ -285,7 +307,7 @@ bool FrameObserverD3D12::begin(ID3D12Device *device, ID3D12GraphicsCommandList *
 
 void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
 	D3D12_RESOURCE_STATES state, ID3D12Resource *mask, D3D12_RESOURCE_STATES mask_state, ID3D12Resource *motion,
-	D3D12_RESOURCE_STATES motion_state)
+	D3D12_RESOURCE_STATES motion_state, uint64_t serial)
 {
 	if (!begun_ || device == nullptr || cmd == nullptr || color == nullptr)
 		return;
@@ -368,8 +390,20 @@ void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 	barrier12(cmd, sums_, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	written_[ring_] = have_prev_;
 	age_[ring_] = 0;
+	serial_[ring_] = serial;
 	cur_ = now;
 	have_prev_ = true;
+}
+
+bool FrameObserverD3D12::take_edges(FrameEdges *out) noexcept
+{
+	if (held_count_ == 0)
+		return false;
+	*out = held_[0];
+	for (uint32_t i = 1; i < held_count_; ++i)
+		held_[i - 1] = held_[i];
+	--held_count_;
+	return true;
 }
 
 FrameObservation FrameObserverD3D12::take() noexcept
@@ -393,6 +427,7 @@ void FrameObserverD3D12::release() noexcept
 	rel(heap_);
 	for (uint32_t k = 0; k < kReadback; ++k)
 		written_[k] = false;
+	held_count_ = 0;
 	w_ = h_ = 0;
 	format_ = DXGI_FORMAT_UNKNOWN;
 	have_prev_ = begun_ = failed_ = false;

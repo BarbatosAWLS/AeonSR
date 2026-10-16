@@ -1,4 +1,5 @@
 #include "host_session.hpp"
+#include "window_host.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/remote_protocol.hpp"
@@ -94,6 +95,7 @@ struct Args {
 	std::wstring log;
 	bool verbose = false;
 	bool gpu_priority_high = false;
+	uint64_t present_block = 0;
 };
 
 void raise_gpu_priority(HostSession &session)
@@ -123,6 +125,8 @@ Args parse_args()
 			args.log = argv[++i];
 		else if (wcscmp(argv[i], L"--verbose") == 0)
 			args.verbose = true;
+		else if (wcscmp(argv[i], L"--present") == 0 && i + 1 < argc)
+			args.present_block = _wcstoui64(argv[++i], nullptr, 10);
 		else if (wcscmp(argv[i], L"--gpu-priority") == 0 && i + 1 < argc)
 			args.gpu_priority_high = wcscmp(argv[++i], L"high") == 0;
 	}
@@ -307,7 +311,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 	diag_set_verbose(args.verbose);
 
 	int code = ExitNoPid;
-	if (args.pid == 0)
+	if (args.present_block != 0)
+		code = aeon_sr::host::run_window_host(args.present_block);
+	else if (args.pid == 0)
 		diag_error("host", L"AeonSRHost needs --pid <game process id> and was given none.");
 	else
 		code = run(args, host_dir);

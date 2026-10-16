@@ -7,6 +7,7 @@ NeuralRenderParams plan_neural_params(const Settings &s, const FrameSignals &sig
 {
 	NeuralRenderParams np;
 	np.style = clamp_neural_style(s.neural_style);
+	np.render_preset = s.neural_model;
 
 	np.intensity = clamp_neural_unit(s.neural_intensity, kNeuralIntensityDefault, kNeuralUnitMax);
 	np.local_structure = clamp_neural_unit(s.neural_local_structure, kNeuralStructureDefault, kNeuralExtendedMax);
@@ -66,6 +67,21 @@ void plan_vsr_params(const Settings &s, const FrameSignals &sig, UpscalerParams 
 bool split_uses_catmull_rom(bool setting, BackendChoice backend) noexcept
 {
 	return setting || backend == BackendChoice::Dlss;
+}
+
+bool split_while_moving(unsigned int upscale_mode) noexcept
+{
+	return static_cast<UpscaleMode>(upscale_mode) == UpscaleMode::UltraPerformance;
+}
+
+bool input_downscaled(const Settings &s) noexcept
+{
+	return static_cast<UpscaleMode>(s.upscale_mode) != UpscaleMode::Dlaa;
+}
+
+bool withheld_resamples(const Settings &s, const FrameSignals &sig, BackendChoice backend) noexcept
+{
+	return backend == BackendChoice::Dlss && input_downscaled(s) && sig.withheld_interface_learned;
 }
 
 const char *jitter_decision_name(JitterDecision d) noexcept
@@ -137,7 +153,8 @@ FramePlan plan_frame(const Settings &s, const FrameSignals &sig, const BackendSl
 		p.jitter_in_frame = true;
 		plan.jitter_active = true;
 		plan.jitter_decision = JitterDecision::Drawn;
-		if ((s.split_pairs || sig.camera_moving) && (sig.jitter_drawn_index & 1u) != 0u) {
+		const bool split = s.split_pairs || (sig.camera_moving && split_while_moving(s.upscale_mode));
+		if (split && (sig.jitter_drawn_index & 1u) != 0u) {
 			const Jitter q = split_pair_point(sig.jitter_drawn_index, kJitterAmount);
 			plan.split_shift_x = q.x - sig.jitter_drawn_x;
 			plan.split_shift_y = q.y - sig.jitter_drawn_y;
@@ -157,7 +174,7 @@ FramePlan plan_frame(const Settings &s, const FrameSignals &sig, const BackendSl
 		plan.jitter_active = true;
 		plan.jitter_decision = JitterDecision::Empty;
 		plan.next.jitter_index = h.jitter_index + 1u;
-	} else if (s.spatial_jitter && !sig.jitter_withheld) {
+	} else if (s.spatial_jitter && (!sig.jitter_withheld || withheld_resamples(s, sig, choice))) {
 		const Jitter j = halton_jitter(h.jitter_index, kJitterAmount);
 		p.jitter_x = j.x;
 		p.jitter_y = j.y;

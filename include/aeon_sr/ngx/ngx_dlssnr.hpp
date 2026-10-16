@@ -278,6 +278,7 @@ struct NeuralRenderD3D12 : NeuralRenderCommon {
 
 	BlitPipelineD3D12 blit;
 	uint32_t created_style = 0xFFFFFFFFu;
+	uint32_t created_model = 0u;
 
 	uint32_t model_width = 0, model_height = 0;
 	float created_scale = 1.0f;

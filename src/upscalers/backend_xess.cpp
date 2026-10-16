@@ -229,6 +229,7 @@ bool XessD3D12Backend::ensure_resources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	const DXGI_FORMAT scratch = upscaler_scratch_format(fmt);
 	const bool same = (width_ == w && height_ == h && created_backbuffer_format_ == fmt &&
 		created_quality_mode_ == quality_mode_ && created_render_scale_ == render_scale_ &&
+		created_render_w_ == render_width_ && created_render_h_ == render_height_ &&
 		output_tex_ != nullptr && color_full_ != nullptr && color_copy_ != nullptr);
 	if (same)
 		return true;
@@ -252,6 +253,8 @@ bool XessD3D12Backend::ensure_resources(uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 	created_backbuffer_format_ = fmt;
 	created_quality_mode_ = quality_mode_;
 	created_render_scale_ = render_scale_;
+	created_render_w_ = render_width_;
+	created_render_h_ = render_height_;
 	if (!blit_.ensure(device_)) {
 		status = UpscalerStatus::InitFailed;
 		last_error = L"XeSS blit pipeline failed";
@@ -272,14 +275,15 @@ bool XessD3D12Backend::run(
 	queue_ = inputs.engine.queue;
 	return run_native(inputs.engine.device, inputs.engine.cmd,
 		inputs.engine.color, inputs.engine.motion,
-		inputs.engine.color_state, params);
+		inputs.engine.color_state, params, inputs.engine.output, inputs.engine.output_state);
 }
 
 bool XessD3D12Backend::run_native(
 	ID3D12Device *d3d12, ID3D12GraphicsCommandList *cmd12,
 	ID3D12Resource *backbuffer, ID3D12Resource *motion_vectors,
 	D3D12_RESOURCE_STATES backbuffer_state,
-	const UpscalerParams &params)
+	const UpscalerParams &params,
+	ID3D12Resource *output, D3D12_RESOURCE_STATES output_state)
 {
 	if (d3d12 == nullptr || cmd12 == nullptr)
 		return false;
@@ -304,9 +308,15 @@ bool XessD3D12Backend::run_native(
 		return false;
 	if (backbuffer == nullptr || motion_vectors == nullptr)
 		return false;
-	const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
+	ID3D12Resource *const target = output != nullptr ? output : backbuffer;
+	const D3D12_RESOURCE_STATES target_state = output != nullptr ? output_state : backbuffer_state;
+	const D3D12_RESOURCE_DESC bb_desc = target->GetDesc();
 	const uint32_t w = static_cast<uint32_t>(bb_desc.Width);
 	const uint32_t h = bb_desc.Height;
+	explicit_width_ = params.render_width != 0 && params.render_width <= w ? params.render_width : 0u;
+	explicit_height_ = params.render_height != 0 && params.render_height <= h ? params.render_height : 0u;
+	if (explicit_width_ != 0 && explicit_height_ != 0)
+		render_scale_ = static_cast<float>(explicit_width_) / static_cast<float>(w);
 
 	const bool ready = context_ != nullptr && device_ == d3d12 && prepared_ && prepared_w_ == w &&
 		prepared_h_ == h && prepared_quality_ == quality_mode_ && prepared_scale_ == render_scale_;
@@ -334,24 +344,34 @@ bool XessD3D12Backend::run_native(
 		return false;
 	}
 
+	if (explicit_width_ != 0 && explicit_height_ != 0) {
+		render_width_ = explicit_width_;
+		render_height_ = explicit_height_;
+	}
 	if (!ensure_resources(w, h, bb_desc.Format))
 		return false;
 
-	barrier12(cmd12, backbuffer, backbuffer_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-	cmd12->CopyResource(color_full_, backbuffer);
-
-	barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	const bool in_place = output != nullptr || reads_like_copy12(backbuffer, backbuffer_format_);
+	const D3D12_RESOURCE_STATES read_state =
+		in_place ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+	ID3D12Resource *const color_src = in_place ? backbuffer : color_full_;
+	barrier12(cmd12, backbuffer, backbuffer_state, read_state);
+	if (!in_place) {
+		cmd12->CopyResource(color_full_, backbuffer);
+		barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	}
 	const float shift_x = params.jitter_in_frame ? 0.0f : params.jitter_x;
 	const float shift_y = params.jitter_in_frame ? 0.0f : params.jitter_y;
 	const float jitter_u = render_width_ > 0 ? -shift_x / static_cast<float>(render_width_) : 0.0f;
 	const float jitter_v = render_height_ > 0 ? -shift_y / static_cast<float>(render_height_) : 0.0f;
 
 	barrier12(cmd12, color_copy_, kXessSrvState, D3D12_RESOURCE_STATE_RENDER_TARGET);
-	bool ok = blit_.draw_fullscreen(d3d12, cmd12, color_full_,
+	bool ok = blit_.draw_fullscreen(d3d12, cmd12, color_src,
 		color_copy_, scratch_format_, render_width_, render_height_,
 		0.0f, 0u, jitter_u, jitter_v);
 	barrier12(cmd12, color_copy_, D3D12_RESOURCE_STATE_RENDER_TARGET, kXessSrvState);
-	barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+	if (!in_place)
+		barrier12(cmd12, color_full_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 	if (!ok) {
 		status = UpscalerStatus::EvaluateFailed;
 		last_error = L"XeSS failed to blit color into render scratch";
@@ -386,14 +406,19 @@ bool XessD3D12Backend::run_native(
 		}
 	}
 
-	barrier12(cmd12, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	if (output != nullptr) {
+		barrier12(cmd12, backbuffer, read_state, backbuffer_state);
+		barrier12(cmd12, target, target_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	} else {
+		barrier12(cmd12, backbuffer, read_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}
 
 	if (ok)
 		ok = blit_.draw_fullscreen(d3d12, cmd12, output_tex_,
-			backbuffer, backbuffer_format_, width_, height_, params.sharpness);
+			target, backbuffer_format_, width_, height_, params.sharpness);
 
-	if (backbuffer_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
-		barrier12(cmd12, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, backbuffer_state);
+	if (target_state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+		barrier12(cmd12, target, D3D12_RESOURCE_STATE_RENDER_TARGET, target_state);
 
 	if (ok) {
 		status = UpscalerStatus::Ready;

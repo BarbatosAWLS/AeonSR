@@ -20,6 +20,11 @@ Author: **Barbatos AWLS**
 - **Sub-pixel jitter** drawn into the game's own rendering
 - **Every graphics API**: DirectX 8, 9, 10, 11 and 12, OpenGL and Vulkan
 - **32-bit and 64-bit games**
+- **Frame generation** (experimental): Aeon SR's own generator, AMD FSR, Intel XeSS or
+  NVIDIA DLSS Frame Generation, shown in a window of its own over the game
+- **Low latency**: Aeon SR's own mode or NVIDIA Reflex, on every graphics API
+- **Even frame pacing** for games that run faster than the screen
+- **The game's own render scale**, used for real in DirectX 10 and 11 games that have one
 - **DLSS Neural Rendering** as an optional pass, with a runtime you supply
 - **RTX Video Super Resolution** as an experiment: a spatial upscaler for
   DirectX 11 games that rarely improves on the temporal ones
@@ -52,6 +57,9 @@ pinned to an official release, and the build copies the DLLs from there.
 | NVIDIA DLSS Super Resolution | `nvngx_dlss.dll` | [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) v310.9.1 | yes |
 | AMD FSR | `amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_loader_dx12.dll` | [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) v2.3.0, AMD-signed | yes |
 | Intel XeSS | `libxess.dll`, `libxess_dx11.dll` | [Intel XeSS SDK](https://github.com/intel/xess) v3.0.2 | yes |
+| NVIDIA DLSS Frame Generation | `nvngx_dlssg.dll` | [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) v310.9.1 | yes |
+| AMD FSR Frame Generation | `amd_fidelityfx_framegeneration_dx12.dll` | [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) v2.3.0, AMD-signed | yes |
+| Intel XeSS Frame Generation | `libxess_fg.dll`, `libxell.dll` | [Intel XeSS SDK](https://github.com/intel/xess) v3.0.2 | yes |
 | NVIDIA DLSS Neural Rendering | `nvngx_dlssnr.dll` | none official | **no**, see below |
 
 ### DLSS Neural Rendering
@@ -172,6 +180,8 @@ The add-on lives in `src/<module>/`, its headers in `include/aeon_sr/<module>/`:
 | `motion` | The optical flow estimator and its shaders |
 | `depth` | Depth normalisation, depth for Direct3D 9 and Vulkan |
 | `jitter` | Sub-pixel jitter drawn into the game, its hooks, the interface restore |
+| `framegen` | Frame generation: Aeon SR's own and the vendors', pacing, the window it shows in |
+| `games` | What Aeon SR knows of particular games (Project DIVA Mega Mix+'s render scale) |
 
 `host/` is `AeonSRHost.exe` and `prebuild/` is `AeonSRPrebuild.exe`.
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.2.0 LANGUAGES C CXX)
+project(AeonSR VERSION 1.3.0 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -21,6 +21,7 @@ set(AEONSR_FFX_SDK "${AEONSR_EXTERNAL}/FidelityFX-SDK" CACHE PATH "AMD FidelityF
 set(FFX_INCLUDE_DIR "${AEONSR_THIRD_PARTY}/ffx/include" CACHE PATH "FidelityFX API headers")
 set(FFX_DX11_INCLUDE_DIR "${AEONSR_THIRD_PARTY}/ffx_dx11/include" CACHE PATH "FidelityFX DX11 headers")
 set(XESS_INCLUDE_DIR "${AEONSR_THIRD_PARTY}/xess/include" CACHE PATH "XeSS headers")
+set(XESS_FG_INCLUDE_DIR "${AEONSR_XESS_SDK}/inc" CACHE PATH "XeSS frame generation and XeLL headers (SDK submodule)")
 set(VULKAN_INCLUDE_DIR "${AEONSR_EXTERNAL}/Vulkan-Headers/include" CACHE PATH "Vulkan headers")
 set(GL_INCLUDE_DIR "${AEONSR_THIRD_PARTY}/khronos/include")
 set(VKGL_INCLUDE_DIR "${VULKAN_INCLUDE_DIR}" "${GL_INCLUDE_DIR}")
@@ -32,7 +33,11 @@ set(AEONSR_RUNTIME_FILES
   "${AEONSR_XESS_SDK}/bin/libxess.dll"
   "${AEONSR_XESS_SDK}/bin/libxess_dx11.dll"
   "${AEONSR_FFX_SDK}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll"
-  "${AEONSR_FFX_SDK}/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll")
+  "${AEONSR_FFX_SDK}/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll"
+  "${AEONSR_DLSS_SDK}/lib/Windows_x86_64/rel/nvngx_dlssg.dll"
+  "${AEONSR_XESS_SDK}/bin/libxess_fg.dll"
+  "${AEONSR_XESS_SDK}/bin/libxell.dll"
+  "${AEONSR_FFX_SDK}/Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_dx12.dll")
 set(AEONSR_LICENSE_FILES
   "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE|AeonSR_LICENSE.txt"
   "${CMAKE_CURRENT_SOURCE_DIR}/THIRD-PARTY-NOTICES.md|THIRD-PARTY-NOTICES.md"
@@ -49,6 +54,9 @@ foreach(_req
     "${NGX_INCLUDE_DIR}/nvsdk_ngx.h"
     "${NGX_LIB}"
     "${FFX_INCLUDE_DIR}/ffx_api.h"
+    "${FFX_INCLUDE_DIR}/ffx_framegeneration.h"
+    "${XESS_FG_INCLUDE_DIR}/xess_fg/xefg_swapchain.h"
+    "${XESS_FG_INCLUDE_DIR}/xell/xell.h"
     "${FFX_DX11_INCLUDE_DIR}/FidelityFX/host/ffx_fsr3upscaler.h"
     "${XESS_INCLUDE_DIR}/xess/xess.h"
     "${GL_INCLUDE_DIR}/GL/glext.h"
@@ -102,7 +110,6 @@ add_custom_target(aeon_flow_baked DEPENDS "${AEONSR_GEN_DIR}/aeon_sr/motion/flow
 set(AEONSR_SOURCES
   src/core/addon_main.cpp
   src/core/app.cpp
-  src/core/present_drive.cpp
   src/upscalers/backend_dlss.cpp
   src/upscalers/backend_dlss_d3d11.cpp
   src/upscalers/backend_fsr_d3d11.cpp
@@ -123,22 +130,45 @@ set(AEONSR_SOURCES
   src/core/debug_view.cpp
   src/depth/depth_convention.cpp
   src/depth/depth_normalize.cpp
-  src/depth/depth_on_grid.cpp
   src/core/diag_report.cpp
   src/core/diagnostics.cpp
   src/core/dxgi_format_util.cpp
   src/core/flight_recorder.cpp
+  src/core/game_render_scale.cpp
+  src/core/pipeline_trace.cpp
+  src/games/diva_mega_mix_plus.cpp
+  src/games/game_registry.cpp
+  src/games/scale_driver.cpp
+  src/games/signature_scan.cpp
   src/core/report_bundle.cpp
   src/upscalers/ffx_dx11_loader.cpp
   src/upscalers/ffx_loader.cpp
   src/motion/flow_probe.cpp
   src/core/frame_clock.cpp
+  src/core/display_pacer.cpp
+  src/core/latency_governor.cpp
+  src/core/reflex.cpp
   src/core/frame_inputs.cpp
   src/core/frame_plan.cpp
+  src/framegen/display_clock.cpp
+  src/framegen/frame_gen_stage.cpp
+  src/framegen/frame_generation.cpp
+  src/framegen/frame_interpolator.cpp
+  src/framegen/frame_pacer.cpp
+  src/framegen/frame_presenter.cpp
+  src/framegen/present_sync.cpp
+  src/framegen/overlay_scheduler.cpp
+  src/framegen/overlay_presenter.cpp
+  src/framegen/window_host_link.cpp
+  src/framegen/window_host_protocol.cpp
+  src/framegen/vendor_frame_gen.cpp
+  src/framegen/fsr_frame_gen.cpp
+  src/framegen/dlss_frame_gen.cpp
+  src/framegen/xess_frame_gen.cpp
+  src/framegen/xess_fake_swapchain.cpp
   src/jitter/frame_shift.cpp
   src/core/frame_observer.cpp
   src/jitter/hud_restore.cpp
-  src/jitter/depth_regrid.cpp
   src/interop/gpu12.cpp
   src/core/gpu_vendor.cpp
   src/motion/guide_builder.cpp
@@ -149,11 +179,10 @@ set(AEONSR_SOURCES
   src/motion/mv_probe.cpp
   src/motion/mv_stats.cpp
   src/upscalers/native_dlss.cpp
-  src/ngx/neural_arch_hook.cpp
-  src/ngx/neural_hardware.cpp
   src/ngx/ngx_common.cpp
   src/ngx/ngx_override.cpp
   src/ngx/ngx_dlssnr.cpp
+  src/depth/depth_on_grid.cpp
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
@@ -162,6 +191,7 @@ set(AEONSR_SOURCES
   src/motion/optical_flow.cpp
   src/motion/game_jitter_probe.cpp
   src/motion/game_jitter_memory.cpp
+  src/core/present_drive.cpp
   src/core/panel.cpp
   src/core/panel_widgets.cpp
   src/interop/remote_engine.cpp
@@ -169,22 +199,31 @@ set(AEONSR_SOURCES
   src/core/runtime_search.cpp
   src/jitter/scene_jitter.cpp
   src/jitter/scene_jitter_hooks.cpp
+  src/jitter/depth_regrid.cpp
   src/jitter/scene_jitter_shaders.cpp
   src/jitter/shader_offset.cpp
+  src/jitter/dxil_reader.cpp
   src/jitter/shader_position.cpp
   src/jitter/constant_reads.cpp
   src/jitter/gl_jitter.cpp
   src/motion/scene_stability.cpp
   src/core/settings.cpp
   src/jitter/spirv_compile.cpp
+  src/ngx/neural_hardware.cpp
+  src/ngx/neural_arch_hook.cpp
   src/upscalers/upscaler_backend.cpp
   src/upscalers/upscaler_capture.cpp
   src/upscalers/upscaler_capture_format.cpp
   src/jitter/vulkan_viewport_hook.cpp
+  src/jitter/vulkan_constants.cpp
   src/upscalers/xess_loader.cpp
 )
 
 set(AEONSR_VENDOR_SOURCES
+  src/framegen/fsr_frame_gen.cpp
+  src/framegen/dlss_frame_gen.cpp
+  src/framegen/xess_frame_gen.cpp
+  src/framegen/xess_fake_swapchain.cpp
   src/upscalers/backend_dlss.cpp
   src/upscalers/backend_dlss_d3d11.cpp
   src/upscalers/backend_fsr_d3d11.cpp
@@ -192,11 +231,11 @@ set(AEONSR_VENDOR_SOURCES
   src/upscalers/fsr_warmup.cpp
   src/upscalers/backend_vsr.cpp
   src/upscalers/backend_xess.cpp
-  src/depth/depth_on_grid.cpp
   src/upscalers/ffx_dx11_loader.cpp
   src/upscalers/ffx_loader.cpp
   src/ngx/neural_arch_hook.cpp
   src/ngx/ngx_dlssnr.cpp
+  src/depth/depth_on_grid.cpp
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
@@ -205,11 +244,22 @@ set(AEONSR_VENDOR_SOURCES
   src/upscalers/xess_loader.cpp
 )
 
+option(AEONSR_FRAME_GENERATION "Frame generation in the add-on" ON)
+if(NOT AEONSR_FRAME_GENERATION)
+  list(FILTER AEONSR_SOURCES EXCLUDE REGEX "^src/framegen/")
+  list(FILTER AEONSR_VENDOR_SOURCES EXCLUDE REGEX "^src/framegen/")
+endif()
+
 set(AEONSR_COMMON_DEFINITIONS
   WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
   ImTextureID=ImU64 IMGUI_DISABLE_INCLUDE_IMCONFIG_H
   AEONSR_RESHADE_API_VERSION=18
   AEONSR_VERSION_STR="${AEONSR_VERSION_STR}")
+if(AEONSR_FRAME_GENERATION)
+  list(APPEND AEONSR_COMMON_DEFINITIONS AEONSR_FRAME_GENERATION=1)
+else()
+  list(APPEND AEONSR_COMMON_DEFINITIONS AEONSR_FRAME_GENERATION=0)
+endif()
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
   set(AEONSR_X64 ON)
@@ -235,6 +285,7 @@ target_include_directories(AeonSR PRIVATE
   "${FFX_INCLUDE_DIR}"
   "${FFX_DX11_INCLUDE_DIR}"
   "${XESS_INCLUDE_DIR}"
+  "${XESS_FG_INCLUDE_DIR}"
   ${VKGL_INCLUDE_DIR}
   "${RESHADE_ROOT}/source"
   "${RESHADE_ROOT}/deps/spirv/include/spirv/unified1")
@@ -252,6 +303,8 @@ if(AEONSR_X64)
   add_executable(AeonSRHost WIN32
     host/host_main.cpp
     host/host_session.cpp
+    host/window_host.cpp
+    src/framegen/window_host_protocol.cpp
     src/upscalers/backend_dlss.cpp
     src/upscalers/backend_fsr_d3d12.cpp
     src/upscalers/fsr_warmup.cpp

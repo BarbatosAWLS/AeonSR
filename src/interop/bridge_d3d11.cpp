@@ -419,6 +419,7 @@ public:
 			last_error = L"the engine queue refused to wait on the shared fence";
 			return BridgeStep::Import;
 		}
+		ctx->Flush();
 
 		out.cmd = engine_->begin_list();
 		if (out.cmd == nullptr) {

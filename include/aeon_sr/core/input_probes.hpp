@@ -20,6 +20,9 @@ struct InputProbes {
 
 	bool sample_flow(const PassContext &ctx, const FrameInputs &in, float &motion_px);
 
+	bool motion_write_due() const noexcept { return mv11_.write_due(frame + 1u); }
+	void note_motion_written() noexcept { mv11_.note_written(frame + 1u); }
+
 	void reset_motion();
 	void release();
 

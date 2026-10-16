@@ -1,4 +1,7 @@
 #include "aeon_sr/core/settings.hpp"
+#if AEONSR_FRAME_GENERATION
+#include "aeon_sr/framegen/vendor_frame_gen.hpp"
+#endif
 
 #include "aeon_sr/upscalers/upscaler_backend.hpp"
 
@@ -313,6 +316,11 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 		else if (key == "GpuTimings") out.gpu_timings = parse_bool(val);
 		else if (key == "HostGpuPriority") out.host_gpu_priority = parse_bool(val);
 		else if (key == "SpatialJitter") out.spatial_jitter = parse_bool(val);
+		else if (key == "PaceToDisplay") out.pace_to_display = parse_bool(val);
+		else if (key == "LowLatency") {
+			const unsigned long v = std::strtoul(val.c_str(), nullptr, 10);
+			out.low_latency = v <= 2ul ? static_cast<unsigned int>(v) : 0u;
+		}
 		else if (key == "UpscaleMode") out.upscale_mode = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
 		else if (key == "Upscaler") {
 			const unsigned int v = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
@@ -328,6 +336,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.vsr_input_format = (v < kVsrInputFormatCount) ? v : 0u;
 		}
 		else if (key == "NeuralRender") out.neural_render = parse_bool(val);
+		else if (key == "NeuralModel") out.neural_model = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
 		else if (key == "NeuralStyle") out.neural_style = clamp_neural_style(static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10)));
 		else if (key == "NeuralIntensity") out.neural_intensity = clamp_neural_unit(static_cast<float>(std::atof(val.c_str())), kNeuralIntensityDefault);
 		else if (key == "NeuralLocalStructure") out.neural_local_structure = clamp_neural_unit(static_cast<float>(std::atof(val.c_str())), kNeuralStructureDefault, kNeuralExtendedMax);
@@ -408,6 +417,14 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			const unsigned long v = std::strtoul(val.c_str(), nullptr, 0);
 			out.scope_key = v >= 1ul && v <= 0xFEul ? static_cast<unsigned int>(v) : kScopeKeyDefault;
 		}
+		else if (key == "PipelineTrace") out.pipeline_trace = parse_bool(val);
+		else if (key == "GameRenderScale") out.game_render_scale = parse_bool(val);
+		else if (key == "GameRenderScaleBeforeAA") out.game_render_scale_before_aa = parse_bool(val);
+		else if (key == "PipelineTraceDir") out.pipeline_trace_dir = val;
+		else if (key == "PipelineTraceKey") {
+			const unsigned long v = std::strtoul(val.c_str(), nullptr, 0);
+			out.pipeline_trace_key = v >= 1ul && v <= 0xFEul ? static_cast<unsigned int>(v) : kPipelineTraceKeyDefault;
+		}
 		else if (key == "JitterFault") out.jitter_fault = val;
 		else if (key == "ReportKey") {
 			const unsigned long v = std::strtoul(val.c_str(), nullptr, 0);
@@ -416,6 +433,33 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 		else if (key == "FlightFault") out.flight_fault = val;
 		else if (key == "KeepInterface") out.keep_interface = parse_bool(val);
 		else if (key == "ForceSystemMemory") out.force_system_memory = parse_bool(val);
+#if AEONSR_FRAME_GENERATION
+		else if (key == "FrameGeneration") out.frame_generation = parse_bool(val);
+		else if (key == "FrameGenerationLimit") {
+			const unsigned long v = std::strtoul(val.c_str(), nullptr, 10);
+			out.frame_generation_limit = v <= kFrameGenerationLimitMax ? static_cast<unsigned int>(v) : 0u;
+		}
+		else if (key == "FrameGenerationOwnWindow") out.frame_generation_own_window = parse_bool(val);
+		else if (key == "FrameGenerationWindowHost") out.frame_generation_window_host = parse_bool(val);
+		else if (key == "FrameGenerationMultiplier") {
+			std::string v = val;
+			if (!v.empty() && (v.back() == 'x' || v.back() == 'X'))
+				v.pop_back();
+			char *end = nullptr;
+			const unsigned long n = std::strtoul(v.c_str(), &end, 10);
+			out.frame_generation_multiplier = !v.empty() && end != nullptr && *end == '\0' && n >= 2 &&
+				n <= kFrameGenerationMultiplierMax ? static_cast<unsigned int>(n) : 0u;
+		}
+		else if (key == "FrameGenerator") {
+			FrameGenerator g = FrameGenerator::AeonSR;
+			out.frame_generator = parse_frame_generator(val, &g) ? static_cast<unsigned int>(g) : 0u;
+		}
+		else if (key == "FrameGenerationDump") {
+			const unsigned long v = std::strtoul(val.c_str(), nullptr, 10);
+			out.frame_generation_dump = v <= 100000ul ? static_cast<unsigned int>(v) : 0u;
+		}
+		else if (key == "FrameGenerationDumpDir") out.frame_generation_dump_dir = val;
+#endif
 		else if (key == "DebugInfo") out.debug_info = parse_bool(val);
 		else if (key == "VerboseLog") out.verbose_log = parse_bool(val);
 		else if (key == "DebugView") {
@@ -442,6 +486,8 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "RenderPreset=" << in.render_preset << "\n";
 	out << "Sharpness=" << in.sharpness << "\n";
 	out << "SpatialJitter=" << (in.spatial_jitter ? 1 : 0) << "\n";
+	out << "PaceToDisplay=" << (in.pace_to_display ? 1 : 0) << "\n";
+	out << "LowLatency=" << (in.low_latency <= 2u ? in.low_latency : 0u) << "\n";
 	out << "UpscaleMode=" << in.upscale_mode << "\n";
 	if (in.backend < kBackendChoiceCount)
 		out << "Upscaler=" << in.backend << "\n";
@@ -449,6 +495,8 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "FsrProvider=" << in.fsr_provider << "\n";
 	out << "NeuralRender=" << (in.neural_render ? 1 : 0) << "\n";
 	out << "NeuralStyle=" << clamp_neural_style(in.neural_style) << "\n";
+	if (in.neural_model != 0u)
+		out << "NeuralModel=" << in.neural_model << "\n";
 	out << "NeuralIntensity=" << clamp_neural_unit(in.neural_intensity, kNeuralIntensityDefault) << "\n";
 	out << "NeuralLocalStructure=" << clamp_neural_unit(in.neural_local_structure, kNeuralStructureDefault, kNeuralExtendedMax) << "\n";
 	out << "NeuralLocalTone=" << clamp_neural_unit(in.neural_local_tone, kNeuralToneDefault, kNeuralExtendedMax) << "\n";
@@ -496,6 +544,15 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		out << "ScopeDir=" << in.scope_dir << "\n";
 	if (in.scope_key != kScopeKeyDefault)
 		out << "ScopeKey=" << in.scope_key << "\n";
+	out << "GameRenderScale=" << (in.game_render_scale ? 1 : 0) << "\n";
+	if (in.game_render_scale_before_aa)
+		out << "GameRenderScaleBeforeAA=1\n";
+	if (in.pipeline_trace)
+		out << "PipelineTrace=1\n";
+	if (!in.pipeline_trace_dir.empty())
+		out << "PipelineTraceDir=" << in.pipeline_trace_dir << "\n";
+	if (in.pipeline_trace_key != kPipelineTraceKeyDefault)
+		out << "PipelineTraceKey=" << in.pipeline_trace_key << "\n";
 	if (!in.jitter_fault.empty())
 		out << "JitterFault=" << in.jitter_fault << "\n";
 	if (in.report_key != 0)
@@ -504,6 +561,25 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		out << "FlightFault=" << in.flight_fault << "\n";
 	out << "KeepInterface=" << (in.keep_interface ? 1 : 0) << "\n";
 	out << "ForceSystemMemory=" << (in.force_system_memory ? 1 : 0) << "\n";
+#if AEONSR_FRAME_GENERATION
+	out << "FrameGeneration=" << (in.frame_generation ? 1 : 0) << "\n";
+	out << "FrameGenerationLimit=" << (in.frame_generation_limit <= kFrameGenerationLimitMax
+		? in.frame_generation_limit : 0u) << "\n";
+	if (!in.frame_generation_own_window)
+		out << "FrameGenerationOwnWindow=0\n";
+	if (!in.frame_generation_window_host)
+		out << "FrameGenerationWindowHost=0\n";
+	if (in.frame_generation_multiplier >= 2 && in.frame_generation_multiplier <= kFrameGenerationMultiplierMax)
+		out << "FrameGenerationMultiplier=" << in.frame_generation_multiplier << "\n";
+	else
+		out << "FrameGenerationMultiplier=Auto\n";
+	out << "FrameGenerator=" << frame_generator_key(in.frame_generator < kFrameGeneratorCount
+		? static_cast<FrameGenerator>(in.frame_generator) : FrameGenerator::AeonSR) << "\n";
+	if (in.frame_generation_dump != 0)
+		out << "FrameGenerationDump=" << in.frame_generation_dump << "\n";
+	if (!in.frame_generation_dump_dir.empty())
+		out << "FrameGenerationDumpDir=" << in.frame_generation_dump_dir << "\n";
+#endif
 	out << "MvProbe=" << (in.mv_probe ? 1 : 0) << "\n";
 	if (in.gpu_timings)
 		out << "GpuTimings=1\n";

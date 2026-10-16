@@ -49,6 +49,8 @@ struct JitterArm {
 	bool tested_quads = false;
 	bool scene_quads = false;
 	bool depth_regrid = false;
+	bool layers = false;
+	bool depth_proven = false;
 	uint64_t back_buffer = 0;
 	uint64_t back_buffers[kJitterBackBuffers]{};
 	uint32_t back_buffer_count = 0;
@@ -62,6 +64,18 @@ JitterArm disarmed(const JitterArm &arm) noexcept;
 void jitter_arm_add_back_buffer(JitterArm &arm, uint64_t back_buffer) noexcept;
 bool jitter_arm_into_back_buffer(const JitterArm &arm, uint64_t target) noexcept;
 
+enum class JitterProofWhy : uint32_t {
+	Perspective,
+	Flat,
+	NotAsked,
+	NoTerms,
+	Replaced,
+	Deferred,
+	NotRead,
+	Count
+};
+inline constexpr uint32_t kJitterProofWhyCount = static_cast<uint32_t>(JitterProofWhy::Count);
+
 struct JitterDrawCounts {
 	uint32_t plain = 0;
 	uint64_t serial[kJitterCountedArms]{};
@@ -72,9 +86,11 @@ struct JitterDrawCounts {
 	uint32_t plain_aliased = 0;
 	uint32_t by_target = 0;
 	uint32_t depth_draws = 0;
+	uint32_t depth_tested = 0;
 	uint32_t outside_draws = 0;
 	uint32_t interface_kept = 0;
 	uint32_t interface_kept_outside = 0;
+	uint32_t proof_why[kJitterProofWhyCount]{};
 	uint32_t all_draws = 0;
 	uint32_t quads_moved = 0;
 	uint32_t quads_kept = 0;
@@ -87,7 +103,7 @@ struct JitterDrawCounts {
 };
 
 void count_moved_draws(JitterDrawCounts &c, uint64_t serial, uint32_t n = 1u) noexcept;
-void count_scene_draw(JitterDrawCounts &c, uint64_t bound_serial, bool aliased = false) noexcept;
+void count_scene_draw(JitterDrawCounts &c, uint64_t bound_serial, bool aliased = false, uint32_t n = 1u) noexcept;
 void count_other_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n = 1u) noexcept;
 void count_other_depth_draw(JitterDrawCounts &c, uint32_t w, uint32_t h, uint32_t n = 1u) noexcept;
 void add_draw_counts(JitterDrawCounts &into, const JitterDrawCounts &from) noexcept;
@@ -131,6 +147,8 @@ struct JitterListState {
 	bool scene_perspective = false;
 	uint64_t depth_cleared_serial = 0;
 	bool scene_tested = false;
+	bool sky_first = false;
+	bool layer = false;
 	JitterMovedSet moved[kJitterMovedHistory]{};
 	uint32_t moved_next = 0;
 };
@@ -186,8 +204,10 @@ struct JitterFrame {
 	uint32_t plain_aliased = 0;
 	uint32_t by_target = 0;
 	uint32_t depth_draws = 0;
+	uint32_t depth_tested = 0;
 	uint32_t outside_draws = 0;
 	uint32_t interface_kept = 0, interface_kept_outside = 0;
+	uint32_t proof_why[kJitterProofWhyCount]{};
 	uint32_t all_draws = 0;
 	uint32_t quads_moved = 0, quads_kept = 0;
 	uint32_t other_w = 0, other_h = 0, other_draws = 0;
@@ -204,7 +224,25 @@ struct JitterFrame {
 };
 
 bool jitter_frame_like(uint32_t w, uint32_t h, uint32_t dw, uint32_t dh) noexcept;
-bool jitter_move_all(bool was_on, const JitterFrame &frame) noexcept;
+bool jitter_move_all(bool was_on, const JitterFrame &frame, bool depth_proven = false) noexcept;
+bool jitter_interface_alone(const JitterFrame &frame, bool depth_proven) noexcept;
+struct JitterDepthProof {
+	uint32_t proven_w = 0, proven_h = 0;
+	bool armed_proven = false;
+	bool arm(bool by_depth, uint32_t w, uint32_t h, const JitterFrame &drawn) noexcept;
+	void reset() noexcept { *this = JitterDepthProof{}; }
+};
+struct JitterSceneSize {
+	uint32_t learned_w = 0, learned_h = 0, learned_dw = 0, learned_dh = 0;
+	uint32_t depth_w = 0, depth_h = 0, depth_dw = 0, depth_dh = 0;
+	uint32_t comp_w = 0, comp_h = 0, comp_dw = 0, comp_dh = 0;
+	uint32_t w = 0, h = 0;
+	bool by_depth = false;
+	bool by_composite = false;
+	void find(uint64_t scene_depth, uint32_t sel_w, uint32_t sel_h, uint32_t dw, uint32_t dh,
+		const JitterFrame &drawn, uint32_t cw = 0, uint32_t ch = 0) noexcept;
+	void reset() noexcept { *this = JitterSceneSize{}; }
+};
 bool jitter_draw_into_window(const JitterListState &s, const JitterArm &arm) noexcept;
 inline constexpr uint32_t kJitterLearnDraws = 16u;
 bool jitter_learn_scene_size(const JitterFrame &frame, uint32_t display_w, uint32_t display_h,
@@ -237,16 +275,46 @@ public:
 	static constexpr uint32_t kPresentedHistory = 8u;
 	void note_pass_target(uint64_t target) noexcept { last_pass_target_.store(target, std::memory_order_relaxed); }
 	void note_presentation() noexcept;
+	void note_presentation_from(uint64_t from, bool composite = false) noexcept;
+	void forget_composite(uint64_t target) noexcept;
+	bool composite_window(uint64_t target) const noexcept;
+	void note_composite_size(uint64_t from, uint32_t w, uint32_t h) noexcept;
+	uint64_t composite_size() const noexcept { return composite_size_.load(std::memory_order_acquire); }
 	void forget_target(uint64_t resource) noexcept;
 	void note_frame_depth() noexcept { saw_frame_depth_.store(true, std::memory_order_relaxed); }
-	void note_scene_tested(uint64_t serial) noexcept
+	void note_scene_tested(uint64_t serial, bool window = false) noexcept
 	{
-		if (serial != 0 && scene_tested_.load(std::memory_order_relaxed) != serial)
+		if (serial == 0)
+			return;
+		if (scene_tested_.load(std::memory_order_relaxed) != serial)
 			scene_tested_.store(serial, std::memory_order_relaxed);
+		const uint64_t frame = boundaries_.load(std::memory_order_relaxed);
+		if (scene_tested_boundary_.load(std::memory_order_relaxed) != frame)
+			scene_tested_boundary_.store(frame, std::memory_order_relaxed);
+		if (window && window_tested_.load(std::memory_order_relaxed) != serial)
+			window_tested_.store(serial, std::memory_order_relaxed);
 	}
 	bool scene_tested(uint64_t serial) const noexcept
 	{
 		return serial != 0 && scene_tested_.load(std::memory_order_relaxed) == serial;
+	}
+	bool scene_tested_in_frame(uint64_t serial, bool on_list) const noexcept;
+	bool frames_delimited() const noexcept { return !promoted_forced_.load(std::memory_order_relaxed); }
+	static constexpr uint64_t kSkyArms = 2u;
+	bool window_tested_lately(uint64_t serial) const noexcept
+	{
+		const uint64_t w = window_tested_.load(std::memory_order_relaxed);
+		return serial != 0 && w != 0 && w <= serial && serial - w <= kSkyArms;
+	}
+	bool sky_first(const JitterArm &arm) const noexcept
+	{
+		return !arm.depth_proven || window_tested_lately(arm.serial);
+	}
+	bool perspective_seen() const noexcept { return scene_perspective_.load(std::memory_order_relaxed) != 0; }
+	void forget_scene_seen() noexcept
+	{
+		scene_tested_.store(0, std::memory_order_relaxed);
+		scene_perspective_.store(0, std::memory_order_relaxed);
 	}
 	void note_scene_perspective(uint64_t serial) noexcept
 	{
@@ -260,8 +328,10 @@ public:
 	bool saw_frame_depth() const noexcept { return saw_frame_depth_.load(std::memory_order_relaxed); }
 	void forget_scene_targets() noexcept;
 	bool swapchain_image(uint64_t resource) const noexcept;
+	bool swapchain_watched() const noexcept;
 	void back_buffers_into(JitterArm &arm) const noexcept;
 	void note_render_pass(uint64_t target, bool depth) noexcept;
+	void note_chain_written(uint64_t target) noexcept;
 	bool in_frame() const noexcept { return in_frame_.load(); }
 	void promote_now(bool forced = false) noexcept;
 	JitterPromotions take_promotions() noexcept;
@@ -298,6 +368,7 @@ private:
 	std::atomic<bool> lags_{ false };
 	std::atomic<bool> in_frame_{ false };
 	std::atomic<uint64_t> boundaries_{ 0 };
+	std::atomic<uint64_t> frame_image_{ 0 };
 	JitterPromotions promotions_{};
 	uint64_t swapchain_[kJitterBackBuffers]{};
 	uint32_t swapchain_count_ = 0;
@@ -307,6 +378,11 @@ private:
 	std::atomic<uint64_t> scene_target_sizes_[kJitterSceneTargets]{};
 	std::atomic<uint32_t> scene_target_next_{ 0 };
 	std::atomic<uint64_t> presented_[kJitterPresentedTargets]{};
+	std::atomic<uint64_t> composite_[kJitterPresentedTargets]{};
+	std::atomic<uint32_t> composite_next_{ 0 };
+	std::atomic<uint64_t> composite_size_{ 0 };
+	uint64_t composite_seen_[kPresentedHistory]{};
+	uint32_t composite_seen_next_ = 0;
 	std::atomic<uint64_t> last_pass_target_{ 0 };
 	std::mutex presentation_lock_;
 	uint64_t presentations_[kPresentedHistory]{};
@@ -314,6 +390,9 @@ private:
 	std::atomic<uint32_t> presented_next_{ 0 };
 	std::atomic<bool> saw_frame_depth_{ false };
 	std::atomic<uint64_t> scene_tested_{ 0 };
+	std::atomic<uint64_t> scene_tested_boundary_{ 0 };
+	std::atomic<bool> promoted_forced_{ false };
+	std::atomic<uint64_t> window_tested_{ 0 };
 	std::atomic<uint64_t> scene_perspective_{ 0 };
 	std::atomic<uint64_t> frame_{ 0 };
 	std::atomic<bool> scene_known_{ false };
@@ -445,6 +524,9 @@ struct JitterFault {
 	float told_sign_x = 1.0f;
 	bool game_jitter_still = false;
 	bool game_jitter_forget = false;
+	bool game_jitter_assume = false;
+	bool withheld_no_restore = false;
+	bool withheld_no_fill = false;
 };
 
 bool parse_jitter_fault(const std::string &text, JitterFault *out);

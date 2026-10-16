@@ -143,8 +143,46 @@ public:
 
 	bool parse();
 	JitterVertexClass classify(const char *entry);
+	bool w_terms(const char *entry, SpirvWTerms *out);
 
 private:
+	struct Elem {
+		uint32_t id = 0;
+		uint32_t ctx = 0;
+		uint32_t depth = 0;
+		uint32_t path[kMaxPath]{};
+		int lane = -1;
+	};
+	enum class FactorKind : uint8_t { Fail, Constant, Uniform, Coordinate };
+	struct Factor {
+		FactorKind kind = FactorKind::Fail;
+		uint8_t term = 0;
+		uint32_t set = 0, binding = 0, offset = 0;
+		int lane = -1;
+	};
+	struct MemberLayout {
+		uint32_t offset = kNone;
+		uint32_t matrix_stride = 0;
+		bool row_major = false;
+	};
+
+	Elem elem(uint32_t id, uint32_t ctx, const uint32_t *path, uint32_t depth) const noexcept;
+	void innermost_lane(Elem &e, uint32_t type, const uint32_t *idx, uint32_t n) const noexcept;
+	int input_lane(const Loc &l, const Elem &e) const noexcept;
+	bool zero_constant(uint32_t id) const noexcept;
+	int move(Elem &e);
+	bool location(const Loc &l, const Elem &e, Factor &f) const;
+	int8_t inputs(uint32_t id, uint32_t ctx, uint32_t depth);
+	Factor factor(Elem e, uint32_t depth);
+	bool product(const Factor &a, const Factor &b);
+	bool sum(Elem e, uint32_t depth);
+
+	std::unordered_map<uint32_t, uint32_t> set_of_, binding_of_, array_stride_;
+	std::unordered_set<uint32_t> block_types_;
+	std::unordered_map<uint64_t, MemberLayout> members_;
+	std::unordered_map<uint64_t, int8_t> inputs_;
+	SpirvWTerms *terms_ = nullptr;
+
 	uint32_t word(uint32_t index, uint32_t k) const noexcept
 	{
 		const Instr &in = instrs_[index];
@@ -344,10 +382,29 @@ bool Reader::parse()
 		case OpDecorate:
 			if (wc >= 4u && w_[p + 2] == DecorationBuiltIn && w_[p + 3] == BuiltInPosition)
 				pos_vars_.push_back(w_[p + 1]);
+			if (wc >= 4u && w_[p + 2] == DecorationDescriptorSet)
+				set_of_[w_[p + 1]] = w_[p + 3];
+			else if (wc >= 4u && w_[p + 2] == DecorationBinding)
+				binding_of_[w_[p + 1]] = w_[p + 3];
+			else if (wc >= 4u && w_[p + 2] == DecorationArrayStride)
+				array_stride_[w_[p + 1]] = w_[p + 3];
+			else if (wc >= 3u && (w_[p + 2] == DecorationBlock || w_[p + 2] == DecorationBufferBlock))
+				block_types_.insert(w_[p + 1]);
 			break;
 		case OpMemberDecorate:
 			if (wc >= 5u && w_[p + 3] == DecorationBuiltIn && w_[p + 4] == BuiltInPosition)
 				pos_members_.emplace_back(w_[p + 1], w_[p + 2]);
+			if (wc >= 4u) {
+				MemberLayout &m = members_[(static_cast<uint64_t>(w_[p + 1]) << 32) | w_[p + 2]];
+				if (w_[p + 3] == DecorationOffset && wc >= 5u)
+					m.offset = w_[p + 4];
+				else if (w_[p + 3] == DecorationMatrixStride && wc >= 5u)
+					m.matrix_stride = w_[p + 4];
+				else if (w_[p + 3] == DecorationRowMajor)
+					m.row_major = true;
+				else if (w_[p + 3] == DecorationColMajor)
+					m.row_major = false;
+			}
 			break;
 		case OpVariable:
 			if (wc >= 4u && w_[p + 3] == StorageClassOutput)
@@ -1352,6 +1409,698 @@ JitterVertexClass Reader::classify(const char *entry)
 		return JitterVertexClass::Unknown;
 	return total.matrix || total.arith >= 3u || total.terms >= 2u ? JitterVertexClass::Transformed
 																	: JitterVertexClass::Screen;
+}
+
+Reader::Elem Reader::elem(uint32_t id, uint32_t ctx, const uint32_t *path, uint32_t depth) const noexcept
+{
+	Elem e;
+	e.id = id;
+	e.ctx = ctx;
+	e.depth = depth < kMaxPath ? depth : kMaxPath;
+	for (uint32_t i = 0; i < e.depth; ++i)
+		e.path[i] = path[i];
+	innermost_lane(e, type_of(id), e.path, e.depth);
+	return e;
+}
+
+void Reader::innermost_lane(Elem &e, uint32_t type, const uint32_t *idx, uint32_t n) const noexcept
+{
+	if (e.lane >= 0)
+		return;
+	int lane = -1;
+	uint32_t t = type;
+	for (uint32_t k = 0; k < n && t != 0u; ++k) {
+		if (vector_size(t) != 0u && idx[k] < 16u)
+			lane = static_cast<int>(idx[k]);
+		t = member_type(t, idx[k]);
+	}
+	e.lane = lane;
+}
+
+int Reader::input_lane(const Loc &l, const Elem &e) const noexcept
+{
+	if (l.truncated)
+		return -1;
+	const uint32_t pt = def(type_of(l.root));
+	if (pt == kNone || instrs_[pt].op != OpTypePointer)
+		return -1;
+	uint32_t idx[2u * kMaxPath];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < l.depth; ++i) {
+		if (l.path[i] == kNone)
+			return -1;
+		idx[n++] = l.path[i];
+	}
+	for (uint32_t i = 0; i < e.depth; ++i)
+		idx[n++] = e.path[i];
+	Elem at;
+	innermost_lane(at, word(pt, 3), idx, n);
+	return at.lane;
+}
+
+bool Reader::zero_constant(uint32_t id) const noexcept
+{
+	const uint32_t d = def(id);
+	if (d == kNone)
+		return false;
+	const Instr &in = instrs_[d];
+	if (in.op == OpConstantNull)
+		return true;
+	if (in.op == OpConstant) {
+		const uint32_t t = def(word(d, 1));
+		return in.wc == 4u && t != kNone && instrs_[t].op == OpTypeFloat && word(t, 2) == 32u &&
+			(word(d, 3) & 0x7FFFFFFFu) == 0u;
+	}
+	if (in.op == OpConstantComposite) {
+		for (uint32_t k = 3; k < in.wc; ++k)
+			if (!zero_constant(word(d, k)))
+				return false;
+		return in.wc > 3u;
+	}
+	return false;
+}
+
+int Reader::move(Elem &e)
+{
+	if (!step())
+		return -1;
+	const uint32_t d = def(e.id);
+	if (d == kNone)
+		return -1;
+	const Instr &in = instrs_[d];
+	const auto drop_first = [&e]() {
+		for (uint32_t i = 1; i < e.depth; ++i)
+			e.path[i - 1] = e.path[i];
+		--e.depth;
+	};
+	switch (in.op) {
+	case OpCopyObject:
+	case OpCopyLogical:
+		e.id = word(d, 3);
+		return 1;
+	case OpCompositeExtract: {
+		if (in.wc < 5u)
+			return -1;
+		const uint32_t n = in.wc - 4u;
+		if (n + e.depth > kMaxPath)
+			return -1;
+		uint32_t idx[kMaxPath];
+		for (uint32_t k = 0; k < n; ++k)
+			idx[k] = word(d, 4u + k);
+		const uint32_t from = word(d, 3);
+		innermost_lane(e, type_of(from), idx, n);
+		for (uint32_t k = e.depth; k-- > 0;)
+			e.path[k + n] = e.path[k];
+		for (uint32_t k = 0; k < n; ++k)
+			e.path[k] = idx[k];
+		e.depth += n;
+		e.id = from;
+		return 1;
+	}
+	case OpCompositeInsert: {
+		if (in.wc < 6u)
+			return -1;
+		const uint32_t n = in.wc - 5u;
+		const uint32_t common = n < e.depth ? n : e.depth;
+		for (uint32_t k = 0; k < common; ++k) {
+			if (e.path[k] != word(d, 5u + k)) {
+				e.id = word(d, 4);
+				return 1;
+			}
+		}
+		if (e.depth < n)
+			return -1;
+		for (uint32_t k = n; k < e.depth; ++k)
+			e.path[k - n] = e.path[k];
+		e.depth -= n;
+		e.id = word(d, 3);
+		return 1;
+	}
+	case OpVectorShuffle: {
+		if (e.depth == 0u)
+			return -1;
+		const uint32_t r = e.path[0];
+		if (r >= 16u || 5u + r >= in.wc)
+			return -1;
+		const uint32_t c = word(d, 5u + r);
+		const uint32_t n1 = vector_size(type_of(word(d, 3)));
+		if (c == kNone || n1 == 0u)
+			return -1;
+		if (c < n1) {
+			e.id = word(d, 3);
+			e.path[0] = c;
+		} else {
+			e.id = word(d, 4);
+			e.path[0] = c - n1;
+		}
+		return 1;
+	}
+	case OpCompositeConstruct: {
+		if (e.depth == 0u)
+			return -1;
+		const uint32_t k = e.path[0];
+		if (vector_size(word(d, 1)) != 0u) {
+			uint32_t pos = 0;
+			for (uint32_t i = 3; i < in.wc; ++i) {
+				const uint32_t c = word(d, i);
+				const uint32_t cn = vector_size(type_of(c));
+				const uint32_t width = cn != 0u ? cn : 1u;
+				if (k < pos + width) {
+					if (cn != 0u)
+						e.path[0] = k - pos;
+					else
+						drop_first();
+					e.id = c;
+					return 1;
+				}
+				pos += width;
+			}
+			return -1;
+		}
+		if (k >= in.wc - 3u)
+			return -1;
+		e.id = word(d, 3u + k);
+		drop_first();
+		return 1;
+	}
+	case OpSelect:
+		if (zero_constant(word(d, 4))) {
+			e.id = word(d, 5);
+			return 1;
+		}
+		if (zero_constant(word(d, 5))) {
+			e.id = word(d, 4);
+			return 1;
+		}
+		return -1;
+	case OpFunctionParameter: {
+		uint32_t arg = 0, outer = 0, n = 0;
+		if (!parameter_args(e.id, e.ctx, [&](uint32_t a, uint32_t o) {
+				arg = a;
+				outer = o;
+				++n;
+			}) || n != 1u)
+			return -1;
+		e.id = arg;
+		e.ctx = outer;
+		return 1;
+	}
+	case OpFunctionCall: {
+		const auto f = func_of_id_.find(word(d, 3));
+		if (f == func_of_id_.end())
+			return -1;
+		const uint32_t inner = push_ctx(e.ctx, d);
+		if (fail_)
+			return -1;
+		uint32_t value = 0, n = 0;
+		for (const uint32_t r : funcs_[f->second].returns) {
+			const uint32_t t = blocks_[r].last;
+			if (instrs_[t].op != OpReturnValue)
+				return -1;
+			value = word(t, 1);
+			++n;
+		}
+		if (n != 1u)
+			return -1;
+		e.id = value;
+		e.ctx = inner;
+		return 1;
+	}
+	case OpLoad: {
+		Loc l;
+		if (!resolve(word(d, 3), l))
+			return -1;
+		const uint32_t sc = storage_of(l.root);
+		const uint32_t rd = def(l.root);
+		const bool parameter = sc == kNone && rd != kNone && instrs_[rd].op == OpFunctionParameter;
+		if (sc != StorageClassFunction && sc != StorageClassPrivate && !parameter)
+			return 0;
+		finish_loc(l);
+		const uint32_t loaded = word(d, 1);
+		const uint32_t vec = vector_size(loaded);
+		const uint32_t lanes = vec != 0u && e.depth != 0u && e.path[0] < 16u ? 1u << e.path[0] : kAll;
+		std::vector<Item> items;
+		if (!load_values(d, e.ctx, lanes, items))
+			return -1;
+		for (size_t i = 1; i < items.size(); ++i)
+			if (items[i].id != items[0].id || items[i].ctx != items[0].ctx)
+				return -1;
+		if (items.empty())
+			return -1;
+		const uint32_t vt = type_of(items[0].id);
+		e.ctx = items[0].ctx;
+		e.id = items[0].id;
+		if (vt == loaded)
+			return 1;
+		if (vec != 0u && e.depth != 0u && vt == member_type(loaded, e.path[0])) {
+			drop_first();
+			return 1;
+		}
+		const uint32_t lane_bits = items[0].lanes;
+		if (vector_size(vt) != 0u && member_type(vt, 0u) == loaded && lane_bits != 0u &&
+			(lane_bits & (lane_bits - 1u)) == 0u && e.depth < kMaxPath) {
+			uint32_t bit = 0;
+			while ((lane_bits >> bit) != 1u)
+				++bit;
+			for (uint32_t k = e.depth; k-- > 0;)
+				e.path[k + 1u] = e.path[k];
+			e.path[0] = bit;
+			++e.depth;
+			if (e.lane < 0)
+				e.lane = static_cast<int>(bit);
+			return 1;
+		}
+		return -1;
+	}
+	default:
+		return 0;
+	}
+}
+
+bool Reader::location(const Loc &l, const Elem &e, Factor &f) const
+{
+	const uint32_t sc = storage_of(l.root);
+	if (sc != StorageClassUniform && sc != StorageClassStorageBuffer && sc != StorageClassPushConstant)
+		return false;
+	if (l.truncated)
+		return false;
+	const uint32_t pt = def(type_of(l.root));
+	if (pt == kNone || instrs_[pt].op != OpTypePointer)
+		return false;
+	uint32_t t = word(pt, 3);
+	if (block_types_.count(t) == 0u)
+		return false;
+	uint32_t path[2u * kMaxPath];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < l.depth; ++i) {
+		if (l.path[i] == kNone)
+			return false;
+		path[n++] = l.path[i];
+	}
+	for (uint32_t i = 0; i < e.depth; ++i)
+		path[n++] = e.path[i];
+	uint64_t offset = 0;
+	uint32_t matrix_stride = 0;
+	bool row_major = false, in_matrix = false;
+	for (uint32_t k = 0; k < n; ++k) {
+		const uint32_t td = def(t);
+		if (td == kNone)
+			return false;
+		const uint32_t i = path[k];
+		switch (instrs_[td].op) {
+		case OpTypeStruct: {
+			const auto m = members_.find((static_cast<uint64_t>(t) << 32) | i);
+			if (m == members_.end() || m->second.offset == kNone || i + 2u >= instrs_[td].wc)
+				return false;
+			offset += m->second.offset;
+			matrix_stride = m->second.matrix_stride;
+			row_major = m->second.row_major;
+			t = word(td, 2u + i);
+			break;
+		}
+		case OpTypeArray:
+		case OpTypeRuntimeArray: {
+			const auto s = array_stride_.find(t);
+			if (s == array_stride_.end())
+				return false;
+			offset += static_cast<uint64_t>(i) * s->second;
+			t = word(td, 2);
+			break;
+		}
+		case OpTypeMatrix:
+			if (matrix_stride == 0u)
+				return false;
+			offset += row_major ? static_cast<uint64_t>(i) * 4u : static_cast<uint64_t>(i) * matrix_stride;
+			in_matrix = true;
+			t = word(td, 2);
+			break;
+		case OpTypeVector:
+			offset += in_matrix && row_major ? static_cast<uint64_t>(i) * matrix_stride : static_cast<uint64_t>(i) * 4u;
+			t = word(td, 2);
+			break;
+		default:
+			return false;
+		}
+		if (offset > 0xFFFFFFFull)
+			return false;
+	}
+	const uint32_t fd = def(t);
+	if (fd == kNone || instrs_[fd].op != OpTypeFloat || word(fd, 2) != 32u)
+		return false;
+	f.kind = FactorKind::Uniform;
+	f.offset = static_cast<uint32_t>(offset);
+	if (sc == StorageClassPushConstant) {
+		f.term = SpirvWTerms::Push;
+		return true;
+	}
+	const auto set = set_of_.find(l.root);
+	const auto binding = binding_of_.find(l.root);
+	if (set == set_of_.end() || binding == binding_of_.end())
+		return false;
+	f.term = SpirvWTerms::Buffer;
+	f.set = set->second;
+	f.binding = binding->second;
+	return true;
+}
+
+int8_t Reader::inputs(uint32_t id, uint32_t ctx, uint32_t depth)
+{
+	if (depth > 32u || fail_ || !step())
+		return -1;
+	const uint64_t key = (static_cast<uint64_t>(id) << 32) | ctx;
+	const auto it = inputs_.find(key);
+	if (it != inputs_.end())
+		return it->second;
+	inputs_[key] = 0;
+	const uint32_t d = def(id);
+	bool any = false, unknown = d == kNone;
+	const auto take = [&](uint32_t x, uint32_t c) {
+		const int8_t v = inputs(x, c, depth + 1u);
+		if (v > 0)
+			any = true;
+		else if (v < 0)
+			unknown = true;
+	};
+	if (d != kNone) {
+		const Instr &in = instrs_[d];
+		const auto all_from = [&](uint32_t from) {
+			for (uint32_t k = from; k < in.wc; ++k)
+				take(word(d, k), ctx);
+		};
+		if (in.op == OpUndef) {
+			unknown = true;
+		} else if (is_constant(in.op)) {
+		} else {
+			switch (in.op) {
+			case OpLoad: {
+				Loc l;
+				if (!resolve(word(d, 3), l)) {
+					unknown = true;
+					break;
+				}
+				const uint32_t sc = storage_of(l.root);
+				if (sc == StorageClassInput) {
+					any = true;
+				} else if (sc != kNone && uniform_storage(sc)) {
+				} else if (sc == StorageClassFunction || sc == StorageClassPrivate) {
+					std::vector<Item> items;
+					const bool keep = fail_;
+					const bool ok = load_values(d, ctx, kAll, items);
+					fail_ = keep;
+					if (!ok)
+						unknown = true;
+					for (const Item &i : items)
+						take(i.id, i.ctx);
+				} else {
+					unknown = true;
+				}
+				break;
+			}
+			case OpFunctionParameter:
+				if (!parameter_args(id, ctx, [&](uint32_t a, uint32_t o) { take(a, o); }))
+					unknown = true;
+				break;
+			case OpFunctionCall: {
+				const auto f = func_of_id_.find(word(d, 3));
+				const uint32_t inner = f != func_of_id_.end() ? push_ctx(ctx, d) : 0u;
+				if (f == func_of_id_.end() || fail_) {
+					unknown = true;
+					break;
+				}
+				for (const uint32_t r : funcs_[f->second].returns) {
+					const uint32_t t = blocks_[r].last;
+					if (instrs_[t].op == OpReturnValue)
+						take(word(t, 1), inner);
+					else
+						unknown = true;
+				}
+				break;
+			}
+			case OpCompositeExtract:
+			case OpCopyObject:
+			case OpCopyLogical:
+			case OpBitcast:
+			case OpTranspose:
+				take(word(d, 3), ctx);
+				break;
+			case OpVectorShuffle:
+			case OpCompositeInsert:
+				take(word(d, 3), ctx);
+				take(word(d, 4), ctx);
+				break;
+			case OpPhi:
+				for (uint32_t k = 3; k + 1u < in.wc; k += 2u)
+					take(word(d, k), ctx);
+				break;
+			case OpExtInst:
+				if (glsl_ != 0u && word(d, 3) == glsl_ && in.wc >= 5u && !glsl_takes_pointer(word(d, 4)))
+					all_from(5u);
+				else
+					unknown = true;
+				break;
+			case OpCompositeConstruct:
+			case OpSelect:
+			case OpDot:
+			case OpVectorTimesScalar:
+			case OpMatrixTimesScalar:
+			case OpVectorTimesMatrix:
+			case OpMatrixTimesVector:
+			case OpMatrixTimesMatrix:
+			case OpOuterProduct:
+				all_from(3u);
+				break;
+			default:
+				if ((in.op >= OpConvertFToU && in.op <= OpQuantizeToF16) || (in.op >= OpSNegate && in.op <= OpFMod) ||
+					(in.op >= OpIsNan && in.op <= OpFUnordGreaterThanEqual) ||
+					(in.op >= OpShiftRightLogical && in.op <= OpNot))
+					all_from(3u);
+				else
+					unknown = true;
+				break;
+			}
+		}
+	}
+	const int8_t r = any ? 1 : unknown ? -1 : 0;
+	inputs_[key] = r;
+	return r;
+}
+
+Reader::Factor Reader::factor(Elem e, uint32_t depth)
+{
+	Factor f;
+	if (depth > 64u)
+		return f;
+	for (;;) {
+		const int m = move(e);
+		if (m < 0 || fail_)
+			return f;
+		if (m == 0)
+			break;
+	}
+	const uint32_t d = def(e.id);
+	if (d == kNone)
+		return f;
+	const Instr &in = instrs_[d];
+	f.lane = e.lane;
+	if (in.op == OpUndef)
+		return f;
+	if (is_constant(in.op)) {
+		f.kind = FactorKind::Constant;
+		return f;
+	}
+	if (in.op == OpLoad) {
+		Loc l;
+		if (!resolve(word(d, 3), l))
+			return f;
+		const uint32_t sc = storage_of(l.root);
+		if (sc == StorageClassInput) {
+			f.lane = input_lane(l, e);
+			f.kind = FactorKind::Coordinate;
+		} else if (sc != kNone && uniform_storage(sc) && !location(l, e, f)) {
+			f.kind = FactorKind::Fail;
+		}
+		return f;
+	}
+	const int8_t from = inputs(e.id, e.ctx, 0u);
+	f.kind = from > 0 ? FactorKind::Coordinate : from == 0 ? FactorKind::Constant : FactorKind::Fail;
+	return f;
+}
+
+bool Reader::product(const Factor &a, const Factor &b)
+{
+	if (a.kind == FactorKind::Fail || b.kind == FactorKind::Fail)
+		return false;
+	const bool ka = a.kind != FactorKind::Coordinate, kb = b.kind != FactorKind::Coordinate;
+	if (ka && kb)
+		return true;
+	if (!ka && !kb)
+		return false;
+	const Factor &k = ka ? a : b;
+	const Factor &v = ka ? b : a;
+	if (v.lane == 3)
+		return true;
+	if (k.kind != FactorKind::Uniform)
+		return false;
+	SpirvWTerms &t = *terms_;
+	for (uint32_t i = 0; i < t.count; ++i) {
+		if (t.kind[i] == k.term && t.offset[i] == k.offset &&
+			(k.term == SpirvWTerms::Push || (t.set[i] == k.set && t.binding[i] == k.binding)))
+			return true;
+	}
+	if (t.count == SpirvWTerms::kMax)
+		return false;
+	t.kind[t.count] = k.term;
+	t.set[t.count] = k.term == SpirvWTerms::Push ? 0u : k.set;
+	t.binding[t.count] = k.term == SpirvWTerms::Push ? 0u : k.binding;
+	t.offset[t.count] = k.offset;
+	++t.count;
+	return true;
+}
+
+bool Reader::sum(Elem e, uint32_t depth)
+{
+	if (depth > 64u)
+		return false;
+	for (;;) {
+		const int m = move(e);
+		if (m < 0 || fail_)
+			return false;
+		if (m == 0)
+			break;
+	}
+	const uint32_t d = def(e.id);
+	if (d == kNone)
+		return false;
+	const Instr &in = instrs_[d];
+	if (in.op == OpUndef)
+		return false;
+	if (is_constant(in.op))
+		return true;
+	const auto operand = [&](uint32_t id) { return elem(id, e.ctx, e.path, e.depth); };
+	switch (in.op) {
+	case OpLoad: {
+		Loc l;
+		if (!resolve(word(d, 3), l))
+			return false;
+		const uint32_t sc = storage_of(l.root);
+		if (sc == StorageClassInput)
+			return input_lane(l, e) == 3;
+		return sc == StorageClassUniform || sc == StorageClassStorageBuffer || sc == StorageClassPushConstant;
+	}
+	case OpFAdd:
+	case OpFSub:
+		return sum(operand(word(d, 3)), depth + 1u) && sum(operand(word(d, 4)), depth + 1u);
+	case OpFNegate:
+		return sum(operand(word(d, 3)), depth + 1u);
+	case OpFMul:
+		return product(factor(operand(word(d, 3)), depth + 1u), factor(operand(word(d, 4)), depth + 1u));
+	case OpVectorTimesScalar:
+		return product(factor(operand(word(d, 3)), depth + 1u), factor(elem(word(d, 4), e.ctx, nullptr, 0u), depth + 1u));
+	case OpDot: {
+		if (e.depth != 0u)
+			return false;
+		const uint32_t n = vector_size(type_of(word(d, 3)));
+		if (n == 0u || n > 4u)
+			return false;
+		for (uint32_t i = 0; i < n; ++i) {
+			const uint32_t at[1] = { i };
+			if (!product(factor(elem(word(d, 3), e.ctx, at, 1u), depth + 1u),
+					factor(elem(word(d, 4), e.ctx, at, 1u), depth + 1u)))
+				return false;
+		}
+		return true;
+	}
+	case OpMatrixTimesVector: {
+		if (e.depth != 1u)
+			return false;
+		const uint32_t md = def(type_of(word(d, 3)));
+		if (md == kNone || instrs_[md].op != OpTypeMatrix || word(md, 3) > 4u)
+			return false;
+		const uint32_t r = e.path[0];
+		for (uint32_t j = 0; j < word(md, 3); ++j) {
+			const uint32_t at_m[2] = { j, r }, at_v[1] = { j };
+			if (!product(factor(elem(word(d, 3), e.ctx, at_m, 2u), depth + 1u),
+					factor(elem(word(d, 4), e.ctx, at_v, 1u), depth + 1u)))
+				return false;
+		}
+		return true;
+	}
+	case OpVectorTimesMatrix: {
+		if (e.depth != 1u)
+			return false;
+		const uint32_t n = vector_size(type_of(word(d, 3)));
+		if (n == 0u || n > 4u)
+			return false;
+		const uint32_t c = e.path[0];
+		for (uint32_t j = 0; j < n; ++j) {
+			const uint32_t at_m[2] = { c, j }, at_v[1] = { j };
+			if (!product(factor(elem(word(d, 3), e.ctx, at_v, 1u), depth + 1u),
+					factor(elem(word(d, 4), e.ctx, at_m, 2u), depth + 1u)))
+				return false;
+		}
+		return true;
+	}
+	case OpExtInst:
+		if (glsl_ != 0u && word(d, 3) == glsl_ && in.wc == 8u && word(d, 4) == kGlslFma)
+			return product(factor(operand(word(d, 5)), depth + 1u), factor(operand(word(d, 6)), depth + 1u)) &&
+				sum(operand(word(d, 7)), depth + 1u);
+		return false;
+	default:
+		return false;
+	}
+}
+
+bool Reader::w_terms(const char *entry, SpirvWTerms *out)
+{
+	if (out == nullptr)
+		return false;
+	terms_ = out;
+	std::vector<uint32_t> entry_funcs;
+	const bool by_name = entry != nullptr && entry[0] != '\0';
+	for (const EntryPoint &e : entries_) {
+		if (by_name && !literal_is(e.name, e.name_end, entry))
+			continue;
+		const auto it = func_of_id_.find(e.func);
+		if (it != func_of_id_.end())
+			entry_funcs.push_back(it->second);
+	}
+	if (entry_funcs.size() != 1u)
+		return false;
+	std::vector<Loc> positions;
+	for (const uint32_t v : pos_vars_) {
+		if (storage_of(v) != StorageClassOutput)
+			continue;
+		Loc l;
+		l.root = v;
+		finish_loc(l);
+		positions.push_back(l);
+	}
+	for (const auto &m : pos_members_) {
+		for (const uint32_t v : outputs_) {
+			const uint32_t pt = def(type_of(v));
+			if (pt == kNone || instrs_[pt].op != OpTypePointer || word(pt, 3) != m.first)
+				continue;
+			Loc l;
+			l.root = v;
+			l.depth = 1;
+			l.path[0] = m.second;
+			finish_loc(l);
+			positions.push_back(l);
+		}
+	}
+	if (positions.size() != 1u || positions[0].comps < 4u)
+		return false;
+	std::vector<Item> start;
+	const uint32_t rest = walk_exit(entry_funcs[0], positions[0], 1u << 3, 0u, start, 0u);
+	if (fail_ || rest != 0u || start.empty())
+		return false;
+	for (size_t i = 1; i < start.size(); ++i)
+		if (start[i].id != start[0].id || start[i].ctx != start[0].ctx)
+			return false;
+	const uint32_t at[1] = { 3u };
+	const Elem e = vector_size(type_of(start[0].id)) != 0u ? elem(start[0].id, start[0].ctx, at, 1u)
+															 : elem(start[0].id, start[0].ctx, nullptr, 0u);
+	return sum(e, 0u) && !fail_;
 }
 
 }
@@ -3346,6 +4095,45 @@ JitterVertexClass classify_spirv_vertex_shader(const void *code, size_t bytes, c
 	if (!r.parse())
 		return JitterVertexClass::Unknown;
 	return r.classify(entry_point);
+}
+
+bool spirv_position_w_terms(const void *code, size_t bytes, const char *entry_point, SpirvWTerms *out)
+{
+	if (out == nullptr)
+		return false;
+	*out = SpirvWTerms{};
+	if (code == nullptr || bytes < 20u || (bytes & 3u) != 0u)
+		return false;
+	std::vector<uint32_t> copy;
+	const uint32_t *words = static_cast<const uint32_t *>(code);
+	if ((reinterpret_cast<uintptr_t>(code) & 3u) != 0u) {
+		copy.resize(bytes / 4u);
+		std::memcpy(copy.data(), code, bytes);
+		words = copy.data();
+	}
+	spirv_pos::Reader r(words, bytes / 4u);
+	if (!r.parse() || !r.w_terms(entry_point, out)) {
+		*out = SpirvWTerms{};
+		return false;
+	}
+	return true;
+}
+
+int spirv_w_terms_perspective(const SpirvWTerms &terms, SpirvConstantRead read, void *user) noexcept
+{
+	if (read == nullptr)
+		return -1;
+	bool unknown = false;
+	for (uint32_t i = 0; i < terms.count && i < SpirvWTerms::kMax; ++i) {
+		float x = 0.0f;
+		if (!read(user, terms, i, &x) || x != x) {
+			unknown = true;
+			continue;
+		}
+		if (x > 1e-6f || x < -1e-6f)
+			return 1;
+	}
+	return unknown ? -1 : 0;
 }
 
 JitterVertexClass classify_glsl_vertex_shader(const char *source, size_t length)

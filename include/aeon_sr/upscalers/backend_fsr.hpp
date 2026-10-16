@@ -125,7 +125,9 @@ struct Fsr4D3D12Backend final : UpscalerBackend {
 		ID3D12Resource *backbuffer, ID3D12Resource *motion_vectors,
 		ID3D12Resource *depth,
 		D3D12_RESOURCE_STATES backbuffer_state,
-		const UpscalerParams &params);
+		const UpscalerParams &params,
+		ID3D12Resource *output = nullptr,
+		D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_COMMON);
 
 	bool init_context(ID3D12Device *device, uint32_t w, uint32_t h,
 		DXGI_FORMAT color_format = DXGI_FORMAT_R8G8B8A8_UNORM, bool with_depth = true);
@@ -198,6 +200,7 @@ private:
 	float created_render_scale_ = -1.0f;
 	uint32_t color_flags_ = 0;
 	uint32_t created_color_flags_ = 0xFFFFFFFFu;
+	uint32_t explicit_width_ = 0, explicit_height_ = 0;
 
 	static constexpr D3D12_RESOURCE_STATES kFfxSrvState =
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

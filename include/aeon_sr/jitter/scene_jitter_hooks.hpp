@@ -9,6 +9,8 @@ SceneJitter &scene_jitter() noexcept;
 
 void register_scene_jitter_hooks() noexcept;
 
+void scene_jitter_device_coming(reshade::api::device_api api) noexcept;
+
 JitterFrame take_scene_jitter_frame(reshade::api::effect_runtime *runtime) noexcept;
 
 void discard_scene_jitter_counts(reshade::api::effect_runtime *runtime) noexcept;
@@ -48,8 +50,12 @@ bool draw_indexed(reshade::api::command_list *cmd, uint32_t indices, uint32_t in
 	uint32_t first_index, int32_t first_vertex, uint32_t first_instance);
 bool draw_indirect(reshade::api::command_list *cmd, reshade::api::indirect_command type,
 	reshade::api::resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride);
+bool dispatch_mesh(reshade::api::command_list *cmd, uint32_t group_count_x, uint32_t group_count_y,
+	uint32_t group_count_z);
 void close(reshade::api::command_list *cmd);
 void execute(reshade::api::command_queue *queue, reshade::api::command_list *cmd);
+void present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain, const reshade::api::rect *source,
+	const reshade::api::rect *dest, uint32_t dirty_rect_count, const reshade::api::rect *dirty_rects);
 void execute_secondary(reshade::api::command_list *cmd, reshade::api::command_list *secondary);
 void reset(reshade::api::command_list *cmd);
 void destroy(reshade::api::command_list *cmd);
@@ -63,6 +69,23 @@ void init_pipeline(reshade::api::device *dev, reshade::api::pipeline_layout layo
 void destroy_pipeline(reshade::api::device *dev, reshade::api::pipeline pipe);
 bool clear_depth_stencil(reshade::api::command_list *cmd, reshade::api::resource_view dsv, const float *depth,
 	const uint8_t *stencil, uint32_t rect_count, const reshade::api::rect *rects);
+void push_constants(reshade::api::command_list *cmd, reshade::api::shader_stage stages,
+	reshade::api::pipeline_layout layout, uint32_t param, uint32_t first, uint32_t count, const void *values);
+void push_descriptors(reshade::api::command_list *cmd, reshade::api::shader_stage stages,
+	reshade::api::pipeline_layout layout, uint32_t param, const reshade::api::descriptor_table_update &update);
+void init_pipeline_layout(reshade::api::device *dev, uint32_t count, const reshade::api::pipeline_layout_param *params,
+	reshade::api::pipeline_layout layout);
+void destroy_pipeline_layout(reshade::api::device *dev, reshade::api::pipeline_layout layout);
+void bind_descriptor_tables(reshade::api::command_list *cmd, reshade::api::shader_stage stages,
+	reshade::api::pipeline_layout layout, uint32_t first, uint32_t count, const reshade::api::descriptor_table *tables,
+	uint32_t dynamic_offset_count, const uint32_t *dynamic_offsets);
+bool update_descriptor_tables(reshade::api::device *dev, uint32_t count, const reshade::api::descriptor_table_update *updates);
+bool copy_descriptor_tables(reshade::api::device *dev, uint32_t count, const reshade::api::descriptor_table_copy *copies);
+void destroy_resource(reshade::api::device *dev, reshade::api::resource res);
+bool copy_resource(reshade::api::command_list *cmd, reshade::api::resource source, reshade::api::resource dest);
+bool copy_texture_region(reshade::api::command_list *cmd, reshade::api::resource source, uint32_t source_subresource,
+	const reshade::api::subresource_box *source_box, reshade::api::resource dest, uint32_t dest_subresource,
+	const reshade::api::subresource_box *dest_box, reshade::api::filter_mode filter);
 
 }
 

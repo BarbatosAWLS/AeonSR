@@ -13,6 +13,13 @@ struct FrameObservation {
 	double drawn_change_interface = 0.0, drawn_change_rest = 0.0;
 	double out_flicker_interface = 0.0, out_flicker_rest = 0.0;
 	double motion_rest = 0.0, motion_moving = 0.0, motion_pixels = 0.0;
+	double edges = 0.0, edges_changed = 0.0;
+};
+
+struct FrameEdges {
+	uint64_t serial = 0;
+	uint32_t edges = 0, changed = 0;
+	uint32_t pixels = 0, shown = 0;
 };
 
 class FrameObserverD3D12 {
@@ -21,8 +28,9 @@ public:
 		D3D12_RESOURCE_STATES state);
 	void end(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
 		D3D12_RESOURCE_STATES state, ID3D12Resource *mask, D3D12_RESOURCE_STATES mask_state,
-		ID3D12Resource *motion, D3D12_RESOURCE_STATES motion_state);
+		ID3D12Resource *motion, D3D12_RESOURCE_STATES motion_state, uint64_t serial = 0);
 	FrameObservation take() noexcept;
+	bool take_edges(FrameEdges *out) noexcept;
 	void release() noexcept;
 
 	static constexpr uint32_t kCounters = 32;
@@ -44,6 +52,9 @@ private:
 	uint32_t *mapped_ = nullptr;
 	uint32_t age_[kReadback]{};
 	bool written_[kReadback]{};
+	uint64_t serial_[kReadback]{};
+	FrameEdges held_[kReadback]{};
+	uint32_t held_count_ = 0;
 	uint32_t ring_ = 0;
 	uint32_t cur_ = 0;
 	uint32_t w_ = 0, h_ = 0;

@@ -21,8 +21,9 @@ void InputProbes::tick_motion(const PassContext &ctx, const Settings &s, const F
 	if (ID3D11Device *const dev11 = native_d3d11_device(device)) {
 		ID3D11DeviceContext *const ctx11 = native_d3d11_context(ctx.runtime);
 		auto *const mv_res = native_res<ID3D11Resource>(in.motion_vectors);
-		if (ctx11 != nullptr && mv_res != nullptr)
-			completed = mv11_.tick(dev11, ctx11, mv_res, sw, sh, frame, mv);
+		const bool written_before = in.motion_provider != MotionProvider::Internal || mv11_.written_before(frame);
+		if (ctx11 != nullptr)
+			completed = mv11_.tick(dev11, ctx11, mv_res, sw, sh, frame, mv, written_before);
 	} else if (ID3D12Device *const dev12 = native_d3d12_device(device)) {
 
 		constexpr D3D12_RESOURCE_STATES kSrv =

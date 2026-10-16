@@ -268,7 +268,7 @@ void set_create_params(NeuralParams *p, uint32_t w, uint32_t h, const NeuralRend
 	p->Set(dlssnr_param::kHeight, static_cast<unsigned int>(h));
 	p->Set(dlssnr_param::kScalingRatio, 1.0f);
 	p->Set(dlssnr_param::kStyle, clamp_neural_style(np.style));
-	p->Set(dlssnr_param::kRenderPreset, kNeuralRenderPresetShipping);
+	p->Set(dlssnr_param::kRenderPreset, np.render_preset != 0u ? np.render_preset : kNeuralRenderPresetShipping);
 	p->Set(dlssnr_param::kEnabled, 1);
 	p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
 	p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
@@ -1004,6 +1004,7 @@ void NeuralRenderD3D12::destroy_feature()
 	created_passes = 0;
 	requested_passes = 0;
 	created_style = 0xFFFFFFFFu;
+	created_model = 0u;
 	logged_whole = 0;
 	release_scratch();
 
@@ -1177,6 +1178,7 @@ bool NeuralRenderD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t 
 	if (feature_handles[0] != nullptr && width == w && height == h && output_tex != nullptr &&
 		scratch_format == color_format && source_format == src_format && requested_passes == passes &&
 		created_style == clamp_neural_style(np.style) &&
+		created_model == neural_model_to_ask(runtime_identity.models, np.render_preset) &&
 		model_width == mw && model_height == mh && created_scale == np.model_scale)
 		return true;
 
@@ -1190,9 +1192,13 @@ bool NeuralRenderD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t 
 	source_format = src_format;
 	created_style = clamp_neural_style(np.style);
 
+	NeuralRenderParams ask = np;
+	ask.render_preset = neural_model_to_ask(runtime_identity.models, np.render_preset);
+	created_model = ask.render_preset;
+
 	auto *const p = static_cast<NeuralParams *>(params);
 	p->Reset();
-	set_create_params(p, mw, mh, np);
+	set_create_params(p, mw, mh, ask);
 
 	ID3D12GraphicsCommandList *create_cmd = queue != nullptr ? init_list.begin(device) : nullptr;
 	const bool own_list = create_cmd != nullptr;
@@ -1211,12 +1217,14 @@ bool NeuralRenderD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t 
 			if (mw != w || mh != h)
 				_snwprintf_s(model_note, _TRUNCATE, L" model=%ux%u (%.0f%%)", mw, mh,
 					static_cast<double>(created_scale) * 100.0);
-			wchar_t buf[280]{};
-			_snwprintf_s(buf, _TRUNCATE, L"CreateFeature %u/%u %ux%u%s src=%u fmt=%u%s style=%u preset=%u -> %s",
+			const NeuralModelEntry *const model = neural_model_named(runtime_identity.models, created_model);
+			wchar_t buf[400]{};
+			_snwprintf_s(buf, _TRUNCATE, L"CreateFeature %u/%u %ux%u%s src=%u fmt=%u%s style=%u model %u (%hs) -> %s",
 				made + 1u, passes, w, h, model_note, static_cast<unsigned>(src_format),
 				static_cast<unsigned>(color_format),
 				formats_copy_compatible(src_format, color_format) ? L"" : L" (converted)",
-				created_style, 0u, result_name(cr));
+				created_style, created_model, model != nullptr ? model->name.c_str() : "not in the file's table",
+				result_name(cr));
 			diag_info("neural", buf);
 		}
 		if (seh != 0 || !ngx_ok(cr) || handle == nullptr)
@@ -1398,7 +1406,9 @@ bool NeuralRenderD3D12::evaluate_chain(ID3D12GraphicsCommandList *cmd, uint32_t 
 			barrier12(cmd, output_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		}
 
-		set_eval_params(p, mw, mh, np, sx, sy);
+		NeuralRenderParams asked = np;
+		asked.render_preset = created_model;
+		set_eval_params(p, mw, mh, asked, sx, sy);
 		if (capturing)
 			p->Set(dlssnr_param::kReset, 1);
 		p->Set(dlssnr_param::kColor, color_copy);

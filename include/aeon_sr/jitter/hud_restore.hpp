@@ -16,8 +16,11 @@ inline constexpr float kHudRestoreFlat = 3.0f / 255.0f;
 struct HudRestoreFrame {
 	bool drawn = false;
 	float x = 0.0f, y = 0.0f;
+	bool game_jitters = false;
+	bool scene_moved = false;
 	ID3D12Resource *scene = nullptr;
 	D3D12_RESOURCE_STATES scene_state = D3D12_RESOURCE_STATE_COMMON;
+	bool alone = false;
 };
 
 struct HudRestoreTuning {
@@ -38,6 +41,7 @@ public:
 		D3D12_RESOURCE_STATES state);
 	bool composite(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
 		D3D12_RESOURCE_STATES state);
+	bool fill_held(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource **out);
 
 	void reset() noexcept;
 	void release() noexcept;
@@ -45,6 +49,7 @@ public:
 	HudRestoreTuning tuning;
 
 	ID3D12Resource *mask() const noexcept { return has_mask_ ? core_ : nullptr; }
+	bool camera_learned() const noexcept { return camera_frames_ >= (tuning.need > 0u ? tuning.need : 1u); }
 	static constexpr D3D12_RESOURCE_STATES kMaskState =
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -57,10 +62,11 @@ private:
 	static constexpr uint32_t kRtvSlots = 64u;
 	static constexpr uint32_t kPsoSlots = 12u;
 	static constexpr uint32_t kRetireFrames = 8u;
-	static constexpr uint32_t kTargets = 10u;
+	static constexpr uint32_t kTargets = 12u;
 
-	enum Kind : uint32_t { Composite = 0, Register = 1, Clear = 2, KindCount = 3 };
+	enum Kind : uint32_t { Composite = 0, Register = 1, Clear = 2, Fill = 3, KindCount = 4 };
 	ID3D12PipelineState *trans_pso_ = nullptr;
+	ID3D12PipelineState *held_pso_ = nullptr;
 
 	struct Retired {
 		ID3D12Resource *res = nullptr;
@@ -111,6 +117,8 @@ private:
 	ID3D12Resource *core_ = nullptr;
 	ID3D12Resource *scenes_[2]{};
 	ID3D12Resource *trans_[2]{};
+	ID3D12Resource *filled_ = nullptr;
+	ID3D12Resource *held_ = nullptr;
 	uint32_t trans_cur_ = 0;
 	bool prev_split_ = false;
 	bool trans_history_ = false;
@@ -121,6 +129,8 @@ private:
 
 	bool have_prev_ = false;
 	bool prev_drawn_ = false;
+	bool prev_game_jitters_ = false;
+	uint32_t camera_frames_ = 0;
 	float prev_x_ = 0.0f, prev_y_ = 0.0f;
 	bool gain_ = false;
 	bool has_mask_ = false;

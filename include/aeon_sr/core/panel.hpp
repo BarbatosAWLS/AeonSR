@@ -2,11 +2,15 @@
 
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
+#include "aeon_sr/core/game_render_scale.hpp"
 #include "aeon_sr/core/gpu_vendor.hpp"
 #include "aeon_sr/ngx/neural_params.hpp"
 #include "aeon_sr/motion/scene_stability.hpp"
 #include "aeon_sr/interop/interop.hpp"
 #include "aeon_sr/core/settings.hpp"
+#if AEONSR_FRAME_GENERATION
+#include "aeon_sr/framegen/frame_generation.hpp"
+#endif
 #include "aeon_sr/upscalers/upscaler_backend.hpp"
 
 #include <cstdint>
@@ -172,6 +176,12 @@ struct PanelState {
 	uint32_t scope_second_frames = 0, scope_lag_frames = 0, scope_empty_frames = 0;
 	std::vector<float> scope_residual_x, scope_residual_y;
 	bool scope_capture_enabled = false;
+	uint32_t game_scale_render_w = 0, game_scale_render_h = 0;
+	uint32_t game_scale_w = 0, game_scale_h = 0;
+	GameScaleVerdict game_scale_verdict = GameScaleVerdict::Off;
+	std::string game_title;
+	bool game_integrated = false;
+	std::wstring game_note;
 	std::wstring scope_status;
 	std::string scope_fault;
 	float last_motion_px = 0.0f;
@@ -181,6 +191,10 @@ struct PanelState {
 
 	const char *build_stamp = "";
 	const char *version = "";
+
+#if AEONSR_FRAME_GENERATION
+	FrameGenReadout framegen;
+#endif
 
 	std::wstring report_path;
 	std::wstring report_error;

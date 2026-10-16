@@ -564,10 +564,17 @@ bool UpscalerCaptureD3D12::scope_size(ID3D12Device *device, const D3D12_RESOURCE
 	D3D12_RESOURCE_DESC mask = color;
 	mask.Format = DXGI_FORMAT_R8_UNORM;
 	mask.Flags = D3D12_RESOURCE_FLAG_NONE;
+	D3D12_RESOURCE_DESC motion = mask;
+	motion.Format = DXGI_FORMAT_R16G16_FLOAT;
+	motion.Width = scope_motion_w_;
+	motion.Height = scope_motion_h_;
+	if (scope_motion_w_ == 0 || scope_motion_h_ == 0)
+		scope_wanted_ &= ~(1u << static_cast<uint32_t>(ScopePlane::Motion));
 	UINT64 offset = 0;
 	CapturedPlane fmt[kScopeStagePlanes];
 	for (uint32_t i = 0; i < kScopeStagePlanes; ++i) {
-		const D3D12_RESOURCE_DESC &d = static_cast<ScopePlane>(i) == ScopePlane::Mask ? mask : color;
+		const ScopePlane p = static_cast<ScopePlane>(i);
+		const D3D12_RESOURCE_DESC &d = p == ScopePlane::Mask ? mask : p == ScopePlane::Motion ? motion : color;
 		ScopeSlot &s = scope_slots_[i];
 		if ((scope_wanted_ & (1u << i)) == 0) {
 			s = ScopeSlot{};
@@ -637,7 +644,7 @@ void UpscalerCaptureD3D12::scope_copy(ScopePlane plane, ID3D12Device *device, ID
 	if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
 		return;
 	if (!scope_sized_) {
-		if (plane == ScopePlane::Mask)
+		if (plane == ScopePlane::Mask || plane == ScopePlane::Motion)
 			return;
 		if (!scope_size(device, desc)) {
 			{
@@ -651,6 +658,8 @@ void UpscalerCaptureD3D12::scope_copy(ScopePlane plane, ID3D12Device *device, ID
 	const bool fits = plane == ScopePlane::Mask
 		? desc.Width == scope_color_.Width && desc.Height == scope_color_.Height &&
 			desc.Format == DXGI_FORMAT_R8_UNORM
+		: plane == ScopePlane::Motion
+		? desc.Width == scope_motion_w_ && desc.Height == scope_motion_h_ && desc.Format == DXGI_FORMAT_R16G16_FLOAT
 		: desc.Width == scope_color_.Width && desc.Height == scope_color_.Height &&
 			desc.Format == scope_color_.Format;
 	if (!fits) {

@@ -482,8 +482,10 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 			: state.jitter_in_frame && state.jitter_still ? "armed, nothing drawn took it, the frame left still"
 			: state.jitter_in_frame && state.jitter_mixed ? "drawn into the game, mixed this frame"
 			: state.jitter_in_frame ? "drawn into the game"
-			: state.jitter_active ? "resampled"
-			: state.jitter_withheld ? "not drawn, the game jitters its own frame" : "idle",
+			: state.jitter_withheld && state.jitter_active
+			? "not drawn, the game jitters its own frame; resampled as it is scaled down"
+			: state.jitter_withheld ? "not drawn, the game jitters its own frame"
+			: state.jitter_active ? "resampled" : "idle",
 		static_cast<double>(state.frame_time_ms));
 	if (state.jitter_in_frame || state.jitter_held_lists != 0 || state.jitter_note[0] != '\0')
 		out += wformat(L"  jitter draws: %u moved, %u on the game's grid, %u replayed at an older "

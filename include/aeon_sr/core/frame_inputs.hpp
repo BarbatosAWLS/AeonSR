@@ -50,6 +50,9 @@ struct EngineFrame {
 
 	bool native = false;
 
+	ID3D12Resource *output = nullptr;
+	D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_COMMON;
+
 	bool ready() const noexcept { return cmd != nullptr && color != nullptr; }
 };
 

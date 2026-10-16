@@ -56,7 +56,6 @@ Texture2D<float>  Aux      : register(t10);
 RWTexture2D<float2> OutV  : register(u0);
 RWTexture2D<float>  OutS  : register(u1);
 RWTexture2D<float4> OutS4 : register(u2);
-
 SamplerState LinearClamp : register(s0);
 SamplerState PointClamp  : register(s1);
 
@@ -139,19 +138,20 @@ float local_contrast(float2 uv, float2 texel, uint mip)
 	return mad / (mean + 0.02);
 }
 
+#if AEON_FLOW_QUALITY == 1
+static const int2 kZadOffs[5] = { int2(0,-2), int2(-2,0), int2(0,0), int2(2,0), int2(0,2) };
+#else
+static const int2 kZadOffs[9] = { int2(0,-3), int2(0,-1), int2(-3,0), int2(-1,0), int2(0,0),
+	int2(1,0), int2(3,0), int2(0,1), int2(0,3) };
+#endif
+
 float zad(float2 pos_a, float2 pos_b, float2 texel, uint mip)
 {
-#if AEON_FLOW_QUALITY == 1
-	static const int2 OFFS[5] = { int2(0,-2), int2(-2,0), int2(0,0), int2(2,0), int2(0,2) };
-#else
-	static const int2 OFFS[9] = { int2(0,-3), int2(0,-1), int2(-3,0), int2(-1,0), int2(0,0),
-		int2(1,0), int2(3,0), int2(0,1), int2(0,3) };
-#endif
 	float a[ZAD_SAMPLES], b[ZAD_SAMPLES];
 	float mean_a = 0.0, mean_b = 0.0;
 	[unroll]
 	for (int i = 0; i < ZAD_SAMPLES; ++i) {
-		const float2 o = float2(OFFS[i]) * texel;
+		const float2 o = float2(kZadOffs[i]) * texel;
 		a[i] = LumaCur.SampleLevel(LinearClamp, pos_a + o, mip);
 		b[i] = LumaPrev.SampleLevel(LinearClamp, pos_b + o, mip);
 		mean_a += a[i];
@@ -297,12 +297,22 @@ float frame_luma(float3 c)
 	return l * rcp(1.0 + l);
 }
 
+static const int kLumaHalo = 2;
+static const int kLumaTile = 8 + 2 * kLumaHalo;
+groupshared float gsLuma[kLumaTile * kLumaTile];
+
 [numthreads(8, 8, 1)]
-void CSLuma(uint3 id : SV_DispatchThreadID)
+void CSLuma(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
+	const int2 corner = int2(gid.xy) * 8 - kLumaHalo;
+	[loop]
+	for (uint t = gi; t < uint(kLumaTile * kLumaTile); t += 64u) {
+		const int2 p = corner + int2(t % uint(kLumaTile), t / uint(kLumaTile));
+		gsLuma[t] = frame_luma(Color.SampleLevel(LinearClamp, on_grid((float2(p) + 0.5) * inv_full), 0).rgb);
+	}
+	GroupMemoryBarrierWithGroupSync();
 	if (any(id.xy >= dst))
 		return;
-	const float2 uv = uv_of(id.xy);
 #if AEON_FLOW_QUALITY == 1
 	static const int2 OFFS[5] = { int2(0,0), int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
 	static const float W[5] = { 6, 4, 4, 4, 4 };
@@ -312,15 +322,16 @@ void CSLuma(uint3 id : SV_DispatchThreadID)
 		int2(-1,1), int2(0,1), int2(1,1), int2(0,2) };
 	static const float W[13] = { 1, 3, 4, 3, 1, 4, 6, 4, 1, 3, 4, 3, 1 };
 #endif
+	const int2 at = int2(id.xy) - corner;
 	float sum = 0.0, wsum = 0.0;
 	[unroll]
 	for (int i = 0; i < LUMA_SAMPLES; ++i) {
-		const float3 c = Color.SampleLevel(LinearClamp, on_grid(uv + float2(OFFS[i]) * inv_full), 0).rgb;
-		float l = frame_luma(c);
+		const int2 q = at + OFFS[i];
+		float l = gsLuma[q.y * kLumaTile + q.x];
 		sum += l * W[i];
 		wsum += W[i];
 	}
-	const float centre = frame_luma(Color.SampleLevel(LinearClamp, on_grid(uv), 0).rgb);
+	const float centre = gsLuma[at.y * kLumaTile + at.x];
 	OutS[id.xy] = lerp(centre, sum / wsum, 0.9);
 }
 
@@ -404,11 +415,6 @@ void top_least(uint gi, inout float cost, inout uint order)
 [numthreads(64, 1, 1)]
 void CSCoarseTop(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
-	if (first != 0u) {
-		if (gi == 0u)
-			OutV[gid.xy] = float2(0.0, 0.0);
-		return;
-	}
 	const float2 uv = uv_of(gid.xy);
 	const float2 global_p = GlobalF.SampleLevel(PointClamp, float2(0.5, 0.5), 0);
 	const float2 local_p = PrevFlow.SampleLevel(PointClamp, uv, 0);
@@ -460,7 +466,7 @@ void CSCoarseTop(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 	if (ask && wide_cost < kWideGain * dense_near - kWideMargin)
 		best = float2(int(wide_order) % wide - kWideRadius, int(wide_order) / wide - kWideRadius) * texel1;
 	if (gi == 0u)
-		OutV[gid.xy] = best;
+		OutV[gid.xy] = (first != 0u) ? float2(0.0, 0.0) : best;
 }
 
 [numthreads(8, 8, 1)]
@@ -523,47 +529,66 @@ void CSMedian(uint3 id : SV_DispatchThreadID)
 	OutV[id.xy] = float2(xs[MID], ys[MID]);
 }
 
+static const int kRefTile = 8 + 2 * REFINE_RADIUS;
+groupshared float2 gsRefFlow[kRefTile * kRefTile];
+groupshared float gsRefLuma[kRefTile * kRefTile];
+groupshared float gsRefDepth[kRefTile * kRefTile];
+groupshared float gsRefConf[kRefTile * kRefTile];
+
 [numthreads(8, 8, 1)]
-void CSRefine(uint3 id : SV_DispatchThreadID)
+void CSRefine(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
+	const bool gate_on = (filters != 0u && has_depth != 0u);
+	const int2 corner = int2(gid.xy) * 8 - REFINE_RADIUS;
+	[loop]
+	for (uint t = gi; t < uint(kRefTile * kRefTile); t += 64u) {
+		const float2 suv = (float2(corner + int2(t % uint(kRefTile), t / uint(kRefTile))) + 0.5) * inv_dst;
+		gsRefFlow[t] = flow_at(suv);
+		gsRefLuma[t] = LumaCur.SampleLevel(LinearClamp, suv, mip1);
+		gsRefDepth[t] = gate_on ? depth_tap(suv) : 0.0;
+		float nc = 1.0;
+		if (filters != 0u) {
+			nc = Conf.SampleLevel(LinearClamp, suv, 0);
+			nc = (nc == nc) ? saturate(nc) : 0.0;
+			nc = max(nc * nc, 0.01);
+		}
+		gsRefConf[t] = nc;
+	}
+	GroupMemoryBarrierWithGroupSync();
 	if (any(id.xy >= dst))
 		return;
-	const float2 uv = uv_of(id.xy);
+	const int2 home = int2(id.xy) - corner;
+	const uint centre_at = uint(home.y) * uint(kRefTile) + uint(home.x);
 	const float inv_spatial = -0.5 / (1.5 * 1.5);
 	const float inv_luma = -0.5 / (0.1 * 0.1);
 	const float inv_flow = -0.5 / (1.5 * 1.5);
-
-	const float2 centre_flow = flow_at(uv);
-	const float centre_luma = LumaCur.SampleLevel(LinearClamp, uv, mip1);
-	const bool gate_on = (filters != 0u && has_depth != 0u);
-	const float centre_depth = gate_on ? depth_tap(uv) : 0.0;
-	const float2 dgrad = gate_on ? depth_gradient(uv, centre_depth, inv_src) : float2(0.0, 0.0);
-
+	const float2 centre_flow = gsRefFlow[centre_at];
+	const float centre_luma = gsRefLuma[centre_at];
+	const float centre_depth = gsRefDepth[centre_at];
+	float2 dgrad = float2(0.0, 0.0);
+	if (gate_on) {
+		const float dxp = gsRefDepth[centre_at + 1u] - centre_depth;
+		const float dxm = centre_depth - gsRefDepth[centre_at - 1u];
+		const float dyp = gsRefDepth[centre_at + uint(kRefTile)] - centre_depth;
+		const float dym = centre_depth - gsRefDepth[centre_at - uint(kRefTile)];
+		dgrad = float2((abs(dxp) < abs(dxm)) ? dxp : dxm, (abs(dyp) < abs(dym)) ? dyp : dym);
+	}
 	float2 sum = float2(0.0, 0.0);
 	float wsum = 0.0;
-	[loop]
-	for (int y = -REFINE_RADIUS; y <= REFINE_RADIUS; ++y) {
-		[loop]
-		for (int x = -REFINE_RADIUS; x <= REFINE_RADIUS; ++x) {
-			const float2 suv = uv + float2(x, y) * inv_src;
-			const float2 nf = flow_at(suv);
-			const float nl = LumaCur.SampleLevel(LinearClamp, suv, mip1);
-
-			const float sw = exp(dot(float2(x, y), float2(x, y)) * inv_spatial);
-			const float ld = centre_luma - nl;
+	[unroll]
+	for (int ty = -REFINE_RADIUS; ty <= REFINE_RADIUS; ++ty) {
+		[unroll]
+		for (int tx = -REFINE_RADIUS; tx <= REFINE_RADIUS; ++tx) {
+			const uint at = uint(int(centre_at) + ty * kRefTile + tx);
+			const float2 nf = gsRefFlow[at];
+			const float sw = exp(dot(float2(tx, ty), float2(tx, ty)) * inv_spatial);
+			const float ld = centre_luma - gsRefLuma[at];
 			const float lw = exp(ld * ld * inv_luma);
 			const float2 fd = (nf - centre_flow) / inv_full;
 			const float fw = exp(dot(fd, fd) * inv_flow);
-
 			const float gate = gate_on
-				? depth_gate(centre_depth, dgrad, float2(x, y), depth_tap(suv)) : 1.0;
-			float cw = 1.0;
-			if (filters != 0u) {
-				float nc = Conf.SampleLevel(LinearClamp, suv, 0);
-				nc = (nc == nc) ? saturate(nc) : 0.0;
-				cw = max(nc * nc, 0.01);
-			}
-			const float w = sw * lw * fw * gate * cw;
+				? depth_gate(centre_depth, dgrad, float2(tx, ty), gsRefDepth[at]) : 1.0;
+			const float w = sw * lw * fw * gate * gsRefConf[at];
 			sum += nf * w;
 			wsum += w;
 		}
@@ -593,56 +618,62 @@ void CSGateProbe(uint3 id : SV_DispatchThreadID)
 	OutS[id.xy] = kept / total;
 }
 
-[numthreads(1, 1, 1)]
-void CSGlobal(uint3 id : SV_DispatchThreadID)
+static const float2 kGlobalGrid[32] = {
+	float2(0.0625, 0.125), float2(0.1875, 0.125), float2(0.3125, 0.125), float2(0.4375, 0.125),
+	float2(0.5625, 0.125), float2(0.6875, 0.125), float2(0.8125, 0.125), float2(0.9375, 0.125),
+	float2(0.0625, 0.375), float2(0.1875, 0.375), float2(0.3125, 0.375), float2(0.4375, 0.375),
+	float2(0.5625, 0.375), float2(0.6875, 0.375), float2(0.8125, 0.375), float2(0.9375, 0.375),
+	float2(0.0625, 0.625), float2(0.1875, 0.625), float2(0.3125, 0.625), float2(0.4375, 0.625),
+	float2(0.5625, 0.625), float2(0.6875, 0.625), float2(0.8125, 0.625), float2(0.9375, 0.625),
+	float2(0.0625, 0.875), float2(0.1875, 0.875), float2(0.3125, 0.875), float2(0.4375, 0.875),
+	float2(0.5625, 0.875), float2(0.6875, 0.875), float2(0.8125, 0.875), float2(0.9375, 0.875)
+};
+groupshared float2 gsGlobFlow[32];
+groupshared uint gsGlobValid[32];
+groupshared uint gsGlobPick[32];
+
+[numthreads(32, 1, 1)]
+void CSGlobal(uint gi : SV_GroupIndex)
 {
-	static const float2 GRID[32] = {
-		float2(0.0625, 0.125), float2(0.1875, 0.125), float2(0.3125, 0.125), float2(0.4375, 0.125),
-		float2(0.5625, 0.125), float2(0.6875, 0.125), float2(0.8125, 0.125), float2(0.9375, 0.125),
-		float2(0.0625, 0.375), float2(0.1875, 0.375), float2(0.3125, 0.375), float2(0.4375, 0.375),
-		float2(0.5625, 0.375), float2(0.6875, 0.375), float2(0.8125, 0.375), float2(0.9375, 0.375),
-		float2(0.0625, 0.625), float2(0.1875, 0.625), float2(0.3125, 0.625), float2(0.4375, 0.625),
-		float2(0.5625, 0.625), float2(0.6875, 0.625), float2(0.8125, 0.625), float2(0.9375, 0.625),
-		float2(0.0625, 0.875), float2(0.1875, 0.875), float2(0.3125, 0.875), float2(0.4375, 0.875),
-		float2(0.5625, 0.875), float2(0.6875, 0.875), float2(0.8125, 0.875), float2(0.9375, 0.875)
-	};
-	float xs[32], ys[32];
+	const float2 f0 = flow_at(kGlobalGrid[gi]);
+	const bool mine = depth_at(kGlobalGrid[gi]) < 0.999 && all((asuint(f0) & 0x7fffffffu) <= 0x7f800000u);
+	const float2 v = mine ? f0 : float2(0.0, 0.0);
+	gsGlobFlow[gi] = v;
+	gsGlobValid[gi] = mine ? 1u : 0u;
+	GroupMemoryBarrierWithGroupSync();
 	int count = 0;
 	[loop]
-	for (int i = 0; i < 32; ++i) {
-		if (depth_at(GRID[i]) < 0.999) {
-			const float2 f = flow_at(GRID[i]);
-			xs[count] = f.x;
-			ys[count] = f.y;
-			++count;
-		}
-	}
-	if (count < 3) {
-		OutV[uint2(0, 0)] = float2(0.0, 0.0);
-		return;
-	}
+	for (uint j = 0u; j < 32u; ++j)
+		count += (gsGlobValid[j] != 0u) ? 1 : 0;
+	const bool enough = count >= 3;
 	const int mid = count / 2;
-	[loop]
-	for (int k = 0; k < 32; ++k) {
-		if (k > mid)
-			break;
+	uint pick = 0u;
+	if (mine && enough) {
+		int at_x = 0, at_y = 0;
 		[loop]
-		for (int j = 0; j < 32; ++j) {
-			if (j >= count - 1 - k)
-				break;
-			if (xs[j] > xs[j + 1]) {
-				const float t = xs[j];
-				xs[j] = xs[j + 1];
-				xs[j + 1] = t;
-			}
-			if (ys[j] > ys[j + 1]) {
-				const float t = ys[j];
-				ys[j] = ys[j + 1];
-				ys[j + 1] = t;
-			}
+		for (uint k = 0u; k < 32u; ++k) {
+			if (gsGlobValid[k] == 0u)
+				continue;
+			const float2 f = gsGlobFlow[k];
+			at_x += (f.x < v.x || (f.x == v.x && k < gi)) ? 1 : 0;
+			at_y += (f.y < v.y || (f.y == v.y && k < gi)) ? 1 : 0;
 		}
+		pick = ((at_x == mid) ? 1u : 0u) | ((at_y == mid) ? 2u : 0u);
 	}
-	OutV[uint2(0, 0)] = float2(xs[mid], ys[mid]);
+	gsGlobPick[gi] = pick;
+	GroupMemoryBarrierWithGroupSync();
+	if (gi != 0u)
+		return;
+	float2 m = float2(0.0, 0.0);
+	[loop]
+	for (uint k2 = 0u; k2 < 32u; ++k2) {
+		const uint p = gsGlobPick[k2];
+		if ((p & 1u) != 0u)
+			m.x = gsGlobFlow[k2].x;
+		if ((p & 2u) != 0u)
+			m.y = gsGlobFlow[k2].y;
+	}
+	OutV[uint2(0, 0)] = m;
 }
 
 [numthreads(8, 8, 1)]
@@ -857,15 +888,81 @@ float surface_rho(float r[16])
 	}
 	return (off > 0.02 * mean + 1e-6) ? near_rho : mean;
 }
+)HLSL"
+R"HLSL(
+float3 tensor_of(float L[81])
+{
+	float sxx = 0.0, sxy = 0.0, syy = 0.0, wsum = 0.0;
+	[unroll]
+	for (int j = 1; j < 8; ++j) {
+		[unroll]
+		for (int i = 1; i < 8; ++i) {
+			const float gx = 0.5 * (L[j * 9 + i + 1] - L[j * 9 + i - 1]);
+			const float gy = 0.5 * (L[(j + 1) * 9 + i] - L[(j - 1) * 9 + i]);
+			const float w = exp(-0.125 * float((i - 4) * (i - 4) + (j - 4) * (j - 4)));
+			sxx += w * gx * gx;
+			sxy += w * gx * gy;
+			syy += w * gy * gy;
+			wsum += w;
+		}
+	}
+	return float3(sxx, sxy, syy) / wsum;
+}
+
+#ifndef AEON_FLOW_STRUCTURE_TAPS
+	#define AEON_FLOW_STRUCTURE_TAPS 0
+#endif
+static const int kStructFine = 37;
+static const int kStructCoarse = 23;
+groupshared float gsStructFine[kStructFine * kStructFine];
+groupshared float gsStructCoarse[kStructCoarse * kStructCoarse];
 
 [numthreads(8, 8, 1)]
-void CSStructure(uint3 id : SV_DispatchThreadID)
+void CSStructure(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,
+	uint gi : SV_GroupIndex)
 {
+	const float2 uv = uv_of(id.xy);
+	const bool tiled = AEON_FLOW_STRUCTURE_TAPS == 0 && all(dst * 4u == uint2(round(1.0 / inv_full)));
+	float3 fine, coarse;
+	[branch]
+	if (tiled) {
+		const int2 f0 = int2(gid.xy) * 32 - 2;
+		[loop]
+		for (uint t = gi; t < uint(kStructFine * kStructFine); t += 64u) {
+			const int2 c = f0 + int2(t % uint(kStructFine), t / uint(kStructFine));
+			gsStructFine[t] = LumaCur.SampleLevel(LinearClamp, float2(c) * inv_full, 0);
+		}
+		const int2 c0 = int2(gid.xy) * 16 - 3;
+		[loop]
+		for (uint t2 = gi; t2 < uint(kStructCoarse * kStructCoarse); t2 += 64u) {
+			const int2 c = c0 + int2(t2 % uint(kStructCoarse), t2 / uint(kStructCoarse));
+			gsStructCoarse[t2] = LumaCur.SampleLevel(LinearClamp, float2(c) * (2.0 * inv_full), 1);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
 	if (any(id.xy >= dst))
 		return;
-	const float2 uv = uv_of(id.xy);
-	const float3 fine = tensor_at(uv, 0u);
-	const float3 coarse = tensor_at(uv, 1u);
+	[branch]
+	if (tiled) {
+		float L[81];
+		[unroll]
+		for (int y = 0; y < 9; ++y) {
+			[unroll]
+			for (int x = 0; x < 9; ++x)
+				L[y * 9 + x] = gsStructFine[(int(tid.y) * 4 + y) * kStructFine + int(tid.x) * 4 + x];
+		}
+		fine = tensor_of(L);
+		[unroll]
+		for (int y2 = 0; y2 < 9; ++y2) {
+			[unroll]
+			for (int x2 = 0; x2 < 9; ++x2)
+				L[y2 * 9 + x2] = gsStructCoarse[(int(tid.y) * 2 + y2) * kStructCoarse + int(tid.x) * 2 + x2];
+		}
+		coarse = tensor_of(L);
+	} else {
+		fine = tensor_at(uv, 0u);
+		coarse = tensor_at(uv, 1u);
+	}
 	const float tr = fine.x + fine.z;
 	const float3 st = fine / max(tr, 1e-12) + coarse / max(coarse.x + coarse.z, 1e-12);
 	const float sxx = st.x, sxy = st.y, syy = st.z;
@@ -889,6 +986,9 @@ void CSStructure(uint3 id : SV_DispatchThreadID)
 }
 )HLSL"
 R"HLSL(
+static const uint kTermsBlock = 32u;
+static const uint kTermsSide = kTermsBlock / 8u;
+static const uint kTermsSamples = kTermsSide * kTermsSide;
 static const uint kTermParts = 4u;
 static const uint kPartTerms = kTerms / kTermParts;
 groupshared float gsTerms[64][kPartTerms | 1u];
@@ -1002,8 +1102,8 @@ void CSModelTerms(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi 
 		acc[a0] = 0.0;
 
 	[loop]
-	for (uint s = 0u; s < 4u; ++s) {
-		const uint2 q = gid.xy * 16u + tid.xy * 2u + uint2(s & 1u, s >> 1u);
+	for (uint s = 0u; s < kTermsSamples; ++s) {
+		const uint2 q = gid.xy * kTermsBlock + tid.xy + 8u * uint2(s % kTermsSide, s / kTermsSide);
 		if (any(q >= dst))
 			continue;
 		const float2 f = SrcFlow.Load(int3(q, 0));
@@ -1094,9 +1194,9 @@ void CSPhotoTerms(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi 
 	for (int a0 = 0; a0 < (int)kTerms; ++a0)
 		acc[a0] = 0.0;
 
-	[loop]
-	for (uint s = 0u; s < 4u; ++s) {
-		const uint2 q = gid.xy * 16u + tid.xy * 2u + uint2(s & 1u, s >> 1u);
+	[unroll]
+	for (uint s = 0u; s < kTermsSamples; ++s) {
+		const uint2 q = gid.xy * kTermsBlock + tid.xy + 8u * uint2(s % kTermsSide, s / kTermsSide);
 		if (any(q >= dst))
 			continue;
 		const float2 uv = (float2(q) + 0.5) * inv_dst;
@@ -1311,35 +1411,29 @@ static const float kLandedEvidence = 0.3;
 static const float kLandingDecay = 0.98;
 )HLSL"
 R"HLSL(
-float frame_apart(float a[11], float b[11])
+static const uint kPairBefore = 0u;
+static const uint kPairSwitched = 1u;
+static const uint kPairPub = 2u;
+static const uint kShiftPub = 0u;
+static const uint kShiftPubIdent = 1u;
+groupshared float gsPubApart[3][144];
+groupshared float2 gsPubShift[2][144];
+
+float frame_apart(uint pair)
 {
 	float s = 0.0;
 	[loop]
-	for (int j = 0; j < 9; ++j) {
-		[loop]
-		for (int i = 0; i < 16; ++i) {
-			const float2 uv = (float2(i, j) + 0.5) / float2(16.0, 9.0);
-			const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
-			const float2 x = norm_of(uv);
-			s += length((model_at(a, x, rho) - model_at(b, x, rho)) * px_per_unit);
-		}
-	}
+	for (uint t = 0u; t < 144u; ++t)
+		s += gsPubApart[pair][t];
 	return s / 144.0;
 }
 
-float2 frame_shift(float a[11], float b[11])
+float2 frame_shift(uint pair)
 {
 	float2 s = float2(0.0, 0.0);
 	[loop]
-	for (int j = 0; j < 9; ++j) {
-		[loop]
-		for (int i = 0; i < 16; ++i) {
-			const float2 uv = (float2(i, j) + 0.5) / float2(16.0, 9.0);
-			const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
-			const float2 x = norm_of(uv);
-			s += (model_at(a, x, rho) - model_at(b, x, rho)) * px_per_unit;
-		}
-	}
+	for (uint t = 0u; t < 144u; ++t)
+		s += gsPubShift[pair][t];
 	return s / 144.0;
 }
 
@@ -1359,13 +1453,36 @@ float probe_apart(float a[11], float b[11])
 	return d;
 }
 
-[numthreads(1, 1, 1)]
-void CSThetaPublish(uint3 id : SV_DispatchThreadID)
+[numthreads(144, 1, 1)]
+void CSThetaPublish(uint gi : SV_GroupIndex)
 {
 	float raw[11];
 	[unroll]
 	for (int k = 0; k < 11; ++k)
 		raw[k] = Theta.Load(int3(k, 0, 0));
+	{
+		float before0[11], switched0[11], pub0[11], ident0[11];
+		[unroll]
+		for (int k0 = 0; k0 < 11; ++k0) {
+			before0[k0] = OutS[uint2(3 + k0, 6)];
+			switched0[k0] = OutS[uint2(k0, 7)];
+			pub0[k0] = OutS[uint2(k0, 0)];
+			ident0[k0] = (k0 == 0 || k0 == 4) ? 1.0 : 0.0;
+		}
+		const float2 uv = (float2(gi % 16u, gi / 16u) + 0.5) / float2(16.0, 9.0);
+		const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
+		const float2 x = norm_of(uv);
+		const float2 at_raw = model_at(raw, x, rho);
+		const float2 at_pub = model_at(pub0, x, rho);
+		gsPubApart[kPairBefore][gi] = length((at_raw - model_at(before0, x, rho)) * px_per_unit);
+		gsPubApart[kPairSwitched][gi] = length((at_raw - model_at(switched0, x, rho)) * px_per_unit);
+		gsPubApart[kPairPub][gi] = length((at_raw - at_pub) * px_per_unit);
+		gsPubShift[kShiftPub][gi] = (at_raw - at_pub) * px_per_unit;
+		gsPubShift[kShiftPubIdent][gi] = (at_pub - model_at(ident0, x, rho)) * px_per_unit;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (gi != 0u)
+		return;
 	const uint want = clamp(pad_colour, 1u, 4u);
 	const float stored = OutS[uint2(0, 6)];
 	uint n = (stored == stored && stored >= 0.0 && stored <= 4.0) ? (uint)stored : 0u;
@@ -1385,13 +1502,7 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 	float distrust = (stored_distrust == stored_distrust) ? clamp(stored_distrust, 0.0, 8.0) : 0.0;
 	if (OutS[uint2(11, 7)] > 0.5 && (model_flags & 4u) == 0u) {
 		if ((model_flags & 2u) != 0u && (model_flags & 1u) == 0u && usable) {
-			float switched[11], before[11];
-			[unroll]
-			for (int k9 = 0; k9 < 11; ++k9) {
-				switched[k9] = OutS[uint2(k9, 7)];
-				before[k9] = OutS[uint2(3 + k9, 6)];
-			}
-			const bool against = frame_apart(raw, before) < kVerdictShare * frame_apart(raw, switched);
+			const bool against = frame_apart(kPairBefore) < kVerdictShare * frame_apart(kPairSwitched);
 			distrust = against ? min(distrust + 1.0, 8.0) : max(distrust - 1.0, 0.0);
 			OutS[uint2(13, 7)] = against ? 1.0 : -1.0;
 		}
@@ -1404,12 +1515,12 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 		[unroll]
 		for (int k8 = 0; k8 < 11; ++k8)
 			pub[k8] = OutS[uint2(k8, 0)];
-		apart = (n > 0u) ? frame_apart(raw, pub) : 0.0;
+		apart = (n > 0u) ? frame_apart(kPairPub) : 0.0;
 		const bool supported = model_support() > kCrossQuality;
 		const bool asks = apart > kCrossSwitchPx && supported;
 		if (n > 0u && supported) {
 			const float2 moved = (dejitter - prev_dejitter) * float2(norm_x, 2.0) * px_per_unit;
-			const float2 left = frame_shift(raw, pub);
+			const float2 left = frame_shift(kShiftPub);
 			const float2 lm = left * moved;
 			const float2 mm = moved * moved;
 			const float2 tol = 0.1 * abs(moved);
@@ -1454,11 +1565,7 @@ void CSThetaPublish(uint3 id : SV_DispatchThreadID)
 		bool far = false;
 		{
 			const float2 g = GlobalF.Load(int3(0, 0, 0));
-			float ident[11];
-			[unroll]
-			for (int k11 = 0; k11 < 11; ++k11)
-				ident[k11] = (k11 == 0 || k11 == 4) ? 1.0 : 0.0;
-			const float2 pub_shift = frame_shift(pub, ident);
+			const float2 pub_shift = frame_shift(kShiftPubIdent);
 			const float jump = length(g * float2(norm_x, 2.0) * px_per_unit - pub_shift);
 			far = usable && !invalid_flow(g) && jump > max(kCrossFarPx, kCrossFarShare * length(pub_shift));
 		}
@@ -1626,47 +1733,146 @@ float gate_alpha(float4 st, float2 f, float2 x, float th[11])
 }
 )HLSL"
 R"HLSL(
-[numthreads(8, 8, 1)]
-void CSDecision(uint3 id : SV_DispatchThreadID)
+#ifndef AEON_FLOW_APERTURE
+	#define AEON_FLOW_APERTURE 1
+#endif
+static const float kStillPx = 1.0;
+static const int kAlongReach = 4;
+static const float kAlongPx = 0.5;
+static const float kAlongTexture = 0.8;
+float along_trust()
 {
-	if (any(id.xy >= dst) || Theta.Load(int3(1, 6, 0)) > 0.5)
-		return;
-	const float quality = model_quality();
-	if (!(quality > 0.0) && !(Theta.Load(int3(0, 1, 0)) > 0.5)) {
-		OutS[id.xy] = 0.0;
-		return;
-	}
+	if (AEON_FLOW_APERTURE == 0)
+		return 0.0;
 	float th[11];
 	[unroll]
 	for (int k = 0; k < 11; ++k)
 		th[k] = Theta.Load(int3(k, 0, 0));
-	const float4 sc = StructQ.Load(int3(id.xy, 0));
-	if (!(quality > 0.0)) {
-		OutS[id.xy] = lost_match(id.xy, sc, th, 0.0, 0.0);
-		return;
+	float moved = 0.0;
+	[unroll]
+	for (int c = 0; c < 8; ++c) {
+		const float2 x = float2(((c & 1) != 0) ? 0.5 * norm_x : -0.5 * norm_x, ((c & 2) != 0) ? 1.0 : -1.0);
+		const float rho = ((c & 4) != 0) ? 1.0 : 0.0;
+		if (!(th[6] * x.x + th[7] * x.y + 1.0 + th[10] * rho > 0.25))
+			return 0.0;
+		moved = max(moved, length(model_at(th, x, rho) - x) * px_per_unit);
 	}
+	if (!(moved == moved))
+		return 0.0;
+	return model_support() * (1.0 - smoothstep(kStillPx, 2.0 * kStillPx, moved));
+}
+
+float along_kept(int2 q, float th[11])
+{
+	const float4 st = StructQ.Load(int3(q, 0));
+	if (!(line_like(st) > 0.0))
+		return 1.0;
+	const float2 f = SrcFlow.Load(int3(q, 0));
+	if (invalid_flow(f))
+		return 1.0;
+	const float2 x = norm_of(uv_of(uint2(q)));
+	const float2 m = (model_at(th, x, (has_depth != 0u) ? st.w : 0.0) - x) / float2(norm_x, 2.0);
+	if (invalid_flow(m))
+		return 1.0;
+	const float2 n = float2(cos(st.x), sin(st.x));
+	if (abs(dot(float2(-n.y, n.x), (f - m) * float2(norm_x, 2.0))) * px_per_unit < kAlongPx)
+		return 1.0;
+	float agree = 0.0;
+	[loop]
+	for (int oy = -kAlongReach; oy <= kAlongReach; oy += 2) {
+		[loop]
+		for (int ox = -kAlongReach; ox <= kAlongReach; ox += 2) {
+			const int2 qq = q + int2(ox, oy);
+			if (any(qq < 0) || any(qq >= int2(dst)) || (ox == 0 && oy == 0))
+				continue;
+			const float4 sn = StructQ.Load(int3(qq, 0));
+			if (!(sn.z > 0.3) || line_like(sn) >= kAlongTexture)
+				continue;
+			const float2 fn = SrcFlow.Load(int3(qq, 0));
+			if (invalid_flow(fn))
+				continue;
+			agree += 1.0 - smoothstep(1.0, 2.0, length((fn - f) * float2(norm_x, 2.0)) * px_per_unit);
+		}
+	}
+	return smoothstep(0.5, 2.5, agree);
+}
+)HLSL"
+R"HLSL(
+static const int kDecTile = 8 + 2 * kSurfaceReach;
+groupshared float gsDecA[kDecTile * kDecTile];
+groupshared float gsDecRest[kDecTile * kDecTile];
+groupshared float gsDecZ[kDecTile * kDecTile];
+groupshared float gsDecW[kDecTile * kDecTile];
+groupshared float gsDecAlong;
+
+[numthreads(8, 8, 1)]
+void CSDecision(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+	const bool kept = Theta.Load(int3(1, 6, 0)) > 0.5;
+	if (gi == 0u)
+		gsDecAlong = kept ? 0.0 : along_trust();
+	const float quality = model_quality();
+	const bool solved = Theta.Load(int3(0, 1, 0)) > 0.5;
+	const bool weighs = !kept && quality > 0.0;
+	float th[11];
+	[unroll]
+	for (int k = 0; k < 11; ++k)
+		th[k] = Theta.Load(int3(k, 0, 0));
 	const float rest_share = Theta.Load(int3(6, 1, 0));
 	const float resting = smoothstep(0.5, 0.7, (rest_share == rest_share) ? rest_share : 0.0);
+	const int reach = (has_depth != 0u) ? kSurfaceReach : 2;
+	const int side = 8 + 2 * reach;
+	const int2 corner = int2(gid.xy) * 8 - reach;
+	[loop]
+	for (uint t = gi; t < uint(side * side) && weighs; t += 64u) {
+		const int2 q = corner + int2(t % uint(side), t / uint(side));
+		const uint at = (t / uint(side)) * uint(kDecTile) + t % uint(side);
+		float a = -1.0, rest = -1.0, z = 0.0, w = 0.0;
+		if (all(q >= 0) && all(q < int2(dst))) {
+			const float2 f = SrcFlow.Load(int3(q, 0));
+			if (!invalid_flow(f)) {
+				const float4 st = StructQ.Load(int3(q, 0));
+				a = gate_alpha(st, f, norm_of((float2(q) + 0.5) * inv_dst), th);
+				rest = a;
+				if (all(abs(f * float2(norm_x, 2.0) * px_per_unit) < 0.01))
+					rest *= (st.z > 0.3 && line_like(st) < 0.5) ? 0.0 : 1.0 - resting;
+				z = st.z;
+				w = st.w;
+			}
+		}
+		gsDecA[at] = a;
+		gsDecRest[at] = rest;
+		gsDecZ[at] = z;
+		gsDecW[at] = w;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (kept || any(id.xy >= dst))
+		return;
+	{
+		const float trust = gsDecAlong;
+		OutV[id.xy] = float2((trust > 0.0) ? trust * (1.0 - along_kept(int2(id.xy), th)) : 0.0, 0.0);
+	}
+	if (!(quality > 0.0)) {
+		OutS[id.xy] = solved ? lost_match(id.xy, StructQ.Load(int3(id.xy, 0)), th, 0.0, 0.0) : 0.0;
+		return;
+	}
+	const float4 sc = StructQ.Load(int3(id.xy, 0));
+	const int2 home = int2(id.xy) - corner;
 	float num = 0.0, wsum = 0.0, own = 1.0;
 	[loop]
 	for (int dy = -2; dy <= 2; ++dy) {
 		[loop]
 		for (int dx = -2; dx <= 2; ++dx) {
-			const int2 q = int2(id.xy) + int2(dx, dy);
-			if (any(q < 0) || any(q >= int2(dst)))
+			const uint at = uint(home.y + dy) * uint(kDecTile) + uint(home.x + dx);
+			if (gsDecA[at] < 0.0)
 				continue;
-			const float2 f = SrcFlow.Load(int3(q, 0));
-			if (invalid_flow(f))
-				continue;
-			const float4 st = StructQ.Load(int3(q, 0));
-			float a = gate_alpha(st, f, norm_of((float2(q) + 0.5) * inv_dst), th);
-			if (all(abs(f * float2(norm_x, 2.0) * px_per_unit) < 0.01))
-				a *= (st.z > 0.3 && line_like(st) < 0.5) ? 0.0 : 1.0 - resting;
+			const float a = gsDecRest[at];
+			const float stz = gsDecZ[at], stw = gsDecW[at];
 			if (dx == 0 && dy == 0)
 				own = a;
-			float w = st.z * exp(-0.22 * float(dx * dx + dy * dy));
+			float w = stz * exp(-0.22 * float(dx * dx + dy * dy));
 			if (has_depth != 0u)
-				w *= (abs(st.w - sc.w) <= 0.1 * max(st.w, sc.w) + 1e-5) ? 1.0 : 0.05;
+				w *= (abs(stw - sc.w) <= 0.1 * max(stw, sc.w) + 1e-5) ? 1.0 : 0.05;
 			num += w * a;
 			wsum += w;
 		}
@@ -1679,16 +1885,12 @@ void CSDecision(uint3 id : SV_DispatchThreadID)
 		for (int oy = -kSurfaceReach; oy <= kSurfaceReach; oy += 2) {
 			[loop]
 			for (int ox = -kSurfaceReach; ox <= kSurfaceReach; ox += 2) {
-				const int2 q = int2(id.xy) + int2(ox, oy);
-				if (any(q < 0) || any(q >= int2(dst)))
+				const uint at = uint(home.y + oy) * uint(kDecTile) + uint(home.x + ox);
+				const float a = gsDecA[at];
+				const float stz = gsDecZ[at], stw = gsDecW[at];
+				if (a < 0.0 || !(stz > 0.3) || !(abs(stw - sc.w) <= 0.02 * max(stw, sc.w) + 1e-6))
 					continue;
-				const float4 st = StructQ.Load(int3(q, 0));
-				if (!(st.z > 0.3) || !(abs(st.w - sc.w) <= 0.02 * max(st.w, sc.w) + 1e-6))
-					continue;
-				const float2 f = SrcFlow.Load(int3(q, 0));
-				if (invalid_flow(f))
-					continue;
-				agree += gate_alpha(st, f, norm_of((float2(q) + 0.5) * inv_dst), th);
+				agree += a;
 				count += 1.0;
 			}
 		}
@@ -1710,14 +1912,17 @@ void CSDecision(uint3 id : SV_DispatchThreadID)
 	OutS[id.xy] = alpha;
 }
 
-float pixel_rho(float2 uv)
+groupshared float gsFuseTh[12];
+groupshared float gsFuseRho[10 * 10];
+
+float pixel_rho(int2 home)
 {
 	float r[9];
 	float mean = 0.0, near_rho = 0.0, bx = 0.0, by = 0.0;
 	[unroll]
 	for (int k = 0; k < 9; ++k) {
 		const float2 o = float2(float(k % 3) - 1.0, float(k / 3) - 1.0);
-		r[k] = 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv + o * inv_full), 0);
+		r[k] = gsFuseRho[(home.y + k / 3 - 1) * 10 + home.x + k % 3 - 1];
 		mean += r[k];
 		near_rho = max(near_rho, r[k]);
 		bx += o.x * r[k];
@@ -1735,7 +1940,7 @@ float pixel_rho(float2 uv)
 	return (off > 0.02 * mean + 1e-6) ? near_rho : r[4];
 }
 
-void fuse_kept(uint2 p, float2 uv)
+void fuse_kept(uint2 p, float2 uv, int2 home)
 {
 	if ((model_flags & 4u) == 0u || has_depth == 0u)
 		return;
@@ -1749,21 +1954,33 @@ void fuse_kept(uint2 p, float2 uv)
 	float th[11];
 	[unroll]
 	for (int k = 0; k < 11; ++k)
-		th[k] = Theta.Load(int3(k, 0, 0));
+		th[k] = gsFuseTh[k];
 	const float2 x = norm_of(uv);
-	const float2 m = (model_at(th, x, pixel_rho(uv)) - x) / float2(norm_x, 2.0);
+	const float2 m = (model_at(th, x, pixel_rho(home)) - x) / float2(norm_x, 2.0);
 	const float2 flow = lerp(old, m, alpha);
 	if (!invalid_flow(m) && !invalid_flow(flow))
 		OutV[p] = flow;
 }
 
 [numthreads(8, 8, 1)]
-void CSFuse(uint3 id : SV_DispatchThreadID)
+void CSFuse(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
+	if (gi < 12u)
+		gsFuseTh[gi] = (gi < 11u) ? Theta.Load(int3(gi, 0, 0)) : Theta.Load(int3(1, 6, 0));
+	const int2 corner = int2(gid.xy) * 8 - 1;
+	if (has_depth != 0u) {
+		[loop]
+		for (uint t = gi; t < 100u; t += 64u) {
+			const float2 puv = (float2(corner + int2(t % 10u, t / 10u)) + 0.5) * inv_dst;
+			gsFuseRho[t] = 1.0 - Depth.SampleLevel(PointClamp, on_grid(puv), 0);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
 	if (any(id.xy >= dst))
 		return;
-	if (Theta.Load(int3(1, 6, 0)) > 0.5) {
-		fuse_kept(id.xy, uv_of(id.xy));
+	const int2 home = int2(id.xy) - corner;
+	if (gsFuseTh[11] > 0.5) {
+		fuse_kept(id.xy, uv_of(id.xy), home);
 		return;
 	}
 	const float2 uv = uv_of(id.xy);
@@ -1776,12 +1993,14 @@ void CSFuse(uint3 id : SV_DispatchThreadID)
 	const float2 matched = flow;
 	float alpha = Aux.SampleLevel(LinearClamp, uv, 0);
 	alpha = (alpha == alpha) ? saturate(alpha) : 0.0;
-	if (alpha > 0.0) {
+	float trust = (AEON_FLOW_APERTURE != 0) ? GlobalF.SampleLevel(PointClamp, uv, 0).x : 0.0;
+	trust = (trust == trust) ? saturate(trust) : 0.0;
+	if (alpha > 0.0 || trust > 0.0) {
 		float th[11];
 		[unroll]
 		for (int k = 0; k < 11; ++k)
-			th[k] = Theta.Load(int3(k, 0, 0));
-		const float rho = (has_depth != 0u) ? pixel_rho(uv) : 0.0;
+			th[k] = gsFuseTh[k];
+		const float rho = (has_depth != 0u) ? pixel_rho(home) : 0.0;
 		const float2 x = norm_of(uv);
 		const float2 m = (model_at(th, x, rho) - x) / float2(norm_x, 2.0);
 		if (!invalid_flow(m)) {
@@ -1789,7 +2008,7 @@ void CSFuse(uint3 id : SV_DispatchThreadID)
 			const float2 n = float2(cos(st.x), sin(st.x));
 			const float2 t = float2(-n.y, n.x);
 			const float2 d = (flow - m) * float2(norm_x, 2.0);
-			const float2 kept = n * dot(n, d) + t * (dot(t, d) * (1.0 - line_like(st) * alpha));
+			const float2 kept = n * dot(n, d) + t * (dot(t, d) * (1.0 - line_like(st) * max(alpha, trust)));
 			flow = m + (1.0 - alpha) * kept / float2(norm_x, 2.0);
 		}
 	}

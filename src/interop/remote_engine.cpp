@@ -804,6 +804,8 @@ bool RemoteEngine::run(EngineDevice &engine, const Request &req, Reply &reply)
 	const bool copy_back = exchange(engine, req, descs, reply);
 	note_stats();
 
+	if (!engine.borrowed())
+		engine.use_ring(EngineDevice::Ring::Remote);
 	ID3D12GraphicsCommandList *const back = engine.borrowed()
 		? reinterpret_cast<ID3D12GraphicsCommandList *>(game_list->get_native())
 		: engine.begin_list();

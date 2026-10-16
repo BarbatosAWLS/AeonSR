@@ -43,12 +43,22 @@ std::string neural_kernels_label(const NeuralRuntimeKernels &kernels);
 
 std::string neural_kernels_cards(const NeuralRuntimeKernels &kernels);
 
+struct NeuralModelEntry {
+	uint32_t id = 0;
+	std::string name;
+	std::string resource;
+};
+
 struct NeuralRuntimeIdentity {
 	std::string file_version;
 	bool has_certificate = false;
+	std::vector<NeuralModelEntry> models;
 };
 
 NeuralRuntimeIdentity neural_identity_in(const char *bytes, size_t size);
+
+uint32_t neural_model_to_ask(const std::vector<NeuralModelEntry> &models, uint32_t wanted) noexcept;
+const NeuralModelEntry *neural_model_named(const std::vector<NeuralModelEntry> &models, uint32_t id) noexcept;
 
 bool neural_read_runtime_file(const std::wstring &path, NeuralRuntimeKernels *out_kernels,
 	NeuralRuntimeIdentity *out_identity, std::string *out_sha256);

@@ -21,40 +21,44 @@ void MvProbe11::restart() noexcept
 }
 
 bool MvProbe11::tick(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Resource *mv,
-	float screen_w, float screen_h, uint64_t frame, MvProbeResult &out)
+	float screen_w, float screen_h, uint64_t frame, MvProbeResult &out, bool written_before)
 {
-	if (dev == nullptr || ctx == nullptr || mv == nullptr)
+	if (dev == nullptr || ctx == nullptr)
+		return false;
+	if (mv == nullptr && (staging == nullptr || device != dev))
 		return false;
 
-	ID3D11Texture2D *tex = nullptr;
-	if (FAILED(mv->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) || tex == nullptr)
-		return false;
-	D3D11_TEXTURE2D_DESC src{};
-	tex->GetDesc(&src);
-	tex->Release();
-
-	if (!mv_probe_format_supported(src.Format)) {
-		out.unsupported = true;
-		out.valid = false;
-		return false;
-	}
-
-	if (device != dev || staging == nullptr ||
-		width != src.Width || height != src.Height || format != src.Format) {
-		release();
-
-		D3D11_TEXTURE2D_DESC d = src;
-		d.Usage = D3D11_USAGE_STAGING;
-		d.BindFlags = 0;
-		d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		d.MiscFlags = 0;
-		if (FAILED(dev->CreateTexture2D(&d, nullptr, &staging)))
+	if (mv != nullptr) {
+		ID3D11Texture2D *tex = nullptr;
+		if (FAILED(mv->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) || tex == nullptr)
 			return false;
-		device = dev;
-		width = src.Width;
-		height = src.Height;
-		format = src.Format;
-		next_copy_frame = frame;
+		D3D11_TEXTURE2D_DESC src{};
+		tex->GetDesc(&src);
+		tex->Release();
+
+		if (!mv_probe_format_supported(src.Format)) {
+			out.unsupported = true;
+			out.valid = false;
+			return false;
+		}
+
+		if (device != dev || staging == nullptr ||
+			width != src.Width || height != src.Height || format != src.Format) {
+			release();
+
+			D3D11_TEXTURE2D_DESC d = src;
+			d.Usage = D3D11_USAGE_STAGING;
+			d.BindFlags = 0;
+			d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			d.MiscFlags = 0;
+			if (FAILED(dev->CreateTexture2D(&d, nullptr, &staging)))
+				return false;
+			device = dev;
+			width = src.Width;
+			height = src.Height;
+			format = src.Format;
+			next_copy_frame = frame;
+		}
 	}
 
 	bool completed = false;
@@ -75,7 +79,7 @@ bool MvProbe11::tick(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Resource
 		}
 	}
 
-	if (!pending && frame >= next_copy_frame) {
+	if (mv != nullptr && written_before && !pending && frame >= next_copy_frame) {
 		ctx->CopyResource(staging, mv);
 		pending = true;
 		due_frame = frame + kMvProbeReadDelay;

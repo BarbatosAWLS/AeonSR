@@ -24,7 +24,23 @@ struct MvProbe11 {
 	void restart() noexcept;
 
 	bool tick(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Resource *mv,
-		float screen_w, float screen_h, uint64_t frame, MvProbeResult &out);
+		float screen_w, float screen_h, uint64_t frame, MvProbeResult &out, bool written_before);
+
+	bool write_due(uint64_t frame) const noexcept { return !pending && frame + 1u >= next_copy_frame; }
+
+	void note_written(uint64_t frame) noexcept
+	{
+		if (written != frame) {
+			written_prior = written;
+			written = frame;
+		}
+	}
+	bool written_before(uint64_t frame) const noexcept
+	{
+		const uint64_t before = written == frame ? written_prior : written;
+		return before != 0 && before + 1u == frame;
+	}
+	uint64_t written = 0, written_prior = 0;
 };
 
 struct MvProbe12 {

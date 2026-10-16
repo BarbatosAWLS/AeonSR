@@ -21,8 +21,12 @@
 #include "aeon_sr/jitter/frame_shift.hpp"
 #include "aeon_sr/core/gpu_vendor.hpp"
 #include "aeon_sr/core/frame_observer.hpp"
+#include "aeon_sr/core/game_render_scale.hpp"
+#include "aeon_sr/games/game_integration.hpp"
+#include "aeon_sr/games/scale_driver.hpp"
 #include "aeon_sr/jitter/hud_restore.hpp"
 #include "aeon_sr/jitter/jitter_landing.hpp"
+#include "aeon_sr/jitter/picture_hold.hpp"
 #include "aeon_sr/motion/game_jitter_memory.hpp"
 #include "aeon_sr/motion/game_jitter_probe.hpp"
 #include "aeon_sr/motion/guide_builder.hpp"
@@ -40,6 +44,15 @@
 #include "aeon_sr/interop/remote_engine.hpp"
 #include "aeon_sr/motion/scene_stability.hpp"
 #include "aeon_sr/core/settings.hpp"
+#include "aeon_sr/core/display_pacer.hpp"
+#include "aeon_sr/core/latency_governor.hpp"
+#include "aeon_sr/core/reflex.hpp"
+#if AEONSR_FRAME_GENERATION
+#include "aeon_sr/framegen/display_clock.hpp"
+#endif
+#if AEONSR_FRAME_GENERATION
+#include "aeon_sr/framegen/frame_generation.hpp"
+#endif
 
 namespace aeon_sr {
 
@@ -66,6 +79,7 @@ public:
 	void on_init_effect_runtime(reshade::api::effect_runtime *runtime);
 	void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime);
 	void on_game_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain);
+	void on_finish_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain);
 
 	void run_frame(reshade::api::effect_runtime *runtime,
 		reshade::api::command_list *cmd_list, reshade::api::resource_view rtv, bool after_effects);
@@ -113,6 +127,59 @@ private:
 	FrameHistory history_;
 	FramePlan last_plan_;
 	FrameClock clock_;
+	unsigned int latency_mode_now() const noexcept;
+	static double latency_clock_ms() noexcept;
+	void latency_apply(unsigned int mode, reshade::api::swapchain *swapchain);
+	void latency_wait_until(double t_ms);
+	void latency_queue(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain);
+	void latency_queue_off() noexcept;
+	void *latency_dxgi_ = nullptr;
+	uint32_t latency_dxgi_was_ = 0;
+	LatencyGovernor latency_;
+	Reflex reflex_;
+	void *latency_hwnd_ = nullptr;
+	uint64_t latency_hwnd_tick_ = 0;
+	bool latency_presented_ = false;
+	bool latency_bridged_ = false;
+	bool reflex_game_own_ = false;
+	bool reflex_waiting_said_ = false;
+	unsigned int latency_applied_ = 0;
+	bool reflex_refused_ = false;
+	uint64_t reflex_frame_ = 1;
+	void *latency_timer_ = nullptr;
+	struct LatencyWindow {
+		uint64_t since = 0;
+		uint32_t frames = 0, waited_frames = 0;
+		double waited = 0.0;
+	} latency_window_;
+#if AEONSR_FRAME_GENERATION
+	void pace_to_display(reshade::api::effect_runtime *runtime);
+	void pace_off() noexcept;
+	void pace_gpu_tail(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain);
+	void pace_tail_release() noexcept;
+	struct GpuDone {
+		void *event = nullptr, *wait = nullptr;
+		uint64_t value = 0;
+		double sent_ms = 0.0;
+		std::atomic<double> done_ms{ -1.0 };
+	};
+	static constexpr uint32_t kGpuDoneRing = 4;
+	GpuDone pace_done_[kGpuDoneRing];
+	void *pace_fence_ = nullptr, *pace_fence_device_ = nullptr;
+	uint64_t pace_fence_value_ = 0;
+	double pace_tails_[32] = {};
+	uint32_t pace_tail_n_ = 0, pace_tail_at_ = 0;
+	DisplayPacer display_pacer_;
+	DisplayClock pace_clock_;
+	uintptr_t pace_runtime_ = 0;
+	uint64_t pace_runtime_tick_ = 0;
+	void *pace_timer_ = nullptr;
+	struct PaceWindow {
+		uint64_t since = 0;
+		uint32_t presents = 0, paced = 0, late = 0, misses_at = 0;
+		double waited = 0.0;
+	} pace_window_;
+#endif
 	reshade::api::device_api last_api_ = reshade::api::device_api::d3d11;
 
 	EngineDevice engine_;
@@ -146,9 +213,8 @@ private:
 	void run_effects_frame(reshade::addon_event event, reshade::api::effect_runtime *runtime,
 		reshade::api::command_list *cmd_list, reshade::api::resource_view rtv);
 	SharedPlane flow_game_motion_;
-	SharedPlane flow_game_confidence_;
 	SharedPlane flow_game_global_;
-	void publish_flow_to_game(FrameInputs &inputs);
+	void publish_flow_to_game(FrameInputs &inputs, bool motion_read);
 	bool finish_frame(reshade::api::effect_runtime *runtime,
 		reshade::api::command_list *cmd_list, const FrameInputs &inputs);
 
@@ -212,11 +278,26 @@ private:
 	HudRestoreD3D12 hud_restore_;
 	FrameObserverD3D12 observer_;
 	bool observed_ = false;
+	PictureHold picture_hold_;
+	uint64_t observe_serial_ = 0;
+	struct HoldDrawn {
+		uint64_t serial = 0;
+		float x = 0.0f, y = 0.0f;
+		bool scene = false;
+		bool split = false;
+	};
+	static constexpr uint32_t kHoldDrawn = 16u;
+	HoldDrawn hold_drawn_[kHoldDrawn]{};
+	uint32_t held_frames_ = 0, moved_frames_ = 0;
+	double moved_edges_ = 0.0, moved_changed_ = 0.0;
+	void note_picture_hold();
 	bool hud_detected_ = false;
 	bool interface_split_ = false;
+	bool interface_game_ = false;
 	bool interface_restored_ = false;
 	unsigned long long census_logged_at_ = 0;
 	SplitGate split_gate_;
+	SplitCover split_cover_;
 	uint32_t seen_drawn_ = 0, seen_empty_ = 0, seen_other_ = 0, seen_changes_ = 0, seen_split_ = 0;
 	int seen_last_ = -1;
 	void detect_interface(const FrameInputs &inputs);
@@ -229,6 +310,10 @@ private:
 	std::mutex runtimes_lock_;
 	std::vector<RuntimeDrive> runtimes_;
 	std::vector<PresentRuntime> present_keys_;
+#if AEONSR_FRAME_GENERATION
+	FrameGeneration framegen_;
+	void run_frame_generation(reshade::api::effect_runtime *runtime);
+#endif
 	UpscalerCaptureD3D12 upscaler_capture_;
 	std::wstring upscaler_capture_logged_;
 	std::wstring scope_logged_;
@@ -264,11 +349,9 @@ private:
 	std::string scope_header();
 	void request_scope_capture();
 	uint32_t jitter_scene_w_ = 0, jitter_scene_h_ = 0;
-	uint32_t depth_scene_w_ = 0, depth_scene_h_ = 0;
-	uint32_t depth_scene_dw_ = 0, depth_scene_dh_ = 0;
-	uint32_t learned_scene_w_ = 0, learned_scene_h_ = 0;
-	uint32_t learned_scene_dw_ = 0, learned_scene_dh_ = 0;
+	JitterSceneSize scene_size_;
 	bool move_all_ = false;
+	JitterDepthProof depth_proof_;
 	JitterLanding landing_;
 	GameJitterProbeD3D12 game_probe_;
 	GameJitterDetector game_jitter_;
@@ -311,6 +394,42 @@ private:
 	}
 	BlitPipelineD3D12 frame_shift_blit_;
 	Gpu12Fence frame_shift_fence_;
+	struct GameScaleFrame {
+		bool active = false;
+		bool attempted = false;
+		bool done = false;
+		GameScaleStretch stretch;
+	} game_scale_;
+	ID3D12Resource *game_scale_color_ = nullptr;
+	ID3D12Resource *game_scale_depth_ = nullptr;
+	ID3D12Resource *game_scale_motion_ = nullptr;
+	BlitPipelineD3D12 game_scale_blit_;
+	FrameInputs game_scale_shown_;
+	bool game_scale_hooks_ = false;
+	GameScaleWatch game_scale_watch_{};
+	bool game_scale_watching_ = false;
+	bool game_scale_said_ = false;
+	bool game_scale_backend_takes() const noexcept;
+	bool game_scale_before_aa_said_ = false;
+	uint64_t game_scale_report_at_ = 0;
+	uint32_t game_scale_frames_ = 0, game_scale_fallbacks_ = 0;
+	games::GameIntegration *game_ = nullptr;
+	std::wstring game_note_;
+	games::ScaleDriver game_driver_;
+	bool game_integrated() const noexcept
+	{
+		return settings_.game_render_scale && game_ != nullptr && game_->attached() && game_->replaces_stretch();
+	}
+	bool game_scale_holds_present() const noexcept
+	{
+		return game_integrated() && game_driver_.holds_present(game_->routes_full_size());
+	}
+	void drive_game_scale(bool stretch_ran);
+	bool run_game_scale(const GameScaleStretch &s);
+	bool enter_game_scale(FrameInputs &inputs);
+	void game_scale_motion(FrameInputs &inputs);
+	void update_game_scale_hooks();
+	void release_game_scale() noexcept;
 	StageTimings stage_times_;
 	void run_engine_passes(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 		const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params);

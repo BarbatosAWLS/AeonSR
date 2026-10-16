@@ -24,6 +24,7 @@ enum class JitterVertexClass : uint8_t {
 
 JitterVertexClass classify_d3d9_vertex_shader(const uint32_t *code, size_t dwords);
 JitterVertexClass classify_dxbc_vertex_shader(const void *code, size_t bytes);
+JitterVertexClass classify_dxil_vertex_shader(const void *code, size_t bytes);
 
 struct D3D9WTerms {
 	static constexpr uint32_t kMax = 16u;
@@ -39,14 +40,18 @@ bool d3d9_w_terms_perspective(const D3D9WTerms &terms, const float *constants, u
 struct DxbcWTerms {
 	static constexpr uint32_t kMax = 16u;
 	uint32_t count = 0;
-	uint8_t slot[kMax]{};
+	uint32_t slot[kMax]{};
+	uint32_t space[kMax]{};
 	uint16_t reg[kMax]{};
 	uint8_t lane[kMax]{};
 };
 bool dxbc_position_w_terms(const void *code, size_t bytes, DxbcWTerms *out);
+bool dxil_position_w_terms(const void *code, size_t bytes, DxbcWTerms *out);
 
 using DxbcConstantRead = bool (*)(void *user, uint32_t slot, uint32_t reg, float out[4]);
 int dxbc_w_terms_perspective(const DxbcWTerms &terms, DxbcConstantRead read, void *user) noexcept;
+using DxbcSpacedConstantRead = bool (*)(void *user, uint32_t space, uint32_t slot, uint32_t reg, float out[4]);
+int dxbc_w_terms_perspective_spaced(const DxbcWTerms &terms, DxbcSpacedConstantRead read, void *user) noexcept;
 
 size_t d3d9_shader_dwords(const uint32_t *code, size_t max_dwords) noexcept;
 
