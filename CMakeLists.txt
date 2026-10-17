@@ -67,6 +67,19 @@ foreach(_req
   endif()
 endforeach()
 
+# Microsoft's Direct3D 12 Agility SDK core, when it has been fetched (tools\fetch_agility_sdk.ps1).
+# Optional: without it the engine device is made on the core this Windows ships, which answers Shader
+# Model 6.5, and FSR 4's model then faults inside D3D12Core.dll on its first dispatch.
+set(AEONSR_AGILITY_CORE "${AEONSR_EXTERNAL}/D3D12Core/D3D12Core.dll" CACHE FILEPATH
+  "Microsoft's D3D12Core.dll (Agility SDK 1.619.x), shipped in runtime so FSR 4 runs on Windows 10")
+if(EXISTS "${AEONSR_AGILITY_CORE}")
+  list(APPEND AEONSR_RUNTIME_FILES "${AEONSR_AGILITY_CORE}")
+  message(STATUS "Agility core: ${AEONSR_AGILITY_CORE}")
+else()
+  message(STATUS "No Agility core at ${AEONSR_AGILITY_CORE}: FSR 4 will be refused on this Windows "
+    "(its core answers Shader Model 6.5, FSR 4 needs 6.6); run tools\\fetch_agility_sdk.ps1")
+endif()
+
 set(RESHADEFX_SOURCES
   "${RESHADE_ROOT}/source/effect_lexer.cpp"
   "${RESHADE_ROOT}/source/effect_expression.cpp"
