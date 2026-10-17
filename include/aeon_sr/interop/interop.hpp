@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aeon_sr/core/imgui_reshade.hpp"
+#include "aeon_sr/interop/agility_core.hpp"
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -116,6 +117,8 @@ private:
 	bool adapter_matched_ = false;
 	bool borrowed_ = false;
 	bool initialising_ = false;
+	bool agility_tried_ = false;   // a bundled Direct3D 12 core was asked for this device
+	bool agility_core_ = false;    // ... and the device is on it
 
 	bool finish_device();
 };

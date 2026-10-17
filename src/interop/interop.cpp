@@ -298,12 +298,35 @@ bool EngineDevice::init(reshade::api::device *game)
 bool EngineDevice::finish_device()
 {
 	if (device12_ == nullptr) {
+		// A bundled Direct3D 12 core first, when one is there: the engine device is what FSR 4 runs on,
+		// and FSR 4's model needs Shader Model 6.6 with 8-bit integer dot products, which the core
+		// Windows 10 ships does not offer (it answers 6.5). See agility_core.hpp and docs/agility-core.md.
+		if (!agility_tried_ && agility_core_ready()) {
+			agility_tried_ = true;
+			std::wstring say;
+			const HRESULT ca = create_device_on_agility_core(adapter_, D3D_FEATURE_LEVEL_12_1,
+				IID_PPV_ARGS(&device12_), &say);
+			if (SUCCEEDED(ca) && device12_ != nullptr) {
+				agility_core_ = true;
+				diag_logf(DiagLevel::Info, "gpu",
+					L"engine device on the Direct3D 12 Agility SDK core %u from %s", kAgilitySdkVersion,
+					say.c_str());
+			} else {
+				safe_release(device12_);
+				diag_logf(DiagLevel::Warn, "gpu",
+					L"the bundled Direct3D 12 core was not used: %s; the Direct3D 12 core of this "
+					L"Windows runs instead", say.c_str());
+			}
+		}
+
 		const D3D_FEATURE_LEVEL levels[] = {
 			D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
 			D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
 		};
 		HRESULT hr = E_FAIL;
-		if (!engine_adapter_is_intel(adapter_) &&
+		if (device12_ != nullptr) {
+			hr = S_OK;
+		} else if (!engine_adapter_is_intel(adapter_) &&
 			SUCCEEDED(D3D12CreateDevice(adapter_, D3D_FEATURE_LEVEL_1_0_CORE, IID_PPV_ARGS(&device12_))) &&
 			device12_ != nullptr) {
 			if (engine_device_max_level(device12_) >= D3D_FEATURE_LEVEL_11_0)
