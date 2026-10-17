@@ -798,11 +798,15 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 		{
 			const std::string label = known ? neural_kernels_label(kernels) : std::string("unread");
 			wchar_t buf[1400]{};
-			_snwprintf_s(buf, _TRUNCATE, L"runtime file %s: version %hs, %hs, sha256 %hs, %zu fatbin containers, "
+			wchar_t unused[96]{};
+			if (kernels.unused_containers != 0u)
+				_snwprintf_s(unused, _TRUNCATE, L" (and %u copies nothing in the runtime loads, left out)",
+					kernels.unused_containers);
+			_snwprintf_s(buf, _TRUNCATE, L"runtime file %s: version %hs, %hs, sha256 %hs, %zu fatbin containers%s, "
 				L"kernels %hs -> %hs",
 				path.c_str(), identity.file_version.empty() ? "unread" : identity.file_version.c_str(),
 				identity.has_certificate ? "certificate table present" : "no certificate table",
-				sha.empty() ? "unread" : sha.c_str(), kernels.containers.size(),
+				sha.empty() ? "unread" : sha.c_str(), kernels.containers.size(), unused,
 				label.empty() ? "none named" : label.c_str(),
 				serves ? "runs on this card" : "nothing for this card");
 			diag_info("neural", buf);

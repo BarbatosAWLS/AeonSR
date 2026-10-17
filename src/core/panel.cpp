@@ -838,7 +838,8 @@ void draw_framegen_section(const PanelState &state, Settings &settings, PanelAct
 			"elsewhere AeonSR's own is used", ui::Brand::Nvidia },
 	};
 	if (button_row_index<3>("Low latency", &settings.low_latency, kLatencyOptions,
-			"Less delay between your input and the screen. Frame generation, when on, paces its own frames."))
+			"Less delay between your input and the screen, with frame generation too\n"
+			"(not in exclusive fullscreen, where frame generation paces the game's presents)."))
 		actions.persist = true;
 }
 #endif

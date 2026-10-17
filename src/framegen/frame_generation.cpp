@@ -508,10 +508,13 @@ bool FrameGeneration::round_own_window(effect_runtime *runtime, FrameBridge &bri
 		settings.frame_generation_multiplier <= kFrameGenerationMultiplierMax ? settings.frame_generation_multiplier : 0u;
 	const bool vendor_asked = asked != FrameGenerator::AeonSR && stage_.vendor_usable(asked);
 	double vblank = 0.0, refresh = 0.0;
+	const OverlayStats paced = overlay_.stats();
 	const DisplayGrid monitor = clock_.grid();
-	if (monitor.valid && monitor.period_ms > 2.0)
+	if (paced.compositor_paced && paced.period_ms > 2.0)
+		refresh = paced.period_ms;
+	else if (monitor.valid && monitor.period_ms > 2.0 && refresh_agrees(monitor.period_ms, paced.monitor_hz))
 		refresh = monitor.period_ms;
-	else if (!compositor_clock(&vblank, &refresh))
+	else if (!compositor_clock(&vblank, &refresh) || !refresh_agrees(refresh, paced.monitor_hz))
 		refresh = 0.0;
 	const double real_ms = pacer_.real_interval_ms();
 	uint32_t steps = multiplier;
@@ -657,7 +660,8 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 			L"(%ls), %llu real frames left out, %llu refreshes held, %llu repeated by the multiplier, %.1f ms behind the "
 			L"game (%.1f of it until a frame is usable); on the screen %.1f ms after the game's own time (real frames "
 			L"%.1f, p90 %.1f, %u seen; held %.1f ms after ready), decided %.1f ms before its refresh, %llu missed, %llu late, shown %.1f ms after the blank planned (earliest %.1f); on the game's thread, median ms: round %.2f (begin %.2f, "
-			L"estimator %.2f, end %.2f), wait %.2f; window %ls", (ret - window_start_) / 1000.0, w.frames, med(w.real),
+			L"estimator %.2f, end %.2f), wait %.2f; window's thread p90/most ms: swap chain wait %.1f/%.1f, late "
+			L"%.1f/%.1f, picture %.1f/%.1f, present %.1f/%.1f, GPU done p90 d3d12 %.1f d3d11 %.1f; window %ls", (ret - window_start_) / 1000.0, w.frames, med(w.real),
 			w.generated, by.c_str(), steps, s.real_per_s, s.generated_per_s, s.period_ms > 0.0 ? 1000.0 / s.period_ms : 0.0,
 			s.paced_by == OverlayStats::kPacedByMonitor ? L"the monitor's vertical blanks"
 				: s.paced_by == OverlayStats::kPacedByCompositor ? L"the compositor's clock" : L"the swap chain's releases",
@@ -668,6 +672,8 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 			static_cast<unsigned long long>(s.missed - std::min(s.missed, own_logged_.missed)),
 			static_cast<unsigned long long>(s.late - std::min(s.late, own_logged_.late)), s.offset_p50_ms, s.offset_min_ms,
 			med(w.round), med(w.begin), med(w.record), med(w.end), med(w.waits),
+			s.thread_waitable_p90, s.thread_waitable_max, s.thread_late_p90, s.thread_late_max, s.thread_render_p90,
+			s.thread_render_max, s.thread_present_p90, s.thread_present_max, s.gpu_d3d12_p90, s.gpu_d3d11_p90,
 			!s.visible ? L"hidden (the game is not in front)"
 				: s.in_host ? L"shown, from AeonSRHost.exe" : L"shown, from the game's process");
 		own_logged_ = s;

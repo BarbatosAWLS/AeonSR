@@ -58,6 +58,7 @@ public:
 	void device_gone(reshade::api::device *device);
 
 	bool active() const noexcept { return runtime_ != nullptr; }
+	bool own_window_active() const noexcept { return overlay_active_; }
 	static void note_vulkan_present_mode(uint32_t mode) noexcept;
 	FrameGenReadout readout() const;
 

@@ -25,9 +25,12 @@ uint32_t auto_multiplier(double frame_ms, double period_ms, uint32_t current, ui
 
 uint32_t even_cap_fps(double fps, double refresh_hz) noexcept;
 
+bool refresh_agrees(double period_ms, double nominal_hz) noexcept;
+
 class OverlayPace {
 public:
 	static constexpr double kLeadMs = 6.0;
+	static constexpr double kMaxLeadShare = 0.85;
 	static constexpr double kMinLeadMs = 3.0;
 	static constexpr double kLeadStepMs = 1.0;
 	static constexpr uint32_t kMissWindow = 60;
@@ -40,6 +43,11 @@ public:
 	double lead_ms() const noexcept { return lead_; }
 	uint32_t misses() const noexcept { return misses_total_; }
 	void set_decide_early(bool early) noexcept { early_ = early; }
+	void set_lead_cap(double share) noexcept
+	{
+		if (share > 0.1 && share < 1.0)
+			lead_cap_ = share;
+	}
 	void set_lead(double ms) noexcept
 	{
 		if (ms > 0.0) {
@@ -61,6 +69,7 @@ private:
 	double lead_ = kLeadMs;
 	bool early_ = false;
 	bool fixed_ = false;
+	double lead_cap_ = kMaxLeadShare;
 	bool presented_ = false;
 	uint8_t recent_[kMissWindow] = {};
 	uint32_t recent_at_ = 0, recent_misses_ = 0, calm_ = 0, misses_total_ = 0;
@@ -74,17 +83,22 @@ class OverlayScheduler {
 public:
 	static constexpr uint32_t kKeep = 8;
 	static constexpr uint32_t kIntervals = 32;
-	static constexpr double kMarginMs = 4.0;
+	static constexpr double kNeedWindowMs = 2000.0;
+	static constexpr uint32_t kNeedSamples = 256;
+	static constexpr double kGuardFloorMs = 0.5;
+	static constexpr double kGuardShare = 0.2;
+	static constexpr double kRoundingFraction = 0.25;
+	static constexpr double kMarginMs = 1.5;
 	static constexpr double kMaxLatencyMs = 150.0;
 	static constexpr double kHitch = 3.0;
 	static constexpr uint32_t kSlower = 8;
-	static constexpr double kShrinkMs = 0.05;
+	static constexpr double kShrinkFraction = 0.01;
 	static constexpr double kGrowFraction = 0.25;
 
 	void reset() noexcept;
 
 	void add(uint64_t id, double presented_ms, bool pairs_with_previous, double usable_ms, uint32_t steps = 0,
-		uint32_t made = 0, bool vendor = false) noexcept;
+		uint32_t made = 0, bool vendor = false, double ready_slack_ms = -1.0, double ready_after_ms = -1.0) noexcept;
 
 	OverlayChoice choose(double display_ms, double period_ms) noexcept;
 
@@ -110,6 +124,7 @@ private:
 	};
 	double interval_stat(bool p90) const noexcept;
 	double lag_stat() const noexcept;
+	double desired_latency(double period_ms) const noexcept;
 
 	std::deque<Real> reals_;
 	double intervals_[kIntervals] = {};
@@ -117,6 +132,17 @@ private:
 	uint32_t long_run_ = 0;
 	double lags_[kIntervals] = {};
 	uint32_t lag_n_ = 0, lag_at_ = 0;
+	struct Need {
+		double at;
+		double lag;
+		double pair;
+		double slack;
+		double after;
+	};
+	Need needs_[kNeedSamples] = {};
+	uint32_t need_n_ = 0, need_at_ = 0;
+	double last_display_ = 0.0, last_period_ = 0.0;
+	uint32_t skips_ = 0;
 	double latency_ = -1.0;
 	uint64_t reals_shown_ = 0, reals_skipped_ = 0, generated_ = 0, held_ = 0, repeated_ = 0;
 	uint32_t last_index_ = 0;

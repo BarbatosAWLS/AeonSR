@@ -95,6 +95,99 @@ bool container_serves(const NeuralKernelContainer &c, uint32_t capability) noexc
 	return c.ptx_floor != 0u && c.ptx_floor <= capability;
 }
 
+struct PeView {
+	struct Section {
+		char name[9] = {};
+		uint32_t va = 0, vsize = 0, raw = 0, rawsize = 0, flags = 0;
+	};
+	bool ok = false;
+	uint64_t base = 0;
+	std::vector<Section> sections;
+
+	PeView(const unsigned char *b, size_t size)
+	{
+		if (b == nullptr || size < 0x40u || b[0] != 'M' || b[1] != 'Z')
+			return;
+		const uint32_t pe = rd32(b + 0x3C);
+		if (pe > size - 24u || rd32(b + pe) != 0x00004550u)
+			return;
+		const size_t opt = pe + 24u;
+		if (size - opt < 32u || rd16(b + opt) != 0x20Bu)
+			return;
+		base = rd64(b + opt + 24u);
+		const size_t table = opt + rd16(b + pe + 20u);
+		for (uint32_t i = 0; i < rd16(b + pe + 6u); ++i) {
+			const size_t s = table + 40u * i;
+			if (s > size || size - s < 40u)
+				return;
+			Section x;
+			memcpy(x.name, b + s, 8);
+			x.vsize = rd32(b + s + 8);
+			x.va = rd32(b + s + 12);
+			x.rawsize = rd32(b + s + 16);
+			x.raw = rd32(b + s + 20);
+			x.flags = rd32(b + s + 36);
+			if (x.raw > size || x.rawsize > size - x.raw)
+				return;
+			sections.push_back(x);
+		}
+		ok = true;
+	}
+
+	uint64_t rva_of(size_t offset) const noexcept
+	{
+		for (const Section &s : sections)
+			if (offset >= s.raw && offset - s.raw < s.rawsize)
+				return s.va + (offset - s.raw);
+		return UINT64_MAX;
+	}
+};
+
+void drop_unreferenced(const unsigned char *b, size_t size, NeuralRuntimeKernels *k)
+{
+	if (k->containers.size() < 2u)
+		return;
+	const PeView pe(b, size);
+	if (!pe.ok)
+		return;
+	std::vector<uint64_t> wanted;
+	for (const NeuralKernelContainer &c : k->containers)
+		wanted.push_back(pe.rva_of(c.offset));
+	std::vector<bool> used(wanted.size(), false);
+	const auto mark = [&](uint64_t rva) {
+		for (size_t i = 0; i < wanted.size(); ++i)
+			if (wanted[i] == rva)
+				used[i] = true;
+	};
+	for (const PeView::Section &s : pe.sections) {
+		const unsigned char *const lo = b + s.raw;
+		if (s.flags & 0x20000000u) {
+			for (size_t p = 0; p + 7u <= s.rawsize; ++p) {
+				if ((lo[p] != 0x48u && lo[p] != 0x4Cu) || lo[p + 1] != 0x8Du || (lo[p + 2] & 0xC7u) != 0x05u)
+					continue;
+				const int32_t disp = static_cast<int32_t>(rd32(lo + p + 3));
+				mark(static_cast<uint64_t>(static_cast<int64_t>(s.va) + static_cast<int64_t>(p) + 7 + disp));
+			}
+		} else if (strcmp(s.name, ".rsrc") != 0) {
+			for (size_t p = (8u - s.raw % 8u) % 8u; p + 8u <= s.rawsize; p += 8u) {
+				const uint64_t v = rd64(lo + p);
+				if (v >= pe.base && v - pe.base < 0x100000000ull)
+					mark(v - pe.base);
+			}
+		}
+	}
+	if (std::find(used.begin(), used.end(), true) == used.end())
+		return;
+	std::vector<NeuralKernelContainer> keep;
+	for (size_t i = 0; i < used.size(); ++i) {
+		if (used[i])
+			keep.push_back(std::move(k->containers[i]));
+		else
+			++k->unused_containers;
+	}
+	k->containers.swap(keep);
+}
+
 }
 
 uint32_t neural_capability_for_architecture(uint32_t architecture) noexcept
@@ -229,9 +322,11 @@ NeuralRuntimeKernels neural_kernels_in(const char *bytes, size_t size)
 		size_t end = 0;
 		if (!read_container(b, size, i, &c, &end))
 			continue;
+		c.offset = i;
 		out.containers.push_back(std::move(c));
 		i = end - 1u;
 	}
+	drop_unreferenced(b, size, &out);
 	return out;
 }
 

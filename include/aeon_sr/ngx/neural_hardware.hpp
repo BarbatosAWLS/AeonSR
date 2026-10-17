@@ -24,10 +24,12 @@ const char *neural_arch_name(uint32_t id) noexcept;
 struct NeuralKernelContainer {
 	std::vector<uint32_t> cubins;
 	uint32_t ptx_floor = 0u;
+	size_t offset = 0u;
 };
 
 struct NeuralRuntimeKernels {
 	std::vector<NeuralKernelContainer> containers;
+	uint32_t unused_containers = 0u;
 	std::vector<uint32_t> text_targets;
 	uint32_t text_ptx_floor = 0u;
 };

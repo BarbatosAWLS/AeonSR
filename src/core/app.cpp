@@ -2180,7 +2180,7 @@ double App::latency_clock_ms() noexcept
 unsigned int App::latency_mode_now() const noexcept
 {
 #if AEONSR_FRAME_GENERATION
-	if (settings_.frame_generation)
+	if (settings_.frame_generation && !framegen_.own_window_active())
 		return 0u;
 #endif
 	const unsigned int m = settings_.low_latency <= 2u ? settings_.low_latency : 0u;

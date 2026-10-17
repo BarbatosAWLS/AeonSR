@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,6 +25,8 @@ namespace aeon_sr {
 inline constexpr uint32_t kOverlayMaxMade = 5;
 
 bool compositor_clock(double *vblank_ms, double *period_ms) noexcept;
+
+double monitor_refresh_hz(HMONITOR m) noexcept;
 
 bool overlay_creating_device() noexcept;
 bool overlay_on_own_thread() noexcept;
@@ -57,6 +60,12 @@ struct OverlayStats {
 	double screen_ms_p50 = 0.0, screen_real_ms_p50 = 0.0, screen_real_ms_p90 = 0.0;
 	uint32_t screen_samples = 0;
 	double held_real_ms_p50 = 0.0;
+	double thread_waitable_p90 = 0.0, thread_waitable_max = 0.0;
+	double thread_late_p90 = 0.0, thread_late_max = 0.0;
+	double thread_render_p90 = 0.0, thread_render_max = 0.0;
+	double thread_present_p90 = 0.0, thread_present_max = 0.0;
+	double gpu_d3d12_p90 = 0.0, gpu_d3d11_p90 = 0.0;
+	double monitor_hz = 0.0;
 	double lead_ms = 0.0;
 	uint64_t late = 0;
 	uint64_t missed = 0;
@@ -125,6 +134,8 @@ private:
 	bool make_ring(ID3D12Device *device, uint32_t w, uint32_t h, DXGI_FORMAT family, std::wstring *why);
 	void release_ring() noexcept;
 	void run();
+	void ready_run();
+	double ready_time(uint64_t fence_value);
 	bool thread_init(std::wstring *why);
 	bool init_host(std::wstring *why);
 	bool init_local(std::wstring *why);
@@ -160,6 +171,16 @@ private:
 
 	std::thread thread_;
 	std::atomic<bool> quit_{ false };
+	std::thread ready_thread_;
+	HANDLE ready_event_ = nullptr;
+	static constexpr uint32_t kReadyRing = 64;
+	struct ReadyAt {
+		uint64_t value;
+		double at;
+	};
+	ReadyAt ready_at_[kReadyRing] = {};
+	std::mutex ready_mutex_;
+	std::atomic<bool> ready_alive_{ false };
 	std::atomic<bool> init_done_{ false };
 	std::atomic<bool> init_ok_{ false };
 	std::atomic<bool> sink_failed_{ false };
@@ -234,6 +255,22 @@ private:
 	uint32_t shown_ring_at_ = 0;
 	UINT stats_count_ = 0;
 	std::vector<double> screen_all_, screen_real_, held_real_;
+	std::vector<double> t_waitable_, t_wake_late_, t_render_, t_present_;
+	double monitor_hz_ = 0.0, monitor_hz_at_ = -1.0e9, good_period_ = 0.0;
+	HMONITOR monitor_ = nullptr;
+	struct GpuTrace {
+		ID3D12Fence *ready_fence, *done_fence;
+		uint64_t ready, done;
+		double submitted;
+	};
+	bool gpu_trace_ = false;
+	std::thread trace_thread_;
+	std::mutex trace_mutex_;
+	std::condition_variable trace_cv_;
+	std::vector<GpuTrace> trace_pending_;
+	std::vector<double> trace_d3d12_, trace_d3d11_;
+	bool trace_quit_ = false;
+	void trace_run();
 	void read_frame_statistics();
 	bool showing_made_ = false;
 	bool shown_new_ = false;

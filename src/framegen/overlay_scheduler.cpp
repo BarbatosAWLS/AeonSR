@@ -1,6 +1,7 @@
 #include "aeon_sr/framegen/overlay_scheduler.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 
 namespace aeon_sr {
@@ -16,6 +17,15 @@ uint32_t auto_multiplier(double frame_ms, double period_ms, uint32_t current, ui
 		return current;
 	const double want = std::ceil(frames - 0.05);
 	return static_cast<uint32_t>(std::clamp(want, 1.0, static_cast<double>(max)));
+}
+
+bool refresh_agrees(double period_ms, double nominal_hz) noexcept
+{
+	if (nominal_hz <= 1.0)
+		return true;
+	if (period_ms <= 0.0)
+		return false;
+	return std::fabs(1000.0 / period_ms - nominal_hz) <= std::max(0.04 * nominal_hz, 1.0);
 }
 
 uint32_t even_cap_fps(double fps, double refresh_hz) noexcept
@@ -43,7 +53,7 @@ void OverlayPace::note(bool missed, double period_ms) noexcept
 		++misses_total_;
 		calm_ = 0;
 		if (recent_misses_ >= kMissesToGrow) {
-			lead_ = std::min(lead_ + kLeadStepMs, 0.5 * period_ms);
+			lead_ = std::min(lead_ + kLeadStepMs, lead_cap_ * period_ms);
 			for (uint8_t &r : recent_)
 				r = 0;
 			recent_misses_ = 0;
@@ -87,12 +97,13 @@ double OverlayPace::plan(double now_ms, double vblank_ms, double period_ms, doub
 		last_ = next;
 		return next + period_ms;
 	}
-	const double lead = std::min(lead_, 0.5 * period_ms);
-	double next = vblank + std::ceil((now_ms + lead - vblank) / period_ms) * period_ms;
-	if (next < now_ms + lead)
+	const double lead = std::min(lead_, lead_cap_ * period_ms);
+	const double least = std::min({ kMinLeadMs, lead, 0.5 * period_ms });
+	double next = vblank + std::ceil((now_ms + least - vblank) / period_ms) * period_ms;
+	if (next < now_ms + least)
 		next += period_ms;
 	if (presented_ && last_ > 0.0 && !fixed_)
-		note(next > last_ + 1.5 * period_ms, period_ms);
+		note(now_ms > last_ + period_ms, period_ms);
 	presented_ = false;
 	if (last_ > 0.0 && next < last_ + 0.5 * period_ms)
 		next = last_ + period_ms;
@@ -126,8 +137,53 @@ double OverlayScheduler::lag_stat() const noexcept
 	return s[std::min(lag_n_ - 1, lag_n_ * 9 / 10)];
 }
 
+double OverlayScheduler::desired_latency(double period_ms) const noexcept
+{
+	if (need_n_ == 0)
+		return 0.0;
+	const uint32_t first = (need_at_ + kNeedSamples - need_n_) % kNeedSamples;
+	const double newest = needs_[(need_at_ + kNeedSamples - 1) % kNeedSamples].at;
+	const auto mad = [](double *v, uint32_t n) {
+		std::nth_element(v, v + n / 2, v + n);
+		const double med = v[n / 2];
+		for (uint32_t i = 0; i < n; ++i)
+			v[i] = std::fabs(v[i] - med);
+		std::nth_element(v, v + n / 2, v + n);
+		return 1.4826 * v[n / 2];
+	};
+	double afters[kNeedSamples];
+	uint32_t known = 0;
+	for (uint32_t k = 0; k < need_n_; ++k) {
+		const Need &n = needs_[(first + k) % kNeedSamples];
+		if (newest - n.at <= kNeedWindowMs && n.slack >= 0.0 && n.after >= 0.0)
+			afters[known++] = n.after;
+	}
+	const bool timed = known >= 8 && interval_n_ >= 8;
+	double spread = 0.0;
+	if (timed) {
+		double iv[kIntervals];
+		std::copy(intervals_, intervals_ + interval_n_, iv);
+		const double presents = mad(iv, interval_n_) / std::sqrt(2.0);
+		const double gpu = mad(afters, known);
+		spread = std::min(kRoundingFraction * period_ms, std::sqrt(presents * presents + gpu * gpu));
+	}
+	const double guard = std::min(kGuardShare * period_ms, kGuardFloorMs + 2.0 * spread);
+	double need = 0.0;
+	for (uint32_t k = 0; k < need_n_; ++k) {
+		const Need &n = needs_[(first + k) % kNeedSamples];
+		if (newest - n.at > kNeedWindowMs)
+			continue;
+		const double round = !timed || n.slack < 0.0 ? kRoundingFraction * period_ms
+			: n.slack < guard ? period_ms : 0.0;
+		need = std::max(need, n.lag + round - 0.5 * period_ms);
+		if (n.pair >= 0.0)
+			need = std::max(need, n.pair + round - 1.5 * period_ms);
+	}
+	return std::min(kMaxLatencyMs, need + kMarginMs + (timed ? spread : 0.0));
+}
+
 void OverlayScheduler::add(uint64_t id, double presented_ms, bool pairs_with_previous, double usable_ms, uint32_t steps,
-	uint32_t made, bool vendor) noexcept
+	uint32_t made, bool vendor, double ready_slack_ms, double ready_after_ms) noexcept
 {
 	if (!reals_.empty()) {
 		const Real &last = reals_.back();
@@ -159,6 +215,16 @@ void OverlayScheduler::add(uint64_t id, double presented_ms, bool pairs_with_pre
 	} else {
 		pairs_with_previous = false;
 	}
+	const bool after_skip = last_display_ > 0.0 && usable_ms - last_display_ > 1.5 * last_period_ &&
+		std::bitset<16>(skips_).count() < 8;
+	if (lag < kMaxLatencyMs && !after_skip) {
+		const double pair = pairs_with_previous && long_run_ == 0 && !reals_.empty() ? usable_ms - reals_.back().at
+			: -1.0;
+		needs_[need_at_] = Need{ presented_ms, lag, pair < kMaxLatencyMs ? pair : -1.0, ready_slack_ms,
+			ready_slack_ms >= 0.0 ? ready_after_ms : -1.0 };
+		need_at_ = (need_at_ + 1) % kNeedSamples;
+		need_n_ = std::min(need_n_ + 1, kNeedSamples);
+	}
 	reals_.push_back(Real{ id, presented_ms, pairs_with_previous, false, steps >= 2 ? steps : 0u, made, vendor, 0.0,
 		usable_ms });
 	while (reals_.size() > kKeep)
@@ -168,13 +234,18 @@ void OverlayScheduler::add(uint64_t id, double presented_ms, bool pairs_with_pre
 OverlayChoice OverlayScheduler::choose(double display_ms, double period_ms) noexcept
 {
 	OverlayChoice c;
+	skips_ = (skips_ << 1) |
+		(last_display_ > 0.0 && display_ms - last_display_ > 1.5 * last_period_ ? 1u : 0u);
+	skips_ &= 0xFFFFu;
+	last_display_ = display_ms;
+	last_period_ = period_ms;
 	if (reals_.size() < 2 || interval_n_ == 0)
 		return c;
-	const double desired = std::min(kMaxLatencyMs, std::max(period_ms, interval_stat(true)) + lag_stat() + kMarginMs);
+	const double desired = desired_latency(period_ms);
 	if (latency_ < 0.0)
-		latency_ = desired;
+		latency_ = std::min(kMaxLatencyMs, desired + 0.5 * period_ms);
 	else if (latency_ > desired)
-		latency_ = std::max(desired, latency_ - kShrinkMs);
+		latency_ = std::max(desired, latency_ - kShrinkFraction * period_ms);
 	else if (latency_ < desired)
 		latency_ = std::min(desired, latency_ + kGrowFraction * period_ms);
 	double content = display_ms - latency_;
