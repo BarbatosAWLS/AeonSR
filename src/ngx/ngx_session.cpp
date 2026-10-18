@@ -17,6 +17,10 @@ bool NgxSession::ensure_dll_present()
 	dll_present = !dir.empty();
 	if (dll_present)
 		dll_dir = dir;
+	if (!dll_present && !layer_path.empty()) {
+		dll_present = true;
+		dll_dir = addon_dir;
+	}
 	if (!dll_present) {
 		status = UpscalerStatus::MissingRuntime;
 		last_error = L"Place nvngx_dlss.dll next to AeonSR.addon64, or in a runtime\\ folder beside it";

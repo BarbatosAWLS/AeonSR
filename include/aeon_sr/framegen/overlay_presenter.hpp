@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <condition_variable>
 #include <mutex>
@@ -27,6 +28,15 @@ inline constexpr uint32_t kOverlayMaxMade = 5;
 bool compositor_clock(double *vblank_ms, double *period_ms) noexcept;
 
 double monitor_refresh_hz(HMONITOR m) noexcept;
+
+struct FenceReached {
+	double at = -1.0;
+	bool waited = false;
+	bool exact = false;
+};
+inline constexpr double kFenceSlackMs = 0.5;
+FenceReached fence_reached(ID3D12Fence *fence, uint64_t value, HANDLE event, HANDLE quit, double timeout_ms,
+	double since) noexcept;
 
 bool overlay_creating_device() noexcept;
 bool overlay_on_own_thread() noexcept;
@@ -60,6 +70,8 @@ struct OverlayStats {
 	double screen_ms_p50 = 0.0, screen_real_ms_p50 = 0.0, screen_real_ms_p90 = 0.0;
 	uint32_t screen_samples = 0;
 	double held_real_ms_p50 = 0.0;
+	double ready_wait_p90 = 0.0, ready_wait_max = 0.0;
+	double ready_wait_long = 0.0;
 	double thread_waitable_p90 = 0.0, thread_waitable_max = 0.0;
 	double thread_late_p90 = 0.0, thread_late_max = 0.0;
 	double thread_render_p90 = 0.0, thread_render_max = 0.0;
@@ -67,13 +79,17 @@ struct OverlayStats {
 	double gpu_d3d12_p90 = 0.0, gpu_d3d11_p90 = 0.0;
 	double monitor_hz = 0.0;
 	double lead_ms = 0.0;
+	double work_ms = 0.0;
+	uint64_t work_seen = 0, work_found = 0, work_untimed = 0;
 	uint64_t late = 0;
 	uint64_t missed = 0;
+	uint64_t missed_late_work = 0;
 	double offset_p50_ms = 0.0, offset_min_ms = 0.0;
 	static constexpr uint8_t kPacedByReleases = 0, kPacedByMonitor = 1, kPacedByCompositor = 2;
 	uint8_t paced_by = kPacedByReleases;
 	bool in_host = false;
 	uint32_t host_pid = 0;
+	int host_gpu_class = -1;
 	std::wstring note;
 };
 
@@ -254,7 +270,8 @@ private:
 	ShownEntry shown_ring_[kShownRing] = {};
 	uint32_t shown_ring_at_ = 0;
 	UINT stats_count_ = 0;
-	std::vector<double> screen_all_, screen_real_, held_real_;
+	std::vector<double> screen_all_, screen_real_, held_real_, ready_wait_;
+	uint32_t ready_wait_long_ = 0;
 	std::vector<double> t_waitable_, t_wake_late_, t_render_, t_present_;
 	double monitor_hz_ = 0.0, monitor_hz_at_ = -1.0e9, good_period_ = 0.0;
 	HMONITOR monitor_ = nullptr;
@@ -262,15 +279,27 @@ private:
 		ID3D12Fence *ready_fence, *done_fence;
 		uint64_t ready, done;
 		double submitted;
+		double planned;
+		double display;
+		uint64_t seq;
 	};
-	bool gpu_trace_ = false;
+	struct GpuDone {
+		double planned, display, done;
+		bool exact;
+	};
 	std::thread trace_thread_;
 	std::mutex trace_mutex_;
 	std::condition_variable trace_cv_;
+	HANDLE trace_quit_event_ = nullptr;
 	std::vector<GpuTrace> trace_pending_;
+	std::vector<GpuDone> trace_done_;
 	std::vector<double> trace_d3d12_, trace_d3d11_;
 	bool trace_quit_ = false;
+	uint64_t trace_seq_ = 0, trace_void_ = 0;
+	uint64_t work_seen_ = 0, work_found_ = 0, work_untimed_ = 0;
 	void trace_run();
+	double planned_at_ = 0.0;
+	FILE *pace_csv_ = nullptr;
 	void read_frame_statistics();
 	bool showing_made_ = false;
 	bool shown_new_ = false;

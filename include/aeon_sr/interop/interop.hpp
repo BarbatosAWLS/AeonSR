@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aeon_sr/core/imgui_reshade.hpp"
+#include "aeon_sr/interop/agility_core.hpp"
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -24,8 +25,6 @@ enum class BridgeKind : uint8_t {
 	Vulkan,
 	Staging,
 };
-
-const char *bridge_kind_label(BridgeKind kind) noexcept;
 
 enum class BridgeStep : uint8_t {
 	Ok = 0,

@@ -19,14 +19,12 @@ public:
 	void release() noexcept;
 
 	ID3D12Resource *texture() const noexcept { return tex_; }
-	uint32_t creations() const noexcept { return creations_; }
 
 private:
 	ID3D12Resource *tex_ = nullptr;
 	DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
 	uint32_t w_ = 0, h_ = 0;
 	bool failed_ = false;
-	uint32_t creations_ = 0;
 };
 
 }

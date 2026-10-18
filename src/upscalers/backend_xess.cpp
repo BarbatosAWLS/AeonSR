@@ -35,16 +35,24 @@ reshade::api::device_api XessD3D12Backend::api() const
 	return reshade::api::device_api::d3d12;
 }
 
-bool XessD3D12Backend::ensure_dll_present()
+bool XessD3D12Backend::ensure_dll_present(bool may_keep)
 {
 	if (api_.module != nullptr)
 		return true;
-	for (const auto &p : runtime_candidates(runtime_search_dirs(addon_dir, exe_directory_w()), L"libxess.dll")) {
-		if (file_exists_w(p)) {
-			dll_path_ = p;
-			return true;
+	const uint64_t now = GetTickCount64();
+	if (!may_keep || !looked_.fresh(now)) {
+		bool found = false;
+		for (const auto &p : runtime_candidates(runtime_search_dirs(addon_dir, exe_directory_w()), L"libxess.dll")) {
+			if (file_exists_w(p)) {
+				dll_path_ = p;
+				found = true;
+				break;
+			}
 		}
+		looked_.note(found, now);
 	}
+	if (looked_.found())
+		return true;
 	status = UpscalerStatus::MissingRuntime;
 	last_error = L"Place libxess.dll next to AeonSR.addon64 (run scripts/bootstrap-sr-runtimes.ps1)";
 	return false;
@@ -54,7 +62,7 @@ bool XessD3D12Backend::runtime_present()
 {
 	if (xess_loading())
 		return true;
-	return ensure_dll_present();
+	return ensure_dll_present(true);
 }
 
 void XessD3D12Backend::wait_gpu()

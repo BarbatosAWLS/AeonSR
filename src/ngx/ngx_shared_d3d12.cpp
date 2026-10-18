@@ -3,6 +3,7 @@
 #include "aeon_sr/ngx/ngx_session_ngx.hpp"
 
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace aeon_sr {
@@ -12,6 +13,7 @@ struct SharedNgx12 {
 	ID3D12Device *device = nullptr;
 	const Ngx12Api *api = nullptr;
 	int count = 0;
+	std::vector<std::wstring> paths;
 };
 std::mutex g_shared_mutex;
 std::vector<SharedNgx12> g_shared;
@@ -39,9 +41,24 @@ NVSDK_NGX_Result ngx12_acquire(const Ngx12Api &api, ID3D12Device *device, const 
 			data_dir, device, info);
 		diag_info("dlss", std::wstring(tag) + ngx_format_result(L"Init_with_ProjectID", r));
 	}
-	if (!NVSDK_NGX_FAILED(r))
-		g_shared.push_back(SharedNgx12{ device, &api, 1 });
+	if (!NVSDK_NGX_FAILED(r)) {
+		SharedNgx12 s{ device, &api, 1, {} };
+		if (info != nullptr)
+			for (unsigned int i = 0; i < info->PathListInfo.Length; ++i)
+				if (info->PathListInfo.Path[i] != nullptr)
+					s.paths.emplace_back(info->PathListInfo.Path[i]);
+		g_shared.push_back(std::move(s));
+	}
 	return r;
+}
+
+std::vector<std::wstring> ngx12_instance_paths(const Ngx12Api &api, ID3D12Device *device)
+{
+	std::lock_guard lock(g_shared_mutex);
+	for (const SharedNgx12 &s : g_shared)
+		if (s.device == device && s.api == &api)
+			return s.paths;
+	return {};
 }
 
 void ngx12_release(const Ngx12Api &api, ID3D12Device *device, const wchar_t *tag)

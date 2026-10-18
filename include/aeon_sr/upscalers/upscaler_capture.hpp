@@ -106,7 +106,6 @@ private:
 	uint32_t left_ = 0;
 	uint32_t next_index_ = 0;
 	uint64_t sequence_ = 0;
-	uint64_t last_recorded_ = 0;
 	bool recorded_this_frame_ = false;
 	Plane drawn_{};
 	CapturedPlane drawn_info_{};
@@ -146,7 +145,6 @@ private:
 	uint32_t scope_outstanding_ = 0;
 	bool scope_closed_ = false;
 	bool scope_done_ = true;
-	uint32_t scope_frames_written_ = 0;
 	std::wstring scope_note_;
 	std::wstring scope_error_;
 };

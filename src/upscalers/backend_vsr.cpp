@@ -1,8 +1,13 @@
 #include "aeon_sr/upscalers/backend_vsr.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/core/frame_inputs.hpp"
-#include "aeon_sr/interop/native_d3d.hpp"
+#include "aeon_sr/interop/blit_d3d12.hpp"
+#include "aeon_sr/interop/interop.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
+
+#include <d3d11_4.h>
+#include <dxgi1_2.h>
 
 #include <cstdio>
 #include <cstring>
@@ -62,13 +67,53 @@ bool make_tex(ID3D11Device *dev, uint32_t w, uint32_t h, DXGI_FORMAT fmt, UINT b
 	return SUCCEEDED(dev->CreateTexture2D(&d, nullptr, out));
 }
 
-template <class T>
-void release(T *&p)
+bool make_pair(EngineDevice &engine, ID3D11Device *device11, uint32_t w, uint32_t h, DXGI_FORMAT fmt, UINT bind,
+	SharedPlane &out)
 {
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
+	if (device11 == nullptr || w == 0 || h == 0)
+		return false;
+	D3D11_TEXTURE2D_DESC d{};
+	d.Width = w;
+	d.Height = h;
+	d.MipLevels = 1;
+	d.ArraySize = 1;
+	d.Format = fmt;
+	d.SampleDesc.Count = 1;
+	d.Usage = D3D11_USAGE_DEFAULT;
+	d.BindFlags = bind;
+	d.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	ID3D11Texture2D *tex = nullptr;
+	if (FAILED(device11->CreateTexture2D(&d, nullptr, &tex)) || tex == nullptr)
+		return false;
+	IDXGIResource1 *res = nullptr;
+	HANDLE handle = nullptr;
+	ID3D12Resource *tex12 = nullptr;
+	const bool ok = SUCCEEDED(tex->QueryInterface(IID_PPV_ARGS(&res))) && res != nullptr &&
+		SUCCEEDED(res->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle)) &&
+		SUCCEEDED(engine.device()->OpenSharedHandle(handle, IID_PPV_ARGS(&tex12)));
+	safe_release(res);
+	if (handle != nullptr)
+		CloseHandle(handle);
+	if (!ok || tex12 == nullptr) {
+		safe_release(tex12);
+		safe_release(tex);
+		return false;
 	}
+	out.helper = tex;
+	out.engine = tex12;
+	out.width = w;
+	out.height = h;
+	out.format = fmt;
+	return true;
+}
+
+void drop_pair(SharedPlane &plane)
+{
+	safe_release(plane.engine);
+	safe_release(plane.helper);
+	plane.game = { 0 };
+	plane.width = plane.height = 0;
+	plane.format = DXGI_FORMAT_UNKNOWN;
 }
 
 DXGI_FORMAT vp_format_for(DXGI_FORMAT backbuffer)
@@ -87,83 +132,6 @@ DXGI_FORMAT vp_format_for(DXGI_FORMAT backbuffer)
 	}
 }
 
-}
-
-const char *VsrD3D11Backend::name() const { return "RTX VSR"; }
-reshade::api::device_api VsrD3D11Backend::api() const { return reshade::api::device_api::d3d11; }
-
-bool VsrD3D11Backend::runtime_present() { return true; }
-
-void VsrD3D11Backend::on_destroy_swapchain()
-{
-	release_processor();
-	release_scratch();
-}
-
-void VsrD3D11Backend::release_scratch()
-{
-	release(color_full_);
-	release(input_tex_);
-	release(output_tex_);
-}
-
-void VsrD3D11Backend::release_processor()
-{
-	release(processor_);
-	release(enumerator_);
-	created_render_width_ = created_render_height_ = 0;
-	created_format_ = DXGI_FORMAT_UNKNOWN;
-}
-
-void VsrD3D11Backend::shutdown()
-{
-	release_processor();
-	release_scratch();
-	blit_.release();
-	release(video_context1_);
-	release(video_context_);
-	release(video_device_);
-
-	device_ = nullptr;
-	context_ = nullptr;
-	if (status != UpscalerStatus::MissingRuntime)
-		status = UpscalerStatus::Idle;
-}
-
-bool VsrD3D11Backend::ensure_device(reshade::api::device *device, ID3D11DeviceContext *ctx)
-{
-	ID3D11Device *const dev = native_d3d11_device(device);
-	if (dev == nullptr || ctx == nullptr) {
-		status = UpscalerStatus::UnsupportedApi;
-		last_error = L"RTX VSR needs a Direct3D 11 game. Pick DLSS, FSR or XeSS.";
-		return false;
-	}
-	if (device_ == dev && video_device_ != nullptr && video_context_ != nullptr) {
-		context_ = ctx;
-		return true;
-	}
-
-	shutdown();
-	device_ = dev;
-	context_ = ctx;
-
-	if (FAILED(dev->QueryInterface(__uuidof(ID3D11VideoDevice), reinterpret_cast<void **>(&video_device_))) ||
-		video_device_ == nullptr) {
-		status = UpscalerStatus::InitFailed;
-		last_error = L"ID3D11VideoDevice unavailable (no video processor on this device)";
-		return false;
-	}
-	if (FAILED(ctx->QueryInterface(__uuidof(ID3D11VideoContext), reinterpret_cast<void **>(&video_context_))) ||
-		video_context_ == nullptr) {
-		status = UpscalerStatus::InitFailed;
-		last_error = L"ID3D11VideoContext unavailable";
-		release(video_device_);
-		return false;
-	}
-
-	if (FAILED(ctx->QueryInterface(__uuidof(ID3D11VideoContext1), reinterpret_cast<void **>(&video_context1_))))
-		video_context1_ = nullptr;
-	return true;
 }
 
 bool VsrD3D11Backend::ensure_processor(uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h,
@@ -197,7 +165,7 @@ bool VsrD3D11Backend::ensure_processor(uint32_t render_w, uint32_t render_h, uin
 	if (FAILED(video_device_->CreateVideoProcessor(enumerator_, 0, &processor_)) || processor_ == nullptr) {
 		status = UpscalerStatus::InitFailed;
 		last_error = L"CreateVideoProcessor failed";
-		release(enumerator_);
+		safe_release(enumerator_);
 		return false;
 	}
 
@@ -265,54 +233,141 @@ void VsrD3D11Backend::query_super_resolution()
 	}
 }
 
+const char *VsrD3D11Backend::name() const { return "RTX VSR"; }
+reshade::api::device_api VsrD3D11Backend::api() const { return reshade::api::device_api::d3d12; }
+
+bool VsrD3D11Backend::runtime_present() { return true; }
+
+void VsrD3D11Backend::on_destroy_swapchain()
+{
+	release_processor();
+	release_scratch();
+}
+
+void VsrD3D11Backend::release_scratch()
+{
+	safe_release(color_full_);
+	safe_release(input_tex_);
+	safe_release(output_tex_);
+	if (engine != nullptr && (in_.engine != nullptr || out_.engine != nullptr || flush_trigger_ != nullptr))
+		engine->drain();
+	drop_pair(in_);
+	drop_pair(out_);
+	safe_release(flush_trigger_);
+}
+
+void VsrD3D11Backend::release_processor()
+{
+	safe_release(processor_);
+	safe_release(enumerator_);
+	created_render_width_ = created_render_height_ = 0;
+	created_format_ = DXGI_FORMAT_UNKNOWN;
+}
+
+void VsrD3D11Backend::shutdown()
+{
+	release_processor();
+	release_scratch();
+	blit_.release();
+	safe_release(video_context1_);
+	safe_release(video_context_);
+	safe_release(video_device_);
+	safe_release(context4_);
+	safe_release(fence11_);
+	safe_release(fence12_);
+	value_ = 0;
+
+	device_ = nullptr;
+	context_ = nullptr;
+	if (status != UpscalerStatus::MissingRuntime)
+		status = UpscalerStatus::Idle;
+}
+
+bool VsrD3D11Backend::ensure_device()
+{
+	ID3D11Device *const dev = engine != nullptr ? engine->device11() : nullptr;
+	ID3D11DeviceContext *const ctx = engine != nullptr ? engine->context11() : nullptr;
+	ID3D11Device5 *const dev5 = engine != nullptr ? engine->device11_5() : nullptr;
+	if (dev == nullptr || ctx == nullptr || dev5 == nullptr) {
+		status = UpscalerStatus::InitFailed;
+		last_error = L"RTX VSR needs a Direct3D 11.4 device beside the engine (Windows 10 1709 or newer)";
+		return false;
+	}
+	if (device_ == dev && video_device_ != nullptr && video_context_ != nullptr && fence12_ != nullptr)
+		return true;
+
+	shutdown();
+	device_ = dev;
+	context_ = ctx;
+
+	if (FAILED(dev->QueryInterface(__uuidof(ID3D11VideoDevice), reinterpret_cast<void **>(&video_device_))) ||
+		video_device_ == nullptr) {
+		status = UpscalerStatus::InitFailed;
+		last_error = L"ID3D11VideoDevice unavailable (no video processor on this device)";
+		return false;
+	}
+	if (FAILED(ctx->QueryInterface(__uuidof(ID3D11VideoContext), reinterpret_cast<void **>(&video_context_))) ||
+		video_context_ == nullptr || FAILED(ctx->QueryInterface(IID_PPV_ARGS(&context4_))) || context4_ == nullptr) {
+		status = UpscalerStatus::InitFailed;
+		last_error = L"ID3D11VideoContext unavailable";
+		safe_release(video_context_);
+		safe_release(video_device_);
+		return false;
+	}
+	if (FAILED(ctx->QueryInterface(__uuidof(ID3D11VideoContext1), reinterpret_cast<void **>(&video_context1_))))
+		video_context1_ = nullptr;
+
+	HANDLE h = nullptr;
+	const bool ok = SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence11_))) &&
+		SUCCEEDED(fence11_->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &h)) &&
+		SUCCEEDED(engine->device()->OpenSharedHandle(h, IID_PPV_ARGS(&fence12_)));
+	if (h != nullptr)
+		CloseHandle(h);
+	if (!ok) {
+		status = UpscalerStatus::InitFailed;
+		last_error = L"this driver refused a shared fence between Direct3D 11 and Direct3D 12";
+		safe_release(fence11_);
+		safe_release(fence12_);
+		return false;
+	}
+	value_ = 0;
+	return true;
+}
+
 bool VsrD3D11Backend::run(
 	reshade::api::effect_runtime *runtime,
 	const FrameInputs &inputs,
 	const UpscalerParams &params)
 {
-	if (runtime == nullptr)
+	if (engine == nullptr || !inputs.engine.ready() || inputs.engine.color == nullptr)
 		return false;
-	reshade::api::device *const device = runtime->get_device();
-	if (device == nullptr)
-		return false;
-	ID3D11DeviceContext *const ctx = native_d3d11_context(runtime);
-	if (!ensure_device(device, ctx))
-		return false;
-
-	auto *const backbuffer = native_res<ID3D11Resource>(inputs.color);
-	if (backbuffer == nullptr) {
+	const bool borrowed = engine->borrowed();
+	reshade::api::command_queue *const game_queue = runtime != nullptr ? runtime->get_command_queue() : nullptr;
+	reshade::api::command_list *const game_list = borrowed && game_queue != nullptr
+		? game_queue->get_immediate_command_list() : nullptr;
+	if (borrowed && (game_list == nullptr ||
+			reinterpret_cast<ID3D12GraphicsCommandList *>(game_list->get_native()) != inputs.engine.cmd)) {
 		status = UpscalerStatus::EvaluateFailed;
-		last_error = L"no colour resource";
+		last_error = L"this frame is not on ReShade's own command list, so RTX VSR cannot take it";
 		return false;
 	}
-
 	if (params.color_space != 0) {
 		status = UpscalerStatus::UnsupportedApi;
 		last_error = L"RTX VSR is an SDR feature; this frame is HDR (scRGB/PQ). "
 			L"Use DLSS, or switch the game to SDR for VSR.";
 		return false;
 	}
-
-	const DXGI_FORMAT bb_fmt = tex_format(backbuffer);
-	const DXGI_FORMAT fmt = vp_format_for(bb_fmt);
+	const D3D12_RESOURCE_DESC cd = inputs.engine.color->GetDesc();
+	const DXGI_FORMAT fmt = vp_format_for(cd.Format);
 	if (fmt == DXGI_FORMAT_UNKNOWN) {
 		status = UpscalerStatus::UnsupportedApi;
 		last_error = L"RTX VSR needs an 8-bit RGBA/BGRA frame; this back buffer format is not one.";
 		return false;
 	}
-
-	uint32_t out_w = 0, out_h = 0;
-	{
-		D3D11_TEXTURE2D_DESC d{};
-		ID3D11Texture2D *t = nullptr;
-		if (SUCCEEDED(backbuffer->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&t))) && t) {
-			t->GetDesc(&d);
-			t->Release();
-		}
-		out_w = d.Width;
-		out_h = d.Height;
-	}
+	const uint32_t out_w = static_cast<uint32_t>(cd.Width), out_h = cd.Height;
 	if (out_w == 0 || out_h == 0)
+		return false;
+	if (!ensure_device())
 		return false;
 
 	float scale = params.render_scale > 0.0f ? params.render_scale : 1.0f;
@@ -323,83 +378,139 @@ bool VsrD3D11Backend::run(
 
 	if (!ensure_processor(render_w, render_h, out_w, out_h, fmt))
 		return false;
-
-	ctx->CopyResource(color_full_, backbuffer);
-	if (!blit_.ensure(device_) || !blit_.blit(ctx, color_full_, input_tex_)) {
-		status = UpscalerStatus::EvaluateFailed;
-		last_error = L"failed to downscale the frame into the VSR input";
-		return false;
+	if (!in_.matches(out_w, out_h, fmt) || !out_.matches(out_w, out_h, fmt)) {
+		drop_pair(in_);
+		drop_pair(out_);
+		if (!make_pair(*engine, device_, out_w, out_h, fmt,
+				D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, in_) ||
+			!make_pair(*engine, device_, out_w, out_h, fmt,
+				D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, out_)) {
+			status = UpscalerStatus::InitFailed;
+			last_error = L"the textures RTX VSR shares with the engine could not be made";
+			return false;
+		}
 	}
 
-	set_super_resolution(true);
-
-	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-	ivd.FourCC = 0;
-	ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-	ivd.Texture2D.MipSlice = 0;
-	ivd.Texture2D.ArraySlice = 0;
-	ID3D11VideoProcessorInputView *iview = nullptr;
-	if (FAILED(video_device_->CreateVideoProcessorInputView(input_tex_, enumerator_, &ivd, &iview)) ||
-		iview == nullptr) {
+	ID3D12GraphicsCommandList *const cmd = inputs.engine.cmd;
+	const D3D12_RESOURCE_STATES cs = inputs.engine.color_state;
+	barrier12(cmd, inputs.engine.color, cs, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	barrier12(cmd, in_.engine, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+	cmd->CopyResource(in_.engine, inputs.engine.color);
+	barrier12(cmd, in_.engine, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+	barrier12(cmd, inputs.engine.color, D3D12_RESOURCE_STATE_COPY_SOURCE, cs);
+	if (borrowed) {
+		if (flush_trigger_ == nullptr) {
+			D3D12_HEAP_PROPERTIES heap{};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			D3D12_RESOURCE_DESC d{};
+			d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			d.Width = 256;
+			d.Height = 1;
+			d.DepthOrArraySize = 1;
+			d.MipLevels = 1;
+			d.SampleDesc.Count = 1;
+			d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			if (FAILED(engine->device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d,
+					D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&flush_trigger_)))) {
+				status = UpscalerStatus::InitFailed;
+				last_error = L"RTX VSR could not make the buffer that has ReShade submit its list";
+				return false;
+			}
+		}
+		const reshade::api::resource trigger{ reinterpret_cast<uintptr_t>(flush_trigger_) };
+		game_list->barrier(trigger, reshade::api::resource_usage::unordered_access,
+			reshade::api::resource_usage::unordered_access);
+		game_queue->flush_immediate_command_list();
+	} else if (!engine->submit_list()) {
 		status = UpscalerStatus::EvaluateFailed;
-		last_error = L"CreateVideoProcessorInputView failed";
+		last_error = L"the engine's list could not be submitted before RTX VSR: " + engine->last_error;
+		list_lost = true;
 		return false;
 	}
+	ID3D12CommandQueue *const queue = engine->queue();
+	const uint64_t handed = ++value_;
+	const bool signalled = SUCCEEDED(queue->Signal(fence12_, handed));
+	if (!borrowed)
+		engine->use_ring(EngineDevice::Ring::Remote);
 
-	D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
-	ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-	ovd.Texture2D.MipSlice = 0;
-	ID3D11VideoProcessorOutputView *oview = nullptr;
-	if (FAILED(video_device_->CreateVideoProcessorOutputView(output_tex_, enumerator_, &ovd, &oview)) ||
-		oview == nullptr) {
+	bool ran = false;
+	if (signalled && SUCCEEDED(context4_->Wait(fence11_, handed))) {
+		context_->CopyResource(color_full_, in_.helper);
+		if (blit_.ensure(device_) && blit_.blit(context_, color_full_, input_tex_)) {
+			set_super_resolution(true);
+			D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+			ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+			D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+			ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+			ID3D11VideoProcessorInputView *iview = nullptr;
+			ID3D11VideoProcessorOutputView *oview = nullptr;
+			if (SUCCEEDED(video_device_->CreateVideoProcessorInputView(input_tex_, enumerator_, &ivd, &iview)) &&
+				iview != nullptr &&
+				SUCCEEDED(video_device_->CreateVideoProcessorOutputView(output_tex_, enumerator_, &ovd, &oview)) &&
+				oview != nullptr) {
+				const RECT src_rect{ 0, 0, static_cast<LONG>(render_w), static_cast<LONG>(render_h) };
+				const RECT dst_rect{ 0, 0, static_cast<LONG>(out_w), static_cast<LONG>(out_h) };
+				video_context_->VideoProcessorSetStreamSourceRect(processor_, 0, TRUE, &src_rect);
+				video_context_->VideoProcessorSetStreamDestRect(processor_, 0, TRUE, &dst_rect);
+				video_context_->VideoProcessorSetOutputTargetRect(processor_, TRUE, &dst_rect);
+				D3D11_VIDEO_PROCESSOR_STREAM stream{};
+				stream.Enable = TRUE;
+				stream.pInputSurface = iview;
+				const HRESULT blt = video_context_->VideoProcessorBlt(processor_, oview, 0, 1, &stream);
+				if (SUCCEEDED(blt)) {
+					context_->CopyResource(out_.helper, output_tex_);
+					ran = true;
+				} else {
+					set_super_resolution(false);
+					last_error = L"VideoProcessorBlt failed (driver rejected RTX VSR?)";
+				}
+			} else {
+				last_error = L"the video processor's views could not be made";
+			}
+			safe_release(oview);
+			safe_release(iview);
+		} else {
+			last_error = L"failed to downscale the frame into the VSR input";
+		}
+	} else {
+		last_error = L"the engine and the video processor could not be ordered on the GPU";
+	}
+	const uint64_t back = ++value_;
+	if (FAILED(context4_->Signal(fence11_, back)))
+		fence12_->Signal(back);
+	context_->Flush();
+	queue->Wait(fence12_, back);
+	ID3D12GraphicsCommandList *const again = borrowed
+		? reinterpret_cast<ID3D12GraphicsCommandList *>(game_list->get_native()) : engine->begin_list();
+	if (again != cmd) {
 		status = UpscalerStatus::EvaluateFailed;
-		last_error = L"CreateVideoProcessorOutputView failed";
-		release(iview);
+		last_error = L"the engine's list could not be reopened after RTX VSR: " + engine->last_error;
+		list_lost = true;
 		return false;
 	}
-
-	const RECT src_rect{ 0, 0, static_cast<LONG>(render_w), static_cast<LONG>(render_h) };
-	const RECT dst_rect{ 0, 0, static_cast<LONG>(out_w), static_cast<LONG>(out_h) };
-	video_context_->VideoProcessorSetStreamSourceRect(processor_, 0, TRUE, &src_rect);
-	video_context_->VideoProcessorSetStreamDestRect(processor_, 0, TRUE, &dst_rect);
-	video_context_->VideoProcessorSetOutputTargetRect(processor_, TRUE, &dst_rect);
-
-	D3D11_VIDEO_PROCESSOR_STREAM stream{};
-	stream.Enable = TRUE;
-	stream.OutputIndex = 0;
-	stream.InputFrameOrField = 0;
-	stream.PastFrames = 0;
-	stream.FutureFrames = 0;
-	stream.pInputSurface = iview;
-
-	const HRESULT blt = video_context_->VideoProcessorBlt(processor_, oview, 0, 1, &stream);
-	release(oview);
-	release(iview);
-
-	if (FAILED(blt)) {
-
-		set_super_resolution(false);
+	if (!ran) {
 		status = UpscalerStatus::EvaluateFailed;
-		last_error = L"VideoProcessorBlt failed (driver rejected RTX VSR?)";
 		return false;
 	}
+	barrier12(cmd, inputs.engine.color, cs, D3D12_RESOURCE_STATE_COPY_DEST);
+	barrier12(cmd, out_.engine, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	cmd->CopyResource(inputs.engine.color, out_.engine);
+	barrier12(cmd, out_.engine, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+	barrier12(cmd, inputs.engine.color, D3D12_RESOURCE_STATE_COPY_DEST, cs);
 
 	query_super_resolution();
-
 	if (!logged_once_) {
 		logged_once_ = true;
-		wchar_t buf[192]{};
-		_snwprintf_s(buf, _TRUNCATE, L"[VSR] Blt %ux%u -> %ux%u  capable=%d enabled=%d in_use=%d level=%u",
-			render_w, render_h, out_w, out_h, vsr_status_.capable ? 1 : 0,
+		wchar_t buf[224]{};
+		_snwprintf_s(buf, _TRUNCATE, L"[VSR] Blt %ux%u -> %ux%u on the engine's planes  capable=%d enabled=%d "
+			L"in_use=%d level=%u", render_w, render_h, out_w, out_h, vsr_status_.capable ? 1 : 0,
 			vsr_status_.enabled ? 1 : 0, vsr_status_.in_use ? 1 : 0, vsr_status_.level);
 		diag_info("vsr", buf);
 	}
 
-	ctx->CopyResource(backbuffer, output_tex_);
-
 	status = UpscalerStatus::Ready;
 	if (!vsr_status_.capable) {
-
 		last_error = L"the driver reports this GPU cannot run RTX VSR; the video processor "
 			L"scaled the frame without it.";
 	} else if (vsr_status_.queried && !vsr_status_.enabled) {

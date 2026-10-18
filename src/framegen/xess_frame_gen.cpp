@@ -2,6 +2,7 @@
 #include "aeon_sr/framegen/xess_fake_swapchain.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/gpu_vendor.hpp"
 #include "aeon_sr/interop/blit_d3d12.hpp"
 
 #include <xell/xell.h>
@@ -14,10 +15,15 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 namespace aeon_sr {
 namespace {
+
+std::mutex g_test_mutex;
+std::wstring g_test_xefg, g_test_xell;
+int g_test_intel = -1;
 
 struct XeApi {
 	HMODULE xell = nullptr, xefg = nullptr;
@@ -39,6 +45,9 @@ struct XeApi {
 	decltype(&::xefgSwapChainGetLastPresentStatus) last_status = nullptr;
 	decltype(&::xefgSwapChainDestroy) destroy = nullptr;
 	decltype(&::xefgSwapChainEnableDebugFeature) debug_feature = nullptr;
+	decltype(&::xefgSwapChainGetProperties) properties = nullptr;
+	decltype(&::xefgSwapChainSetNumInterpolatedFrames) set_interpolations = nullptr;
+	decltype(&::xefgSwapChainD3D12GetInitializationParameters) init_params = nullptr;
 };
 
 template <typename F>
@@ -51,8 +60,16 @@ void resolve(HMODULE m, const char *name, F &out, std::wstring *missing)
 
 bool load_api(XeApi *x, std::wstring *error)
 {
-	const std::wstring fg_path = find_vendor_runtime(L"libxess_fg.dll");
-	const std::wstring ll_path = find_vendor_runtime(L"libxell.dll");
+	std::wstring fg_path, ll_path;
+	{
+		std::lock_guard lock(g_test_mutex);
+		fg_path = g_test_xefg;
+		ll_path = g_test_xell;
+	}
+	if (fg_path.empty())
+		fg_path = find_vendor_runtime(L"libxess_fg.dll");
+	if (ll_path.empty())
+		ll_path = find_vendor_runtime(L"libxell.dll");
 	if (fg_path.empty() || ll_path.empty()) {
 		*error = L"Intel XeSS frame generation needs libxess_fg.dll and libxell.dll in the add-on's runtime folder";
 		return false;
@@ -89,7 +106,23 @@ bool load_api(XeApi *x, std::wstring *error)
 		*error = L"Intel XeSS frame generation: its DLLs lack " + missing;
 		return false;
 	}
+	x->properties = reinterpret_cast<decltype(x->properties)>(GetProcAddress(x->xefg, "xefgSwapChainGetProperties"));
+	x->set_interpolations = reinterpret_cast<decltype(x->set_interpolations)>(
+		GetProcAddress(x->xefg, "xefgSwapChainSetNumInterpolatedFrames"));
+	x->init_params = reinterpret_cast<decltype(x->init_params)>(
+		GetProcAddress(x->xefg, "xefgSwapChainD3D12GetInitializationParameters"));
 	return true;
+}
+
+bool intel_card(ID3D12Device *device)
+{
+	{
+		std::lock_guard lock(g_test_mutex);
+		if (g_test_intel >= 0)
+			return g_test_intel != 0;
+	}
+	GpuInfo info;
+	return query_gpu_info(device, &info) && info.vendor == GpuVendor::Intel;
 }
 
 void on_xefg_log(const char *message, xefg_swapchain_logging_level_t level, void *)
@@ -168,6 +201,10 @@ public:
 	std::wstring version() const override { return state_.load() == kReady ? version_ : std::wstring(); }
 	void reset() noexcept override { frames_ = 0; }
 	bool busy() const noexcept override { return state_.load(std::memory_order_acquire) == kBuilding; }
+	uint32_t max_generated() const noexcept override
+	{
+		return state_.load(std::memory_order_acquire) == kReady ? limit_ : 1u;
+	}
 
 	VendorStep record(const VendorFrame &f, std::wstring *note) override
 	{
@@ -182,7 +219,7 @@ public:
 			*note = L"Intel XeSS frame generation does not take scRGB HDR frames";
 			return VendorStep::Unavailable;
 		}
-		if (s == kReady && (f.device != device_ || f.width != w_ || f.height != h_ || f.format != format_)) {
+		if (s == kReady && (f.device != device_ || f.width != w_ || f.height != h_ || f.format != format_ || rebuild_)) {
 			join();
 			if (order_fence_ != nullptr) {
 				f.queue->Signal(order_fence_, ++order_value_);
@@ -208,6 +245,22 @@ public:
 		if (c.broken.load()) {
 			*note = L"Intel XeSS frame generation: its swap chain could not copy a frame";
 			return VendorStep::Unavailable;
+		}
+		const uint32_t wanted = std::clamp(f.generated, 1u, limit_);
+		if (wanted != current_) {
+			const xefg_swapchain_result_t sr = api_.set_interpolations(fg_, wanted);
+			if (sr < 0) {
+				*note = std::wstring(L"Intel XeSS frame generation: asking for ") + std::to_wstring(wanted) +
+					L" frames: " + xefg_result(sr) + L"; one frame between two real ones from here";
+				diag_logf(DiagLevel::Warn, "framegen", L"%ls", note->c_str());
+				cap_ = 1;
+				rebuild_ = true;
+				frames_ = 0;
+				return VendorStep::Failed;
+			}
+			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: %u frames between two real ones from here (was %u)",
+				wanted, current_);
+			current_ = wanted;
 		}
 
 		f.queue->Signal(c.consumed, consumed_up_to_);
@@ -288,7 +341,9 @@ public:
 			return VendorStep::Failed;
 		}
 		++frames_;
-		const bool generated = st.framesPresented > 0 && st.isFrameGenEnabled != 0 &&
+		const uint32_t count = current_;
+		const uint64_t last = first + count - 1;
+		const bool generated = st.framesPresented >= count && st.isFrameGenEnabled != 0 &&
 			st.frameGenResult == XEFG_SWAPCHAIN_RESULT_SUCCESS && !fresh;
 		if (!generated) {
 			if (!fresh && refusals_ < 3) {
@@ -296,35 +351,39 @@ public:
 				diag_logf(DiagLevel::Warn, "framegen", L"XeSS-FG made no frame for %u: %u presented, %ls, %ls", id,
 					st.framesPresented, xefg_result(st.frameGenResult), st.isFrameGenEnabled != 0 ? L"enabled" : L"disabled");
 			}
-			consumed_up_to_ = c.presents.load(std::memory_order_acquire);
+			consumed_up_to_ = std::max({ consumed_up_to_, ledger_.expected, c.presents.load(std::memory_order_acquire) });
 			return VendorStep::Warming;
 		}
 
 		const DWORD budget = static_cast<DWORD>(std::clamp(f.frame_ms, 8.0, 50.0));
 		const double deadline = t0 + budget;
-		while (c.presents.load(std::memory_order_acquire) < first && !c.broken.load()) {
+		while (c.presents.load(std::memory_order_acquire) < last && !c.broken.load()) {
 			const double left = deadline - qpc_now_ms();
 			if (left <= 0.0)
 				break;
 			WaitForSingleObject(c.event, static_cast<DWORD>(std::ceil(left)));
 		}
 		const uint64_t seen = c.presents.load(std::memory_order_acquire);
-		consumed_up_to_ = std::max(consumed_up_to_, first);
-		if (seen < first) {
+		consumed_up_to_ = std::max({ consumed_up_to_, ledger_.expected, seen });
+		if (seen < last) {
 			++late_;
 			*note = L"Intel XeSS frame generation: the generated frame did not arrive in time";
 			return VendorStep::Failed;
 		}
 		note_wait(qpc_now_ms() - t0);
 
-		ID3D12Resource *const slot = c.slot[first % XefgCaptures::kRing];
-		f.queue->Wait(c.captured, first);
-		barrier12(f.cmd, slot, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-		barrier12(f.cmd, f.output, kOutputState, D3D12_RESOURCE_STATE_COPY_DEST);
-		f.cmd->CopyResource(f.output, slot);
-		barrier12(f.cmd, f.output, D3D12_RESOURCE_STATE_COPY_DEST, kOutputState);
-		barrier12(f.cmd, slot, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-		consumed_up_to_ = std::max(consumed_up_to_, first);
+		f.queue->Wait(c.captured, last);
+		for (uint32_t i = 0; i < count; ++i) {
+			ID3D12Resource *const slot = c.slot[(first + i) % XefgCaptures::kRing];
+			ID3D12Resource *const out = i == 0 ? f.output : f.more_outputs[i - 1];
+			if (out == nullptr)
+				break;
+			barrier12(f.cmd, slot, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			barrier12(f.cmd, out, kOutputState, D3D12_RESOURCE_STATE_COPY_DEST);
+			f.cmd->CopyResource(out, slot);
+			barrier12(f.cmd, out, D3D12_RESOURCE_STATE_COPY_DEST, kOutputState);
+			barrier12(f.cmd, slot, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+		}
 		return VendorStep::Generated;
 	}
 
@@ -343,7 +402,8 @@ private:
 		wait_max_ = std::max(wait_max_, ms);
 		if (++waits_ == 200) {
 			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: generated frame arrived %.2f ms after the frame on "
-				L"average (max %.2f) over %u frames; %u late", wait_sum_ / waits_, wait_max_, waits_, late_);
+				L"average (max %.2f) over %u frames; %u late%ls", wait_sum_ / waits_, wait_max_, waits_, late_,
+				current_ > 1 ? (L" (the last of " + std::to_wstring(current_) + L" a frame)").c_str() : L"");
 			wait_sum_ = wait_max_ = 0.0;
 			waits_ = late_ = 0;
 		}
@@ -352,6 +412,7 @@ private:
 	void start_build(const VendorFrame &f)
 	{
 		join();
+		rebuild_ = false;
 		device_ = f.device;
 		w_ = f.width;
 		h_ = f.height;
@@ -410,6 +471,18 @@ private:
 			error_ = std::wstring(L"Intel XeSS frame generation: XeLL: ") + xefg_result(r);
 			return false;
 		}
+		uint32_t supported = 1;
+		bool asked = false;
+		if (api_.properties != nullptr) {
+			xefg_swapchain_properties_t props{};
+			asked = api_.properties(fg_, &props) >= 0;
+			if (asked)
+				supported = props.maxSupportedInterpolations;
+		}
+		const bool intel = intel_card(device_);
+		limit_ = std::min(cap_, xefg_interpolation_limit(intel, asked, supported, api_.set_interpolations != nullptr,
+			XefgCaptures::kRing));
+		current_ = limit_;
 		IDXGIFactory7 *real = nullptr;
 		if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&real))) || real == nullptr) {
 			error_ = L"Intel XeSS frame generation: no DXGI factory";
@@ -431,11 +504,18 @@ private:
 		DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs{};
 		fs.Windowed = TRUE;
 		xefg_swapchain_d3d12_init_params_t p{};
-		p.maxInterpolatedFrames = 1;
+		p.maxInterpolatedFrames = limit_;
 		p.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 		p.uiMode = XEFG_SWAPCHAIN_UI_MODE_NONE;
 		HWND hwnd = window_ != nullptr && IsWindow(window_) ? window_ : GetDesktopWindow();
 		r = api_.init_desc(fg_, hwnd, &sd, &fs, fg_queue_, factory_, &p);
+		if (r < 0 && limit_ > 1) {
+			diag_logf(DiagLevel::Warn, "framegen", L"XeSS-FG did not start for %u frames between two real ones (%ls); "
+				L"asking for one", limit_, xefg_result(r));
+			limit_ = current_ = 1;
+			p.maxInterpolatedFrames = 1;
+			r = api_.init_desc(fg_, hwnd, &sd, &fs, fg_queue_, factory_, &p);
+		}
 		if (r < 0) {
 			error_ = std::wstring(L"Intel XeSS frame generation did not start: ") + xefg_result(r);
 			return false;
@@ -444,6 +524,28 @@ private:
 			error_ = L"Intel XeSS frame generation gave no swap chain";
 			return false;
 		}
+		if (limit_ > 1 && api_.init_params != nullptr) {
+			xefg_swapchain_d3d12_init_params_t used{};
+			if (api_.init_params(fg_, &used) >= 0 && used.maxInterpolatedFrames >= 1 &&
+				used.maxInterpolatedFrames < limit_)
+				limit_ = used.maxInterpolatedFrames;
+			current_ = limit_;
+		}
+		if (limit_ > 1)
+			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: up to %u frames between two real ones (%ux): this Intel "
+				L"card reports %u", limit_, limit_ + 1, supported);
+		else if (api_.properties == nullptr || api_.set_interpolations == nullptr)
+			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: one frame between two real ones: this runtime has no "
+				L"multi frame calls (XeSS SDK 3.x has them)");
+		else if (!asked)
+			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: one frame between two real ones: it did not say how many "
+				L"it makes");
+		else if (cap_ == 1 && supported > 1 && intel)
+			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: one frame between two real ones: it refused a count "
+				L"before (it reports %u)", supported);
+		else
+			diag_logf(DiagLevel::Info, "framegen", L"XeSS-FG: one frame between two real ones: %ls (it reports %u)",
+				intel ? L"this Intel card makes no more" : L"Intel makes more only on its own graphics", supported);
 		api_.debug_feature(fg_, XEFG_SWAPCHAIN_DEBUG_FEATURE_SHOW_ONLY_INTERPOLATION, 1, nullptr);
 		api_.enable(fg_, 1);
 		present_id_ = 0;
@@ -518,8 +620,20 @@ private:
 	double wait_sum_ = 0.0, wait_max_ = 0.0;
 	uint32_t waits_ = 0, late_ = 0;
 	uint32_t refusals_ = 0;
+	uint32_t limit_ = 1;
+	uint32_t current_ = 1;
+	bool rebuild_ = false;
+	uint32_t cap_ = XefgCaptures::kRing - 1;
 };
 
+}
+
+void xefg_use_for_tests(const std::wstring &xefg_dll, const std::wstring &xell_dll, int intel)
+{
+	std::lock_guard lock(g_test_mutex);
+	g_test_xefg = xefg_dll;
+	g_test_xell = xell_dll;
+	g_test_intel = intel;
 }
 
 std::unique_ptr<VendorFrameGenerator> make_xess_frame_generator()

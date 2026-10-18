@@ -17,14 +17,16 @@
 
 namespace aeon_sr {
 
+struct Settings;
+
+uint64_t frame_gen_settings_key(const Settings &s) noexcept;
+
 enum class FrameGenResult : uint8_t {
 	Generated = 0,
 	Warming,
 	Building,
 	Failed,
 };
-
-const char *frame_gen_result_label(FrameGenResult r) noexcept;
 
 struct FrameGenOptions {
 	OpticalFlowD3D12::Quality quality = OpticalFlowD3D12::Quality::Balanced;
@@ -66,6 +68,8 @@ public:
 	const std::wstring &fallback_note() const noexcept { return fallback_note_; }
 	std::wstring vendor_version() const { return vendor_ != nullptr ? vendor_->version() : std::wstring(); }
 	bool vendor_usable(FrameGenerator g) const noexcept { return !(vendor_unavailable_ && unavailable_kind_ == g); }
+	void forget_refusal() noexcept;
+	void settings_changed(uint64_t key) noexcept;
 	uint32_t vendor_max_generated() const noexcept { return vendor_ != nullptr ? vendor_->max_generated() : 1u; }
 	uint32_t last_made() const noexcept { return last_made_; }
 	static DXGI_FORMAT vendor_output_format(ID3D12Device *device, DXGI_FORMAT frame) noexcept;
@@ -111,6 +115,7 @@ private:
 	std::unique_ptr<VendorFrameGenerator> vendor_;
 	bool vendor_unavailable_ = false;
 	FrameGenerator unavailable_kind_ = FrameGenerator::AeonSR;
+	uint64_t settings_key_ = 0;
 	struct Retired {
 		std::unique_ptr<VendorFrameGenerator> gen;
 		uint32_t frames = 0;

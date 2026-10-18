@@ -2,22 +2,6 @@
 #include "aeon_sr/core/frame_inputs.hpp"
 
 namespace aeon_sr {
-namespace {
-
-void sync_status(UpscalerBackend &backend, const NgxSession &rt)
-{
-	backend.status = backend.crashed ? UpscalerStatus::Crashed : rt.status;
-	backend.last_error = rt.last_error;
-	backend.crashed = rt.crashed || backend.crashed;
-}
-
-template <class T>
-T *native_handle(uint64_t handle) noexcept
-{
-	return reinterpret_cast<T *>(static_cast<uintptr_t>(handle));
-}
-
-}
 
 const char *DlssD3D12Backend::name() const { return "DLSS"; }
 reshade::api::device_api DlssD3D12Backend::api() const { return reshade::api::device_api::d3d12; }
@@ -26,7 +10,18 @@ bool DlssD3D12Backend::runtime_present()
 {
 	if (dlss_loading())
 		return true;
-	return rt != nullptr && rt->ensure_dll_present();
+	return rt != nullptr && dll_found(true);
+}
+
+bool DlssD3D12Backend::dll_found(bool may_keep)
+{
+	const uint64_t now = GetTickCount64();
+	if (may_keep && looked_.fresh(now) && looked_.found() && rt->dll_present && found_layer_ == rt->layer_path)
+		return true;
+	const bool found = rt->ensure_dll_present();
+	looked_.note(found, now);
+	found_layer_ = rt->layer_path;
+	return found;
 }
 
 void DlssD3D12Backend::on_destroy_swapchain()
@@ -72,7 +67,7 @@ bool DlssD3D12Backend::run(
 		}
 	}
 
-	if (!rt->ensure_dll_present()) {
+	if (!dll_found(rt->ngx_initialized)) {
 		sync_status(*this, *rt);
 		return false;
 	}

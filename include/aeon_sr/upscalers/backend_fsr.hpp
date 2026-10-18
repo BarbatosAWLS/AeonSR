@@ -6,6 +6,7 @@
 #include "aeon_sr/upscalers/ffx_loader.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
 #include "aeon_sr/upscalers/upscaler_backend.hpp"
+#include "aeon_sr/core/runtime_search.hpp"
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -57,7 +58,6 @@ private:
 	uint32_t render_height_ = 0;
 	uint32_t quality_mode_ = 0;
 	float render_scale_ = 0.0f;
-	float sharpness_ = 0.0f;
 	float frame_time_ms_ = 0.0f;
 
 	DXGI_FORMAT scratch_format_ = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -112,6 +112,7 @@ struct Fsr4D3D12Backend final : UpscalerBackend {
 	const char *name() const override;
 	reshade::api::device_api api() const override;
 	bool runtime_present() override;
+	const RecentLook &runtime_look() const noexcept { return looked_; }
 	bool run(reshade::api::effect_runtime *runtime,
 		const FrameInputs &inputs,
 		const UpscalerParams &params) override;
@@ -147,6 +148,7 @@ private:
 	FfxApi api_{};
 	ffxContext context_ = nullptr;
 	bool dll_present_ = false;
+	RecentLook looked_;
 	bool initialized_ = false;
 
 	static constexpr int kIdle = 0, kRunning = 1, kFinished = 2;
@@ -190,7 +192,6 @@ private:
 	uint32_t render_height_ = 0;
 	uint32_t quality_mode_ = 0;
 	float render_scale_ = 0.0f;
-	float sharpness_ = 0.0f;
 	float frame_time_ms_ = 0.0f;
 
 	DXGI_FORMAT scratch_format_ = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -214,7 +215,7 @@ private:
 
 	BlitPipelineD3D12 blit_;
 
-	bool ensure_dll_present();
+	bool ensure_dll_present(bool may_keep = false);
 
 	void enumerate_providers(ID3D12Device *device);
 	void destroy_context();

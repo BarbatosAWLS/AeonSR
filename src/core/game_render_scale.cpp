@@ -184,8 +184,6 @@ struct Timing {
 		if (now >= report_at + 10000u && frames != 0) {
 			out.scene_ms = scene_sum / frames;
 			out.frame_ms = framed != 0 ? frame_sum / framed : 0.0;
-			out.timed_frames = frames;
-			out.timed_stretches = stretches;
 			diag_logf(DiagLevel::Info, "scale", L"render scale: the game's own GPU time, last 10 s, %u frames (%u through "
 				L"its stretch): %.2f ms a frame drawing its scene and what follows up to the stretch (to the present on a "
 				L"frame with none); %.2f ms from present to present on the GPU",

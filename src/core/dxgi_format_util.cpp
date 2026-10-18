@@ -23,14 +23,20 @@ bool format_supports_uav(DXGI_FORMAT format) noexcept
 	}
 }
 
-DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) noexcept
+DXGI_FORMAT color_read_format(DXGI_FORMAT fmt) noexcept
 {
 	switch (fmt) {
 	case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
 	case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
 	case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
 	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	default: return fmt;
+	}
+}
 
+DXGI_FORMAT depth_read_format(DXGI_FORMAT fmt) noexcept
+{
+	switch (fmt) {
 	case DXGI_FORMAT_R32_TYPELESS:
 	case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
 	case DXGI_FORMAT_R24G8_TYPELESS:
@@ -41,6 +47,12 @@ DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) noexcept
 	case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
 	default: return fmt;
 	}
+}
+
+DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) noexcept
+{
+	const DXGI_FORMAT color = color_read_format(fmt);
+	return color != fmt ? color : depth_read_format(fmt);
 }
 
 DXGI_FORMAT format_family(DXGI_FORMAT fmt) noexcept
@@ -115,6 +127,12 @@ DXGI_FORMAT resolve_scratch_format(DXGI_FORMAT backbuffer_fmt) noexcept
 	default:
 		return format_supports_uav(backbuffer_fmt) ? backbuffer_fmt : DXGI_FORMAT_R8G8B8A8_UNORM;
 	}
+}
+
+bool is_srgb(DXGI_FORMAT f) noexcept
+{
+	return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+		f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
 }

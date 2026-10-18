@@ -1,4 +1,5 @@
 #include "aeon_sr/upscalers/fsr_warmup.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include <dxgi1_4.h>
 #include <excpt.h>
@@ -47,25 +48,6 @@ ID3D12Resource *make_texture(ID3D12Device *device, uint32_t w, uint32_t h, DXGI_
 			IID_PPV_ARGS(&res))))
 		return nullptr;
 	return res;
-}
-
-ffxReturnCode_t dispatch_guarded(PfnFfxDispatch fn, ffxContext *ctx,
-	const ffxDispatchDescHeader *desc, unsigned long *seh_code)
-{
-	__try {
-		return fn(ctx, desc);
-	} __except ((*seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
-		return FFX_API_RETURN_ERROR;
-	}
-}
-
-template <typename T>
-void release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
 }
 
 bool read_file(const std::wstring &path, std::vector<uint8_t> &out)
@@ -310,10 +292,20 @@ ffxReturnCode_t record_two(PfnFfxDispatch fn, ffxContext *context, ffxDispatchDe
 
 }
 
+ffxReturnCode_t dispatch_guarded(PfnFfxDispatch fn, ffxContext *ctx,
+	const ffxDispatchDescHeader *desc, unsigned long *seh_code)
+{
+	__try {
+		return fn(ctx, desc);
+	} __except ((*seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
+		return FFX_API_RETURN_ERROR;
+	}
+}
+
 FsrPipelineCache::~FsrPipelineCache()
 {
 	release_standins();
-	release(lib);
+	safe_release(lib);
 }
 
 void FsrPipelineCache::release_standins()
@@ -328,7 +320,7 @@ void FsrPipelineCache::release_standins()
 void FsrPipelineCache::open(ID3D12Device *device, const std::wstring &file)
 {
 	release_standins();
-	release(lib);
+	safe_release(lib);
 	blob.clear();
 	st = {};
 	opened_size = 0;
@@ -548,14 +540,14 @@ bool fsr_warmup_dispatch(const FfxApi &api, ffxContext *context, ID3D12Device *d
 	if (gpu_may_hold)
 		return false;
 
-	release(color);
-	release(depth);
-	release(motion);
-	release(output);
-	release(list);
-	release(alloc);
-	release(fence);
-	release(queue);
+	safe_release(color);
+	safe_release(depth);
+	safe_release(motion);
+	safe_release(output);
+	safe_release(list);
+	safe_release(alloc);
+	safe_release(fence);
+	safe_release(queue);
 	if (event != nullptr)
 		CloseHandle(event);
 	return ok;

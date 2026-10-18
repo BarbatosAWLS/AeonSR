@@ -13,6 +13,9 @@
 
 namespace aeon_sr {
 
+ffxReturnCode_t dispatch_guarded(PfnFfxDispatch fn, ffxContext *ctx,
+	const ffxDispatchDescHeader *desc, unsigned long *seh_code);
+
 constexpr uint32_t kFsrCreateFlags =
 	FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
 

@@ -43,25 +43,76 @@ uint32_t even_cap_fps(double fps, double refresh_hz) noexcept
 	return 0;
 }
 
-void OverlayPace::note(bool missed, double period_ms) noexcept
+void OverlayPace::note(bool missed, bool counted, double period_ms) noexcept
 {
-	recent_misses_ -= recent_[recent_at_];
-	recent_[recent_at_] = missed ? 1 : 0;
-	recent_misses_ += recent_[recent_at_];
+	const bool grows = missed && counted;
+	recent_[recent_at_] = grows ? 1 : 0;
 	recent_at_ = (recent_at_ + 1) % kMissWindow;
-	if (missed) {
+	if (missed)
 		++misses_total_;
+	const bool timed = work_q_ > 0.0;
+	double &adapted = timed ? extra_ : untimed_;
+	if (grows) {
 		calm_ = 0;
-		if (recent_misses_ >= kMissesToGrow) {
-			lead_ = std::min(lead_ + kLeadStepMs, lead_cap_ * period_ms);
+		const uint32_t window = timed ? kMissWindow : kMissWindowUntimed;
+		uint32_t recent = 0;
+		for (uint32_t i = 1; i <= window; ++i)
+			recent += recent_[(recent_at_ + kMissWindow - i) % kMissWindow];
+		if (recent >= kMissesToGrow) {
+			adapted = std::min(adapted + kLeadStepMs, lead_cap_ * period_ms);
 			for (uint8_t &r : recent_)
 				r = 0;
-			recent_misses_ = 0;
 		}
-	} else if (++calm_ >= kCalmPlans) {
+	} else if (++calm_ >= (timed ? kCalmPlans : kCalmPlansUntimed)) {
 		calm_ = 0;
-		lead_ = std::max(kMinLeadMs, lead_ - 0.25 * kLeadStepMs);
+		adapted = std::max(timed ? 0.0 : kMinLeadMs, adapted - 0.25 * kLeadStepMs);
 	}
+}
+
+void OverlayPace::work_done(double planned_ms, double display_ms, double done_ms, bool exact) noexcept
+{
+	const double span = done_ms - planned_ms;
+	if (!(planned_ms > 0.0) || !(span >= 0.0) || span > 1000.0)
+		return;
+	if (display_ms == last_)
+		last_done_ = done_ms;
+	if (!exact)
+		return;
+	work_[work_at_] = Work{ planned_ms, span };
+	work_at_ = (work_at_ + 1u) % kWorkRing;
+	work_n_ = std::min(work_n_ + 1u, kWorkRing);
+	newest_planned_ = std::max(newest_planned_, planned_ms);
+	double s[kWorkRing];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < work_n_; ++i)
+		if (newest_planned_ - work_[i].planned <= kWorkWindowMs)
+			s[n++] = work_[i].span;
+	if (n < kWorkNeed) {
+		work_q_ = 0.0;
+		return;
+	}
+	const uint32_t k = std::min(n - 1u, static_cast<uint32_t>(kWorkShare * static_cast<double>(n)));
+	std::nth_element(s, s + k, s + n);
+	work_q_ = s[k];
+}
+
+void OverlayPace::follow(double period_ms) noexcept
+{
+	if (fixed_)
+		return;
+	const double cap = lead_cap_ * period_ms;
+	if (work_q_ > 0.0)
+		extra_ = std::clamp(extra_, 0.0, std::max(0.0, cap - work_q_ - kComposeMs));
+	const double want = std::clamp(work_q_ > 0.0 ? work_q_ + kComposeMs + extra_ : untimed_,
+		std::min(kMinLeadMs, cap), cap);
+	if (want > lead_ || work_q_ <= 0.0) {
+		lead_ = want;
+		falling_ = false;
+	} else if (falling_ || want <= lead_ - kLeadSlackMs + 1e-9) {
+		lead_ = std::max(want, lead_ - kLeadFallMs);
+		falling_ = lead_ > want;
+	}
+	lead_ = std::min(lead_, cap);
 }
 
 double OverlayPace::estimate_vblank(double vblank_ms, double period_ms) noexcept
@@ -97,18 +148,30 @@ double OverlayPace::plan(double now_ms, double vblank_ms, double period_ms, doub
 		last_ = next;
 		return next + period_ms;
 	}
+	if (presented_ && last_ > 0.0) {
+		const bool missed = now_ms > last_ + period_ms;
+		bool counted = missed;
+		if (missed && work_q_ > 0.0) {
+			const bool work_late = last_done_ < 0.0 || last_done_ > last_ - kDeadlineMs;
+			if (work_late)
+				++late_work_total_;
+			counted = work_late && !squeezed_;
+		}
+		note(missed, counted, period_ms);
+	}
+	presented_ = false;
+	follow(period_ms);
 	const double lead = std::min(lead_, lead_cap_ * period_ms);
 	const double least = std::min({ kMinLeadMs, lead, 0.5 * period_ms });
 	double next = vblank + std::ceil((now_ms + least - vblank) / period_ms) * period_ms;
 	if (next < now_ms + least)
 		next += period_ms;
-	if (presented_ && last_ > 0.0 && !fixed_)
-		note(now_ms > last_ + period_ms, period_ms);
-	presented_ = false;
 	if (last_ > 0.0 && next < last_ + 0.5 * period_ms)
 		next = last_ + period_ms;
+	squeezed_ = next - lead < now_ms;
 	*present_at = std::max(now_ms, next - lead);
 	last_ = next;
+	last_done_ = -1.0;
 	return next;
 }
 
@@ -231,6 +294,19 @@ void OverlayScheduler::add(uint64_t id, double presented_ms, bool pairs_with_pre
 		reals_.pop_front();
 }
 
+double OverlayScheduler::due_at(double at, double display_ms, double period_ms, double desired) const noexcept
+{
+	double latency = latency_;
+	for (uint32_t j = 0; j < kPlanAhead; ++j) {
+		const double d = display_ms + static_cast<double>(j) * period_ms;
+		if (at <= d - latency + 0.5 * period_ms)
+			return d;
+		latency = latency > desired ? std::max(desired, latency - kShrinkFraction * period_ms)
+			: std::min(desired, latency + kGrowFraction * period_ms);
+	}
+	return display_ms + static_cast<double>(kPlanAhead) * period_ms;
+}
+
 OverlayChoice OverlayScheduler::choose(double display_ms, double period_ms) noexcept
 {
 	OverlayChoice c;
@@ -258,6 +334,21 @@ OverlayChoice OverlayScheduler::choose(double display_ms, double period_ms) noex
 	for (size_t i = 0; i < reals_.size(); ++i)
 		if (reals_[i].at <= content + 0.5 * period_ms)
 			due = static_cast<long>(i);
+	if (plan_b_ != 0 && due >= 0 && std::fabs(display_ms - plan_at_) < 1.5 * period_ms) {
+		for (size_t i = 1; i < reals_.size(); ++i) {
+			if (reals_[i].id != plan_b_)
+				continue;
+			const long bi = static_cast<long>(i);
+			const bool planned = std::fabs(display_ms - plan_at_) < 0.5 * period_ms;
+			if (reals_[i - 1].shown && !reals_[i].shown) {
+				if (due == bi && !planned && display_ms < plan_at_)
+					due = bi - 1;
+				else if (due == bi - 1 && planned && reals_[i].at <= content + 1.5 * period_ms && i + 1 < reals_.size())
+					due = bi;
+			}
+			break;
+		}
+	}
 	if (due >= 0 && !reals_[static_cast<size_t>(due)].shown) {
 		for (long i = 0; i < due; ++i) {
 			if (!reals_[static_cast<size_t>(i)].shown) {
@@ -267,6 +358,7 @@ OverlayChoice OverlayScheduler::choose(double display_ms, double period_ms) noex
 		}
 		reals_[static_cast<size_t>(due)].shown = true;
 		reals_[static_cast<size_t>(due)].shown_at = display_ms;
+		plan_b_ = 0;
 		++reals_shown_;
 		c.kind = OverlayChoice::Kind::Real;
 		c.b = reals_[static_cast<size_t>(due)].id;
@@ -282,18 +374,26 @@ OverlayChoice OverlayScheduler::choose(double display_ms, double period_ms) noex
 		const double median = interval_stat(false);
 		if (b.pairs && span > 0.0 && (median <= 0.0 || span < kHitch * median)) {
 			double t = std::clamp((content - a.at) / span, 0.0, 1.0);
-			const double ratio = median > 0.0 ? median / period_ms : 0.0;
-			const double whole = std::round(ratio);
-			if (whole >= 2.0 && std::fabs(ratio - whole) < 0.03 && a.shown_at > 0.0) {
-				const double b_at = display_ms +
-					std::ceil((b.at + latency_ - 0.5 * period_ms - display_ms) / period_ms - 1e-6) * period_ms;
-				if (b_at - a.shown_at > 1.5 * period_ms)
-					t = std::clamp((display_ms - a.shown_at) / (b_at - a.shown_at), 0.0, 1.0);
+			if (a.shown_at > 0.0) {
+				if (plan_b_ != b.id || display_ms >= plan_at_ - 0.5 * period_ms) {
+					plan_t0_ = plan_b_ == b.id ? plan_t_ : 0.0;
+					plan_from_ = display_ms - period_ms;
+					plan_b_ = b.id;
+					plan_at_ = due_at(b.at, display_ms, period_ms, desired);
+				}
+				const double done = std::round((display_ms - plan_from_) / period_ms);
+				const double left = std::round((plan_at_ - plan_from_) / period_ms);
+				if (left > done && done >= 1.0)
+					t = std::clamp(plan_t0_ + (1.0 - plan_t0_) * done / left, 0.0, 1.0);
+				plan_t_ = t;
 			}
 			c.a = a.id;
 			c.b = b.id;
 			if (b.steps >= 2) {
-				const uint32_t k = static_cast<uint32_t>(std::lround(t * b.steps));
+				uint32_t k = static_cast<uint32_t>(std::lround(t * b.steps));
+				if (b.vendor && k > b.made && b.made >= 1 && k < b.steps &&
+					!(b.id == last_index_of_ && last_index_ >= b.made))
+					k = b.made;
 				const bool missing = b.vendor && k > b.made;
 				if (k == 0 || k >= b.steps || missing || (k == last_index_ && b.id == last_index_of_)) {
 					c.kind = OverlayChoice::Kind::Hold;

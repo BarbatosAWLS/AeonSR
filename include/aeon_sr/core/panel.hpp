@@ -24,7 +24,6 @@ struct PanelState {
 	bool d3d12 = false;
 
 	GpuVendor gpu_vendor = GpuVendor::Unknown;
-	uint32_t gpu_vendor_id = 0;
 	std::wstring gpu_name;
 	const char *active_name = nullptr;
 	std::string upscaler_label;
@@ -37,15 +36,22 @@ struct PanelState {
 	std::wstring native_dlss_modules;
 	std::wstring ngx_layer;
 	bool ngx_layer_relevant = false;
+	enum class OptiscalerHeld : uint8_t {
+		No,
+		PickDlss,
+		GameDlss,
+	};
+	bool optiscaler_offered = false;
+	bool dlss_without_layer = true;
+	bool optiscaler_upscales = false;
+	OptiscalerHeld optiscaler_held = OptiscalerHeld::No;
 	bool active_is_xess = false;
 	bool active_is_vsr = false;
-	bool active_on12 = false;
 	const char *bridge_name = nullptr;
 	const char *bridge_sync = nullptr;
 	const char *api_name = nullptr;
 	BridgeKind bridge_kind = BridgeKind::None;
 	std::wstring bridge_error;
-	bool vsr_possible = false;
 
 	bool bridge_any_ready = false;
 	bool bridge_fsr_adapter_matched = false;
@@ -58,8 +64,6 @@ struct PanelState {
 	bool upscaler_initialized = false;
 	uint32_t upscaler_out_width = 0, upscaler_out_height = 0;
 	uint32_t upscaler_render_width = 0, upscaler_render_height = 0;
-	bool upscaler_bridge_ready = false;
-	bool upscaler_bridge_adapter_matched = false;
 
 	bool vsr_capable = false;
 	bool vsr_enabled = false;
@@ -68,8 +72,6 @@ struct PanelState {
 
 	std::wstring fsr_provider_version;
 	std::vector<std::string> fsr_providers;
-	bool fsr_dx12_dlls_present = false;
-	std::wstring fsr11_loaded_dll_name;
 
 	bool ngx_dll_present = false;
 	bool ngx_initialized = false;
@@ -109,7 +111,6 @@ struct PanelState {
 	uint64_t neural_eval_count = 0;
 	int neural_last = 0;
 	bool neural_init_failed = false;
-	bool neural_via_bridge = false;
 
 	NeuralColorSpace neural_color_space = NeuralColorSpace::Sdr;
 	uint32_t neural_model_width = 0, neural_model_height = 0;
@@ -138,7 +139,6 @@ struct PanelState {
 	float depth_far_plane = 0.0f;
 	std::string depth_overridden;
 	bool have_global_flow = false;
-	bool have_motion_confidence = false;
 	TextureInfo color_info;
 	TextureInfo motion_info;
 	TextureInfo depth_info;
@@ -152,7 +152,6 @@ struct PanelState {
 
 	SceneState scene_state = SceneState::Moving;
 	bool reset_this_frame = false;
-	bool camera_cut = false;
 	bool jitter_active = false;
 	bool jitter_refused = false;
 	bool jitter_in_frame = false;

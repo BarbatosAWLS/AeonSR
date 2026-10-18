@@ -47,34 +47,12 @@ bool compile_entry(const char *entry, const char *target, ID3DBlob **out)
 	return true;
 }
 
-bool create_tex2d(ID3D11Device *device, uint32_t w, uint32_t h, DXGI_FORMAT format, bool need_uav,
-	ID3D11Texture2D **out)
-{
-	if (device == nullptr || out == nullptr)
-		return false;
-
-	D3D11_TEXTURE2D_DESC desc{};
-	desc.Width = w;
-	desc.Height = h;
-	desc.MipLevels = 1;
-	desc.ArraySize = 1;
-	desc.Format = format;
-	desc.SampleDesc.Count = 1;
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-	if (need_uav)
-		desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-
-	return SUCCEEDED(device->CreateTexture2D(&desc, nullptr, out));
-}
-
 }
 
 void BlitPipelineD3D11::release()
 {
 	if (vs) { vs->Release(); vs = nullptr; }
 	if (ps_blit) { ps_blit->Release(); ps_blit = nullptr; }
-	if (ps_debug) { ps_debug->Release(); ps_debug = nullptr; }
 	if (sampler) { sampler->Release(); sampler = nullptr; }
 	if (rs) { rs->Release(); rs = nullptr; }
 	if (dss) { dss->Release(); dss = nullptr; }
@@ -97,7 +75,6 @@ bool BlitPipelineD3D11::ensure(ID3D11Device *dev)
 	Entry entries[] = {
 		{ "VSMain", "vs_5_0", nullptr },
 		{ "PSMain", "ps_5_0", nullptr },
-		{ "PSDebug", "ps_5_0", nullptr },
 	};
 	bool compiled = true;
 	for (Entry &e : entries)
@@ -108,7 +85,7 @@ bool BlitPipelineD3D11::ensure(ID3D11Device *dev)
 		};
 		compiled = SUCCEEDED(device->CreateVertexShader(entries[0].blob->GetBufferPointer(),
 			entries[0].blob->GetBufferSize(), nullptr, &vs)) &&
-			ps(entries[1].blob, &ps_blit) && ps(entries[2].blob, &ps_debug);
+			ps(entries[1].blob, &ps_blit);
 	}
 	for (Entry &e : entries)
 		if (e.blob != nullptr)
@@ -274,90 +251,6 @@ bool BlitPipelineD3D11::blit(ID3D11DeviceContext *ctx, ID3D11Resource *src, ID3D
 		return true;
 	}
 	return composite(ctx, src, dst, sharpness, jitter_u, jitter_v);
-}
-
-bool BlitPipelineD3D11::bias_mask(ID3D11DeviceContext *ctx, ID3D11Resource *confidence,
-	ID3D11Resource *dst, float strength)
-{
-	return mask_pass(ctx, confidence, dst, strength, 5.0f);
-}
-
-bool BlitPipelineD3D11::mask_pass(ID3D11DeviceContext *ctx, ID3D11Resource *src,
-	ID3D11Resource *dst, float strength, float mode)
-{
-	if (ctx == nullptr || src == nullptr || dst == nullptr)
-		return false;
-	ID3D11Device *ctx_device = nullptr;
-	ctx->GetDevice(&ctx_device);
-	const bool pipeline_ready = ctx_device != nullptr && ensure(ctx_device);
-	if (ctx_device != nullptr)
-		ctx_device->Release();
-	if (!pipeline_ready)
-		return false;
-
-	const TexInfo dst_info = tex_info(dst);
-
-	{
-		D3D11_MAPPED_SUBRESOURCE mapped{};
-		if (SUCCEEDED(ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-
-			float cbd[16] = {
-				0.0f, 1.0f,
-				static_cast<float>(dst_info.width), static_cast<float>(dst_info.height),
-				strength, mode, 0.0f, 0.0f };
-			memcpy(mapped.pData, cbd, sizeof(cbd));
-			ctx->Unmap(cb, 0);
-		}
-	}
-
-	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-	srv_desc.Format = view_format_for(tex_info(src).format);
-	srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-	srv_desc.Texture2D.MipLevels = 1;
-	ID3D11ShaderResourceView *srv = nullptr;
-	if (FAILED(device->CreateShaderResourceView(src, &srv_desc, &srv)))
-		return false;
-
-	D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
-	rtv_desc.Format = view_format_for(dst_info.format);
-	rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-	ID3D11RenderTargetView *rtv = nullptr;
-	if (FAILED(device->CreateRenderTargetView(dst, &rtv_desc, &rtv))) {
-		srv->Release();
-		return false;
-	}
-
-	ID3D11RenderTargetView *old_rtv = nullptr;
-	ID3D11DepthStencilView *old_dsv = nullptr;
-	ctx->OMGetRenderTargets(1, &old_rtv, &old_dsv);
-
-	D3D11_VIEWPORT vp{};
-	vp.Width = static_cast<float>(dst_info.width);
-	vp.Height = static_cast<float>(dst_info.height);
-	vp.MaxDepth = 1.0f;
-	ctx->RSSetViewports(1, &vp);
-	ctx->OMSetRenderTargets(1, &rtv, nullptr);
-	ctx->OMSetBlendState(bs, nullptr, 0xffffffff);
-	ctx->OMSetDepthStencilState(dss, 0);
-	ctx->RSSetState(rs);
-	ctx->IASetInputLayout(nullptr);
-	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	ctx->VSSetShader(vs, nullptr, 0);
-	ctx->PSSetShader(ps_debug, nullptr, 0);
-	ctx->PSSetConstantBuffers(0, 1, &cb);
-	ID3D11ShaderResourceView *srvs[3] = { srv, nullptr, nullptr };
-	ctx->PSSetShaderResources(0, 3, srvs);
-	ctx->PSSetSamplers(0, 1, &sampler);
-	ctx->Draw(3, 0);
-
-	ID3D11ShaderResourceView *null_srvs[3] = {};
-	ctx->PSSetShaderResources(0, 3, null_srvs);
-	ctx->OMSetRenderTargets(1, &old_rtv, old_dsv);
-	if (old_rtv) old_rtv->Release();
-	if (old_dsv) old_dsv->Release();
-	srv->Release();
-	rtv->Release();
-	return true;
 }
 
 }

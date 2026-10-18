@@ -1,4 +1,5 @@
 #include "aeon_sr/jitter/hud_restore.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/interop/blit_d3d12.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
@@ -347,15 +348,6 @@ ID3DBlob *compile(const char *entry, const char *target)
 	return blob;
 }
 
-template <typename T>
-void rel(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
-
 void release_blob(void *&b) noexcept
 {
 	if (b != nullptr) {
@@ -388,12 +380,6 @@ bool single_sample_target(const D3D12_RESOURCE_DESC &d) noexcept
 	return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
 		(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 && d.SampleDesc.Count == 1 &&
 		d.MipLevels == 1 && d.DepthOrArraySize == 1 && !typeless(view_format_for(d.Format));
-}
-
-bool is_srgb(DXGI_FORMAT f) noexcept
-{
-	return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-		f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
 bool bounded_format(DXGI_FORMAT f) noexcept
@@ -466,10 +452,10 @@ bool HudRestoreD3D12::ensure_pipeline(ID3D12Device *device)
 	rs.pStaticSamplers = &samp;
 	ID3DBlob *sig = nullptr, *sig_err = nullptr;
 	bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sig_err));
-	rel(sig_err);
+	safe_release(sig_err);
 	ok = ok && SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
 		IID_PPV_ARGS(&root_)));
-	rel(sig);
+	safe_release(sig);
 
 	ID3DBlob *cs[5]{};
 	ID3DBlob *vs = nullptr;
@@ -496,16 +482,16 @@ bool HudRestoreD3D12::ensure_pipeline(ID3D12Device *device)
 		ok = SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(outs[k])));
 	}
 	for (ID3DBlob *&b : cs)
-		rel(b);
+		safe_release(b);
 	if (ok) {
 		vs_ = vs;
 		for (uint32_t k = 0; k < KindCount; ++k)
 			ps_[k] = ps[k];
 		vs = nullptr;
 	} else {
-		rel(vs);
+		safe_release(vs);
 		for (ID3DBlob *&b : ps)
-			rel(b);
+			safe_release(b);
 	}
 
 	D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -573,7 +559,7 @@ bool HudRestoreD3D12::ensure_targets(ID3D12Device *device, uint32_t w, uint32_t 
 		ID3D12Resource **const all[] = { &frames_[0], &frames_[1], &stable_, &state_[0], &state_[1], &core_,
 			&scenes_[0], &scenes_[1], &trans_[0], &trans_[1] };
 		for (ID3D12Resource **r : all)
-			rel(*r);
+			safe_release(*r);
 		diag_error("hud", L"interface restore: its textures could not be made, the interface is left to the upscaler");
 		return false;
 	}
@@ -600,7 +586,7 @@ void HudRestoreD3D12::age_retired() noexcept
 {
 	for (Retired &r : retired_) {
 		if (r.res != nullptr && --r.frames == 0)
-			rel(r.res);
+			safe_release(r.res);
 	}
 }
 
@@ -979,28 +965,28 @@ void HudRestoreD3D12::reset() noexcept
 void HudRestoreD3D12::release() noexcept
 {
 	for (Pso &p : psos_) {
-		rel(p.pso);
+		safe_release(p.pso);
 		p.format = DXGI_FORMAT_UNKNOWN;
 		p.kind = 0;
 	}
-	rel(evidence_);
-	rel(mask_);
-	rel(trans_pso_);
-	rel(held_pso_);
-	rel(clear_);
-	rel(root_);
+	safe_release(evidence_);
+	safe_release(mask_);
+	safe_release(trans_pso_);
+	safe_release(held_pso_);
+	safe_release(clear_);
+	safe_release(root_);
 	release_blob(vs_);
 	for (void *&b : ps_)
 		release_blob(b);
-	rel(srv_heap_);
-	rel(rtv_heap_);
+	safe_release(srv_heap_);
+	safe_release(rtv_heap_);
 	ID3D12Resource **const all[] = { &frames_[0], &frames_[1], &stable_, &state_[0], &state_[1], &core_,
 		&scenes_[0], &scenes_[1], &trans_[0], &trans_[1], &filled_, &held_ };
 	for (ID3D12Resource **r : all)
-		rel(*r);
+		safe_release(*r);
 	trans_cur_ = 0;
 	for (Retired &r : retired_) {
-		rel(r.res);
+		safe_release(r.res);
 		r.frames = 0;
 	}
 	format_ = DXGI_FORMAT_UNKNOWN;

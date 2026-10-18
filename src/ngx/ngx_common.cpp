@@ -236,7 +236,10 @@ float3 PostRcas(float2 uv, float3 e) {
   const float kLimit = 0.25 - 1.0 / 16.0;
   float lobe = max(-kLimit, min(max(max(lobe3.r, lobe3.g), lobe3.b), 0.0));
   lobe *= saturate(sharpness * 1.25) * nz;
-  return (lobe * (b + d + f + g) + e) / (4.0 * lobe + 1.0);
+  float3 r = (lobe * (b + d + f + g) + e) / (4.0 * lobe + 1.0);
+  if (sharpness > 1.0)
+    r = clamp(e + min(sharpness, 3.0) * (r - e), min(e, 0.0), max(e, 1.0));
+  return r;
 }
 float4 SampleCatmullRom(float2 uv) {
   float2 size;

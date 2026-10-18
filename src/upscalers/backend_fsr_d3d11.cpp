@@ -390,7 +390,6 @@ bool Fsr31D3D11Backend::run(
 
 	quality_mode_ = params.quality_mode;
 	render_scale_ = params.render_scale;
-	sharpness_ = params.sharpness;
 	frame_time_ms_ = params.frame_time_ms;
 
 	if (!ensure_dll_present())

@@ -75,14 +75,6 @@ std::wstring wformat(const wchar_t *fmt, ...)
 	return buf;
 }
 
-std::wstring widen(const char *s)
-{
-	std::wstring out;
-	for (; s != nullptr && *s != '\0'; ++s)
-		out.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*s)));
-	return out;
-}
-
 bool path_exists(const std::wstring &path)
 {
 	const DWORD attrs = GetFileAttributesW(path.c_str());
@@ -559,11 +551,11 @@ bool nvidia_driver_version(uint32_t luid_low, int32_t luid_high,
 void diag_collect_environment_local(void *addon_module)
 {
 	DiagEnvironment e;
-	e.addon_version = widen(AEONSR_VERSION_STR);
+	e.addon_version = diag_widen(AEONSR_VERSION_STR);
 	e.addon_path = module_path_of(static_cast<HMODULE>(addon_module));
 	e.build_stamp = file_stamp_of(e.addon_path);
 	if (e.build_stamp.empty())
-		e.build_stamp = widen(__DATE__ " " __TIME__);
+		e.build_stamp = diag_widen(__DATE__ " " __TIME__);
 	e.addon_dir = directory_of(e.addon_path);
 	e.exe_path = module_path_of(nullptr);
 	e.os_version = read_os_version();

@@ -17,8 +17,6 @@ namespace aeon_sr {
 
 namespace {
 
-NativeDlss g_at_load;
-
 std::wstring canonical(const std::wstring &path)
 {
 	std::wstring s = path;
@@ -146,6 +144,7 @@ NativeDlss classify_native_dlss(const std::vector<std::wstring> &module_paths, c
 		case DlssModuleKind::Streamline:
 			out.streamline = true;
 			counts = true;
+			out.game_marker = true;
 			break;
 		case DlssModuleKind::NgxCore:
 			out.ngx_core = true;
@@ -157,10 +156,11 @@ NativeDlss classify_native_dlss(const std::vector<std::wstring> &module_paths, c
 		case DlssModuleKind::FrameGeneration:
 			out.frame_generation = true;
 			counts = !own_load();
+			out.game_marker = out.game_marker || counts;
 			break;
 		case DlssModuleKind::RayReconstruction:
-			out.ray_reconstruction = true;
 			counts = !own_load();
+			out.game_marker = out.game_marker || counts;
 			break;
 		default:
 			break;
@@ -328,16 +328,6 @@ std::wstring ngx_layer_label(const NgxLayer &layer)
 	if (layer.optiscaler)
 		return L"OptiScaler (" + file + L")";
 	return L"a DLSS layer (" + file + (layer.name.empty() ? L")" : L", " + layer.name + L")");
-}
-
-void snapshot_native_dlss()
-{
-	g_at_load = classify_native_dlss(loaded_module_paths(), std::wstring(), false);
-}
-
-const NativeDlss &native_dlss_at_load() noexcept
-{
-	return g_at_load;
 }
 
 }

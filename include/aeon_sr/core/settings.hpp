@@ -36,6 +36,10 @@ inline constexpr unsigned int kVsrInputFormatCount = 4u;
 
 inline constexpr float kJitterAmount = 1.0f;
 
+inline constexpr float kSharpnessDefault = 0.25f;
+inline constexpr float kSharpnessMax = 3.0f;
+float clamp_sharpness(float v) noexcept;
+
 inline constexpr unsigned int kScopeFramesDefault = 48u;
 inline constexpr unsigned int kScopeFramesMax = 1024u;
 inline constexpr unsigned int kScopeKeyDefault = 0x7Au;
@@ -69,17 +73,18 @@ inline constexpr float kNeuralExtendedMax = 2.0f;
 inline constexpr unsigned int kNeuralPassMax = 3u;
 unsigned int clamp_neural_passes(unsigned int passes) noexcept;
 
-inline constexpr float kNeuralPassFixedCost = 1.3f;
-inline constexpr float kNeuralPassPixelCost = 15.8f;
+inline constexpr float kNeuralPassFixedCost = 1.10f;
+inline constexpr float kNeuralPassPixelCost = 9.44f;
 
 float neural_chain_relative_cost(float model_scale, unsigned int passes, float row_fraction = 1.0f) noexcept;
 
 enum class NeuralMode : unsigned int { Quality = 0u, Balanced = 1u, Performance = 2u, UltraPerformance = 3u };
 inline constexpr unsigned int kNeuralModeCount = 4u;
 unsigned int clamp_neural_mode(unsigned int mode) noexcept;
-inline constexpr float kNeuralModeKeep[kNeuralModeCount] = { 1.0f, 0.75f, 0.6f, 0.5f };
+inline constexpr float kNeuralModeCost[kNeuralModeCount] = { 1.0f, 0.75f, 0.6f, 0.4f };
 inline constexpr float kNeuralModeKeepMin = 0.4f;
-unsigned int neural_mode_width(unsigned int frame_w, float scale, unsigned int mode) noexcept;
+unsigned int neural_mode_width(unsigned int frame_w, float scale, unsigned int mode,
+	unsigned int frame_h = 0u) noexcept;
 double neural_warp_to_frame(double model_uv, double a) noexcept;
 double neural_warp_to_model(double frame_uv, double a) noexcept;
 
@@ -92,7 +97,7 @@ float clamp_neural_range(float v, float lo, float hi, float fallback) noexcept;
 inline constexpr float kNeuralModelScales[] = {
 	1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f };
 inline constexpr unsigned int kNeuralModelScaleCount = 7u;
-inline constexpr unsigned int kNeuralModelScaleDefault = 4u;
+inline constexpr unsigned int kNeuralModelScaleDefault = 2u;
 unsigned int neural_model_scale_index_for_percent(unsigned int percent) noexcept;
 unsigned int neural_model_scale_percent(unsigned int index) noexcept;
 
@@ -134,7 +139,7 @@ struct Settings {
 	bool show_osd = false;
 
 	unsigned int render_preset = 11;
-	float sharpness = 0.25f;
+	float sharpness = kSharpnessDefault;
 
 	bool upscale_effects = false;
 
@@ -158,6 +163,8 @@ struct Settings {
 
 	std::string fsr_provider;
 
+	bool optiscaler_upscale = false;
+
 	unsigned int jitter_scene_rule = 0;
 	bool jitter_tested_quads = true;
 	bool jitter_scene_quads = true;
@@ -169,6 +176,7 @@ struct Settings {
 	unsigned int scope_frames = kScopeFramesDefault;
 	std::string scope_dir;
 	unsigned int scope_key = kScopeKeyDefault;
+	std::string scope_planes;
 	bool pipeline_trace = false;
 	bool game_render_scale = false;
 	bool game_render_scale_before_aa = false;

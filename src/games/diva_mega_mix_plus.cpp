@@ -149,8 +149,6 @@ public:
 		g_answer.store(attached_ ? s : 0.0f, std::memory_order_relaxed);
 	}
 
-	float requested_render_scale() const noexcept override { return g_answer.load(std::memory_order_relaxed); }
-
 	float applied_render_scale() const noexcept override
 	{
 		return attached_ && at_.render_global != nullptr

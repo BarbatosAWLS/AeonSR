@@ -119,5 +119,6 @@ public:
 };
 
 std::unique_ptr<VendorFrameGenerator> make_vendor_frame_generator(FrameGenerator g);
+std::unique_ptr<VendorFrameGenerator> make_inprocess_vendor_frame_generator(FrameGenerator g);
 
 }

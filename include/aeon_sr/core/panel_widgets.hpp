@@ -137,8 +137,6 @@ struct Span {
 void flow(const Span *spans, int count);
 void wrapped(const ImVec4 &colour, const char *text);
 
-void value_line(const char *label, const char *value);
-
 float avail_width();
 
 #if AEONSR_PANEL_PREVIEW

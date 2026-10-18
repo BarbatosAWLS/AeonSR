@@ -1,4 +1,5 @@
 #include "aeon_sr/depth/d3d9_depth.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include <d3dcompiler.h>
 
@@ -6,15 +7,6 @@
 
 namespace aeon_sr {
 namespace {
-
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 constexpr D3DFORMAT kFormatIntz = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
 

@@ -320,8 +320,6 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
 	}
 	diag_set_sink(mirror_to_host_log);
 
-	snapshot_native_dlss();
-
 	create_app(addon_module);
 
 	reshade::register_event<reshade::addon_event::create_device>(on_create_device);

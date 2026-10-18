@@ -195,9 +195,35 @@ const char *scope_plane_name(ScopePlane p) noexcept
 	case ScopePlane::Mask: return "mask";
 	case ScopePlane::Neural: return "neural";
 	case ScopePlane::Motion: return "motion";
+	case ScopePlane::Depth: return "depth";
 	case ScopePlane::Count: break;
 	}
 	return "";
+}
+
+uint32_t scope_planes_from_names(const std::string &names, bool *unknown)
+{
+	uint32_t bits = 0;
+	if (unknown != nullptr)
+		*unknown = false;
+	size_t i = 0;
+	while (i < names.size()) {
+		const size_t end = names.find_first_of(", \t", i);
+		const std::string name = names.substr(i, end == std::string::npos ? std::string::npos : end - i);
+		bool known = name.empty();
+		for (uint32_t p = 0; p < kScopeStagePlanes; ++p) {
+			if (!name.empty() && name == scope_plane_name(static_cast<ScopePlane>(p))) {
+				bits |= 1u << p;
+				known = true;
+			}
+		}
+		if (!known && unknown != nullptr)
+			*unknown = true;
+		if (end == std::string::npos)
+			break;
+		i = end + 1;
+	}
+	return bits;
 }
 
 const char *scope_column_name(ScopeColumn c) noexcept
@@ -280,7 +306,7 @@ std::wstring scope_plane_path(const std::wstring &dir, uint32_t n, ScopePlane p)
 	return dir + L"\\" + name;
 }
 
-std::string format_scope_txt(const std::string &header, uint32_t frames)
+std::string format_scope_txt(const std::string &header, uint32_t frames, uint32_t planes)
 {
 	std::string out = "scope_version=1\n";
 	std::istringstream in(header);
@@ -294,8 +320,13 @@ std::string format_scope_txt(const std::string &header, uint32_t frames)
 	}
 	out += "frames=" + unum(frames) + "\n";
 	out += "planes=";
-	for (uint32_t i = 0; i < kScopeStagePlanes; ++i)
-		out += std::string(i != 0 ? "," : "") + scope_plane_name(static_cast<ScopePlane>(i));
+	bool first = true;
+	for (uint32_t i = 0; i < kScopeStagePlanes; ++i) {
+		if ((planes & (1u << i)) == 0)
+			continue;
+		out += std::string(first ? "" : ",") + scope_plane_name(static_cast<ScopePlane>(i));
+		first = false;
+	}
 	out += "\nplane_ext=bin\n";
 	return out;
 }

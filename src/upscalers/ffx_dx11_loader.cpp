@@ -4,22 +4,6 @@
 #include <cstring>
 
 namespace aeon_sr {
-namespace {
-
-template <typename Fn>
-bool resolve_export(HMODULE module, const char *name, Fn *&out, std::wstring &error)
-{
-	out = reinterpret_cast<Fn *>(GetProcAddress(module, name));
-	if (out == nullptr) {
-		error = L"GetProcAddress failed for ";
-		error += std::wstring(name, name + strlen(name));
-		return false;
-	}
-	return true;
-}
-
-}
-
 bool ffx_dx11_load(FfxDx11Api &out, const std::wstring &dll_path, std::wstring &error)
 {
 	ffx_dx11_unload(out);

@@ -1,6 +1,8 @@
 #include "aeon_sr/framegen/window_host_link.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/framegen/fg_gpu_priority.hpp"
+#include "aeon_sr/framegen/host_launch.hpp"
 
 #include <cstring>
 #include <initializer_list>
@@ -41,9 +43,6 @@ bool WindowHostLink::start(const std::wstring &exe, ID3D12Device *device, ID3D12
 		stop(true);
 		return false;
 	};
-	if (exe.empty() || GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
-		return refuse(L"AeonSRHost.exe is not beside the add-on");
-
 	mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(window_host::Block), nullptr);
 	if (mapping_ == nullptr)
 		return refuse(hr_text(L"the block shared with AeonSRHost.exe could not be made", GetLastError()));
@@ -55,52 +54,18 @@ bool WindowHostLink::start(const std::wstring &exe, ID3D12Device *device, ID3D12
 		return refuse(L"the block or the events shared with AeonSRHost.exe could not be made");
 	std::memset(block_, 0, sizeof(window_host::Block));
 
-	SIZE_T list_size = 0;
-	InitializeProcThreadAttributeList(nullptr, 1, 0, &list_size);
-	std::vector<unsigned char> list_mem(list_size);
-	auto *const list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(list_mem.data());
-	HANDLE inherit[1] = { mapping_ };
-	if (!InitializeProcThreadAttributeList(list, 1, 0, &list_size))
-		return refuse(hr_text(L"AeonSRHost.exe could not be given the block", GetLastError()));
-	if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr, nullptr)) {
-		const DWORD e = GetLastError();
-		DeleteProcThreadAttributeList(list);
-		return refuse(hr_text(L"AeonSRHost.exe could not be given the block", e));
-	}
-	wchar_t args[64];
-	swprintf(args, 64, L" --present %llu", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mapping_)));
-	std::wstring dir = exe;
-	const size_t slash = dir.find_last_of(L"\\/");
-	dir = slash != std::wstring::npos ? dir.substr(0, slash) : std::wstring(L".");
-	std::wstring command = L"\"" + exe + L"\"" + args + L" --log \"" + dir + L"\\AeonSRHost-window.log\"";
-	std::vector<wchar_t> mutable_command(command.begin(), command.end());
-	mutable_command.push_back(L'\0');
-	STARTUPINFOEXW si{};
-	si.StartupInfo.cb = sizeof(si);
-	si.lpAttributeList = list;
+	HostLaunch launch;
+	std::wstring launch_why;
+	if (!launch_host_suspended(exe, mapping_, L" --present", L"AeonSRHost-window.log", &launch, &launch_why))
+		return refuse(launch_why);
+	process_ = launch.process;
+	host_pid_ = launch.pid;
 	PROCESS_INFORMATION pi{};
-	DWORD priority = GetPriorityClass(GetCurrentProcess());
-	if (priority == REALTIME_PRIORITY_CLASS || priority == 0)
-		priority = HIGH_PRIORITY_CLASS;
-	SetHandleInformation(mapping_, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-	const BOOL created = CreateProcessW(exe.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
-		CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | priority, nullptr, dir.c_str(),
-		&si.StartupInfo, &pi);
-	const DWORD create_error = GetLastError();
-	SetHandleInformation(mapping_, HANDLE_FLAG_INHERIT, 0);
-	DeleteProcThreadAttributeList(list);
-	if (!created)
-		return refuse(hr_text(L"AeonSRHost.exe would not start", create_error));
-	process_ = pi.hProcess;
-	host_pid_ = pi.dwProcessId;
+	pi.hThread = launch.thread;
 
 	bool ok = true;
 	const auto give = [&](HANDLE h, DWORD access, bool same) -> uint64_t {
-		HANDLE out = nullptr;
-		if (h == nullptr || !DuplicateHandle(GetCurrentProcess(), h, process_, &out, access, FALSE,
-				same ? DUPLICATE_SAME_ACCESS : 0))
-			ok = false;
-		return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out));
+		return give_handle(process_, h, access, same, &ok);
 	};
 	const auto give_shared = [&](ID3D12DeviceChild *object) -> uint64_t {
 		HANDLE h = nullptr;
@@ -156,8 +121,10 @@ bool WindowHostLink::start(const std::wstring &exe, ID3D12Device *device, ID3D12
 		return refuse(reason);
 	}
 	alive_ = true;
-	diag_logf(DiagLevel::Info, "framegen", L"frame generation: its own window is shown by AeonSRHost.exe (pid %u)",
-		host_pid_);
+	GpuClass c = GpuClass::Normal;
+	gpu_class_ = get_gpu_class(process_, &c) ? static_cast<int>(c) : -1;
+	diag_logf(DiagLevel::Info, "framegen", L"frame generation: its own window is shown by AeonSRHost.exe (pid %u), "
+		L"its GPU scheduler class %ls", host_pid_, gpu_class_ >= 0 ? gpu_class_name(c) : L"not known");
 	return true;
 }
 
@@ -240,6 +207,7 @@ void WindowHostLink::stop(bool kill) noexcept
 		*h = nullptr;
 	}
 	host_pid_ = 0;
+	gpu_class_ = -1;
 	seq_ = 0;
 }
 

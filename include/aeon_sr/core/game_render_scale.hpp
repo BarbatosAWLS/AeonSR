@@ -53,7 +53,6 @@ struct GameScaleState {
 	uint64_t presents = 0;
 	uint64_t replaced = 0;
 	double scene_ms = 0.0, frame_ms = 0.0;
-	uint32_t timed_frames = 0, timed_stretches = 0;
 	uint64_t missed_corner = 0, missed_none = 0;
 	uint32_t miss_w = 0, miss_h = 0, miss_draws = 0, miss_most = 0, miss_most_w = 0, miss_most_h = 0;
 };

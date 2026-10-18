@@ -1,4 +1,6 @@
 #include "aeon_sr/interop/interop_bridges.hpp"
+#include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/jitter/gl_jitter.hpp"
 
@@ -14,15 +16,6 @@
 namespace aeon_sr {
 namespace {
 
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
-
 typedef PROC(WINAPI *PfnWglGetProcAddress)(LPCSTR);
 typedef HGLRC(WINAPI *PfnWglGetCurrentContext)(void);
 
@@ -35,14 +28,6 @@ bool load_gl(HMODULE gl32, PfnWglGetProcAddress wgl_get, T &fn, const char *name
 		p = (gl32 != nullptr) ? GetProcAddress(gl32, name) : nullptr;
 	fn = reinterpret_cast<T>(p);
 	return fn != nullptr;
-}
-
-std::wstring to_wide(const char *s)
-{
-	std::wstring w;
-	for (const char *p = s; p != nullptr && *p != '\0'; ++p)
-		w.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
-	return w;
 }
 
 struct GlApi {
@@ -447,7 +432,7 @@ public:
 		}
 
 		if (const char *const missing = gl_.load_core(gl32_, wgl_get_proc_)) {
-			last_error = L"this OpenGL driver does not provide " + to_wide(missing) +
+			last_error = L"this OpenGL driver does not provide " + diag_widen(missing) +
 				L", which the add-on needs. An OpenGL 4.3 driver has it, so this one is "
 				L"either very old or a software renderer.";
 			shutdown();
@@ -724,25 +709,10 @@ public:
 			return true;
 		}
 
-		D3D12_HEAP_PROPERTIES heap{};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		D3D12_RESOURCE_DESC desc{};
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		desc.Width = w;
-		desc.Height = h;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.Format = fmt;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		if (FAILED(engine_->device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-				SharedPlane::kState, nullptr, IID_PPV_ARGS(&plane.engine)))) {
+		if (!bridge_util::make_engine_plane(*engine_, w, h, fmt, plane)) {
 			last_error = L"the engine device refused a texture.";
 			return false;
 		}
-		plane.width = w;
-		plane.height = h;
-		plane.format = fmt;
 		return true;
 	}
 

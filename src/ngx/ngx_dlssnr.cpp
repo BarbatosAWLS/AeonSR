@@ -223,8 +223,8 @@ bool warped_size_for(uint32_t w, uint32_t h, float scale, unsigned int mode, uin
 {
 	if (clamp_neural_mode(mode) == 0u || w == 0u || h == 0u)
 		return false;
-	const uint32_t mw = neural_mode_width(w, scale, mode);
-	if (mw == 0u || mw >= neural_mode_width(w, scale, 0u))
+	const uint32_t mw = neural_mode_width(w, scale, mode, h);
+	if (mw == 0u || mw >= neural_mode_width(w, scale, 0u, h))
 		return false;
 	uint32_t mh = static_cast<uint32_t>(std::lround(static_cast<double>(mw) * h / w)) & ~1u;
 	if (mh < 64u)

@@ -1,4 +1,5 @@
 #include "aeon_sr/interop/interop_bridges.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/interop/blit_d3d11.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/native_d3d.hpp"
@@ -7,15 +8,6 @@
 
 namespace aeon_sr {
 namespace {
-
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 DXGI_FORMAT shareable_format_for(DXGI_FORMAT fmt) noexcept
 {
@@ -61,6 +53,28 @@ void release_plane(SharedPlane &plane)
 	plane.game = { 0 };
 	plane.width = plane.height = 0;
 	plane.format = DXGI_FORMAT_UNKNOWN;
+}
+
+bool make_engine_plane(EngineDevice &engine, uint32_t w, uint32_t h, DXGI_FORMAT fmt, SharedPlane &plane)
+{
+	D3D12_HEAP_PROPERTIES heap{};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC desc{};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = w;
+	desc.Height = h;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.Format = fmt;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	if (FAILED(engine.device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			SharedPlane::kState, nullptr, IID_PPV_ARGS(&plane.engine))))
+		return false;
+	plane.width = w;
+	plane.height = h;
+	plane.format = fmt;
+	return true;
 }
 
 bool make_nt_pair(EngineDevice &engine, ID3D11Device *device11,
@@ -257,25 +271,10 @@ public:
 			return true;
 		bridge_util::release_plane(plane);
 
-		D3D12_HEAP_PROPERTIES heap{};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		D3D12_RESOURCE_DESC desc{};
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		desc.Width = w;
-		desc.Height = h;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.Format = fmt;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		if (FAILED(engine_->device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-				SharedPlane::kState, nullptr, IID_PPV_ARGS(&plane.engine)))) {
+		if (!bridge_util::make_engine_plane(*engine_, w, h, fmt, plane)) {
 			last_error = L"the engine device refused a texture";
 			return false;
 		}
-		plane.width = w;
-		plane.height = h;
-		plane.format = fmt;
 		return true;
 	}
 

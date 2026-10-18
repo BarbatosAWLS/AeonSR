@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.3.1 LANGUAGES C CXX)
+project(AeonSR VERSION 1.3.2 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -66,6 +66,16 @@ foreach(_req
     message(FATAL_ERROR "Missing ${_req}. ${_aeonsr_hint}")
   endif()
 endforeach()
+
+set(AEONSR_AGILITY_CORE "${AEONSR_EXTERNAL}/D3D12Core/D3D12Core.dll" CACHE FILEPATH
+  "Microsoft's D3D12Core.dll (Agility SDK 1.619.x), shipped in runtime so FSR 4 runs on Windows 10")
+if(EXISTS "${AEONSR_AGILITY_CORE}")
+  list(APPEND AEONSR_RUNTIME_FILES "${AEONSR_AGILITY_CORE}")
+  message(STATUS "Agility core: ${AEONSR_AGILITY_CORE}")
+else()
+  message(STATUS "No Agility core at ${AEONSR_AGILITY_CORE}: FSR 4 will be refused on this Windows "
+    "(its core answers Shader Model 6.5, FSR 4 needs 6.6); run tools\\fetch_agility_sdk.ps1")
+endif()
 
 set(RESHADEFX_SOURCES
   "${RESHADE_ROOT}/source/effect_lexer.cpp"
@@ -162,6 +172,9 @@ set(AEONSR_SOURCES
   src/framegen/window_host_link.cpp
   src/framegen/window_host_protocol.cpp
   src/framegen/vendor_frame_gen.cpp
+  src/framegen/vendor_frame_gen_remote.cpp
+  src/framegen/fg_host_protocol.cpp
+  src/framegen/host_launch.cpp
   src/framegen/fsr_frame_gen.cpp
   src/framegen/dlss_frame_gen.cpp
   src/framegen/xess_frame_gen.cpp
@@ -186,6 +199,7 @@ set(AEONSR_SOURCES
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
+  src/ngx/ngx_dlssg_files.cpp
   src/ngx/ngx_api12.cpp
   src/ngx/ngx_session.cpp
   src/motion/optical_flow.cpp
@@ -194,6 +208,10 @@ set(AEONSR_SOURCES
   src/core/present_drive.cpp
   src/core/panel.cpp
   src/core/panel_widgets.cpp
+  src/core/i18n.cpp
+  src/core/i18n_reshade.cpp
+  src/core/bidi.cpp
+  src/core/imgui_shaping.cpp
   src/interop/remote_engine.cpp
   src/interop/remote_protocol.cpp
   src/core/runtime_search.cpp
@@ -229,7 +247,6 @@ set(AEONSR_VENDOR_SOURCES
   src/upscalers/backend_fsr_d3d11.cpp
   src/upscalers/backend_fsr_d3d12.cpp
   src/upscalers/fsr_warmup.cpp
-  src/upscalers/backend_vsr.cpp
   src/upscalers/backend_xess.cpp
   src/upscalers/ffx_dx11_loader.cpp
   src/upscalers/ffx_loader.cpp
@@ -239,6 +256,7 @@ set(AEONSR_VENDOR_SOURCES
   src/ngx/ngx_runtime.cpp
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
+  src/ngx/ngx_dlssg_files.cpp
   src/ngx/ngx_api12.cpp
   src/ngx/ngx_session.cpp
   src/upscalers/xess_loader.cpp
@@ -333,7 +351,21 @@ if(AEONSR_X64)
     src/core/settings.cpp
     src/upscalers/upscaler_backend.cpp
     src/upscalers/xess_loader.cpp
+    src/ngx/ngx_dlssg_files.cpp
+    src/upscalers/backend_vsr.cpp
+    src/interop/blit_d3d11.cpp
   )
+  if(AEONSR_FRAME_GENERATION)
+    target_sources(AeonSRHost PRIVATE
+      host/framegen_host.cpp
+      src/framegen/fg_host_protocol.cpp
+      src/framegen/vendor_frame_gen.cpp
+      src/framegen/fsr_frame_gen.cpp
+      src/framegen/dlss_frame_gen.cpp
+      src/framegen/xess_frame_gen.cpp
+      src/framegen/xess_fake_swapchain.cpp
+    )
+  endif()
   target_include_directories(AeonSRHost PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/host"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -343,6 +375,7 @@ if(AEONSR_X64)
     "${FFX_INCLUDE_DIR}"
     "${FFX_DX11_INCLUDE_DIR}"
     "${XESS_INCLUDE_DIR}"
+    "${XESS_FG_INCLUDE_DIR}"
     ${VKGL_INCLUDE_DIR})
   target_compile_definitions(AeonSRHost PRIVATE ${AEONSR_COMMON_DEFINITIONS}
     AEONSR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}

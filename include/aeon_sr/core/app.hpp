@@ -99,7 +99,6 @@ public:
 	UpscalerStatus active_status() const noexcept;
 	const std::wstring &active_error() const noexcept;
 
-	void request_reset() noexcept { history_.reset_pending = true; history_.temporal_history_valid = false; }
 	void persist_settings();
 	void shutdown();
 	void at_process_exit() noexcept
@@ -187,17 +186,27 @@ private:
 	bool remote_tried_ = false;
 	uint32_t remote_out_width_ = 0, remote_out_height_ = 0;
 	uint32_t remote_in_width_ = 0, remote_in_height_ = 0;
+	RemoteEngine::Extras remote_extras_;
+	RemoteEngine::Info remote_info_;
+	bool neural_remote_now() const noexcept;
 	bool remote_wanted() const noexcept;
 	bool runs_remote(const UpscalerBackend *backend) const noexcept;
 	EngineRoute engine_route_now() const noexcept;
 	bool dlss_override() const noexcept;
 	bool crosses(const UpscalerBackend *backend) const noexcept;
+	bool neural_crosses_alone(const EngineRoute &r, const UpscalerBackend *backend) const noexcept;
 	bool must_run_in_host(const UpscalerBackend *backend) const noexcept;
 	bool upscaler_layer_seen() const noexcept;
+	const std::wstring &layer_dlss_path() const noexcept;
+	bool game_dlss_for_layer() const noexcept;
+	void sync_dlss_layer();
+	std::wstring ngx_layer_table_;
+	bool layer_dlss_started_ = false;
+	bool native_before_layer_ = false;
 	void ensure_remote();
-	void run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
+	bool run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 		const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params,
-		bool neural_here);
+		bool neural_here, bool upscaled_here = false);
 	BackendChoice choice_of(const UpscalerBackend *backend) const noexcept;
 	BackendAvailability availability_of(UpscalerBackend *backend, BackendChoice choice);
 	FrameBridge *bridge_ = nullptr;
@@ -225,6 +234,7 @@ private:
 	uint32_t landing_discards_logged_ = 0;
 	bool native_dlss_seen_ = false;
 	unsigned long long ngx_layers_scanned_ms_ = 0;
+	uint32_t ngx_layers_rescans_ = 0;
 	std::vector<NgxLayer> ngx_layers_;
 	void update_ngx_layers();
 	void update_native_dlss();
@@ -266,7 +276,6 @@ private:
 	bool flow_note_benign_ = false;
 	bool motion_wanted_ = false;
 	std::wstring logged_flow_note_;
-	uint64_t last_flow_frames_ = 0;
 	void note_flow_state();
 	void note_frame_blocked(const std::wstring &why);
 	std::wstring flow_error_;

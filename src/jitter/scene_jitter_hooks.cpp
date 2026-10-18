@@ -871,8 +871,6 @@ void bind_target_and_depth(command_list *cmd, JitterContextData &d, uint64_t tar
 	if (g_scene_jitter.engaged()) {
 		size_of(cmd, d, target, &tw, &th);
 		size_of(cmd, d, depth, &dw, &dh);
-		if (depth != 0 && jitter_frame_like(dw, dh, arm.display_w, arm.display_h))
-			g_scene_jitter.note_frame_depth();
 		window = g_scene_jitter.presented_target(target);
 		if (target != 0)
 			bind_composite(cmd, d, target, tw, th);

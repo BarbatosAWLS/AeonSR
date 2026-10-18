@@ -122,29 +122,8 @@ std::wstring product_of(const std::wstring &path)
 	return std::wstring();
 }
 
-}
-
-Ngx12Api ngx12_load_module(const std::wstring &path)
+void take_exports(Ngx12Api &api, HMODULE m)
 {
-	Ngx12Api api;
-	api.path = path;
-	if (lower(product_of(path)).find(L"optiscaler") != std::wstring::npos) {
-		api.error = L"it is OptiScaler, not an NGX runtime. Put d4r's own nvngx.dll there";
-		return api;
-	}
-	HMODULE m = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-	if (m == nullptr) {
-		wchar_t buf[64]{};
-		_snwprintf_s(buf, _TRUNCATE, L" (error %lu)", GetLastError());
-		api.error = L"Windows would not load it" + std::wstring(buf);
-		return api;
-	}
-	const std::wstring got = module_path(m);
-	if (!got.empty() && !ngx_same_file(got, path)) {
-		api.error = L"another program answered its load with " + got +
-			L" (OptiScaler does this; remove it, or set HookOriginalNvngxOnly=true in OptiScaler.ini)";
-		return api;
-	}
 	api.module = m;
 	api.fn_init_ext = reinterpret_cast<void *>(GetProcAddress(m, "NVSDK_NGX_D3D12_Init_Ext"));
 	api.fn_init_project = reinterpret_cast<void *>(GetProcAddress(m, "NVSDK_NGX_D3D12_Init_ProjectID"));
@@ -169,7 +148,77 @@ Ngx12Api ngx12_load_module(const std::wstring &path)
 	}
 	if (!missing.empty())
 		api.error = L"it is not an NGX runtime: it does not export " + missing;
+}
+
+}
+
+Ngx12Api ngx12_load_module(const std::wstring &path)
+{
+	Ngx12Api api;
+	api.path = path;
+	if (lower(product_of(path)).find(L"optiscaler") != std::wstring::npos) {
+		api.error = L"it is OptiScaler, not an NGX runtime. Put d4r's own nvngx.dll there";
+		return api;
+	}
+	HMODULE m = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+	if (m == nullptr) {
+		wchar_t buf[64]{};
+		_snwprintf_s(buf, _TRUNCATE, L" (error %lu)", GetLastError());
+		api.error = L"Windows would not load it" + std::wstring(buf);
+		return api;
+	}
+	const std::wstring got = module_path(m);
+	if (!got.empty() && !ngx_same_file(got, path)) {
+		api.error = L"another program answered its load with " + got +
+			L" (OptiScaler does this; remove it, or set HookOriginalNvngxOnly=true in OptiScaler.ini)";
+		return api;
+	}
+	take_exports(api, m);
 	return api;
+}
+
+bool ngx12_has_table(HMODULE module)
+{
+	if (module == nullptr)
+		return false;
+	Ngx12Api probe;
+	take_exports(probe, module);
+	return probe.usable();
+}
+
+Ngx12Api ngx12_attach_module(const std::wstring &path)
+{
+	Ngx12Api api;
+	api.path = path;
+	HMODULE m = nullptr;
+	if (path.empty() || !GetModuleHandleExW(0, path.c_str(), &m) || m == nullptr) {
+		api.error = L"it is not loaded in this game";
+		return api;
+	}
+	take_exports(api, m);
+	return api;
+}
+
+const Ngx12Api &ngx12_layer_api(const std::wstring &path)
+{
+	static std::mutex mutex;
+	static Ngx12Api attached;
+	static Ngx12Api other;
+	std::lock_guard lock(mutex);
+	if (attached.module == nullptr) {
+		if (running_under_wine())
+			set_d4r_states();
+		attached = ngx12_attach_module(path);
+		diag_state("ngx-layer-dlss", attached.usable() ? DiagLevel::Info : DiagLevel::Error, "dlss", attached.usable()
+			? L"DLSS input goes to " + path + L", which runs the upscaler picked in its own menu"
+			: L"DLSS input was to go to " + path + L", but " + attached.error);
+		return attached;
+	}
+	if (ngx_same_file(attached.path, path))
+		return attached;
+	other.path = path;
+	other.error = L"this game already sent DLSS to " + attached.path + L"; restart the game to use another program";
+	return other;
 }
 
 const Ngx12Api &ngx12_static_api()

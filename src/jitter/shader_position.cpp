@@ -189,11 +189,6 @@ private:
 		return k < in.wc ? w_[in.at + k] : 0u;
 	}
 	uint32_t def(uint32_t id) const noexcept { return id < bound_ ? def_[id] : kNone; }
-	uint32_t op_of(uint32_t id) const noexcept
-	{
-		const uint32_t d = def(id);
-		return d != kNone ? instrs_[d].op : 0u;
-	}
 	uint32_t type_of(uint32_t id) const noexcept;
 	uint32_t vector_size(uint32_t type) const noexcept;
 	uint32_t member_type(uint32_t type, uint32_t index) const noexcept;

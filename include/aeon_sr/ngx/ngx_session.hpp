@@ -63,6 +63,8 @@ struct NgxSession {
 
 	std::wstring addon_dir, dll_dir, data_dir;
 
+	std::wstring layer_path;
+
 	bool ensure_dll_present();
 
 	std::wstring prepare_data_dir();

@@ -11,6 +11,7 @@
 #include "aeon_sr/interop/native_d3d.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/core/game_render_scale.hpp"
+#include "aeon_sr/core/i18n.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
 #include "aeon_sr/ngx/ngx_override.hpp"
 #include "aeon_sr/core/runtime_search.hpp"
@@ -23,6 +24,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -67,6 +69,7 @@ App::App(HMODULE module)
 	ngx12_.data_dir = data_dir;
 	dlss11_.rt = &ngx_;
 	dlss12_.rt = &ngx12_;
+	vsr11_.engine = &engine_;
 	fsr11_.addon_dir = addon_dir;
 	fsr12_.addon_dir = addon_dir;
 	xess12_.addon_dir = addon_dir;
@@ -221,6 +224,16 @@ void App::service_neural_teardown()
 	neural12_.destroy_feature();
 	neural_last_ = 0;
 	neural_init_failed_ = false;
+	++remote_extras_.neural_restart_epoch;
+}
+
+bool App::neural_remote_now() const noexcept
+{
+	if (!remote_.ready())
+		return false;
+	if constexpr (sizeof(void *) == 4)
+		return true;
+	return engine_route_now().neural_in_host;
 }
 
 void App::request_neural_capture()
@@ -230,7 +243,11 @@ void App::request_neural_capture()
 	GetLocalTime(&t);
 	wchar_t stamp[32]{};
 	_snwprintf_s(stamp, _TRUNCATE, L"%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-	neural12_.request_capture(join_path(join_path(neural12_.addon_dir, L"captures"), stamp));
+	const std::wstring dir = join_path(join_path(neural12_.addon_dir, L"captures"), stamp);
+	neural12_.request_capture(dir);
+	remote_extras_.capture_dir = dir;
+	remote_extras_.capture_frames = kNeuralCaptureBurst;
+	++remote_extras_.capture_epoch;
 }
 
 void App::request_upscaler_capture()
@@ -266,7 +283,14 @@ void App::request_scope_capture()
 			root = w;
 	}
 	const std::wstring dir = join_path(root, stamp);
-	upscaler_capture_.request_scope(dir, settings_.scope_frames);
+	bool unknown = false;
+	const uint32_t planes = scope_planes_from_names(settings_.scope_planes, &unknown);
+	if (unknown)
+		diag_warn("capture", std::wstring(L"ScopePlanes has a name that is no plane (drawn, upscaler_in, upscaled, "
+			L"final, mask, neural, motion, depth, separated by commas); ") +
+			(planes == 0 ? L"every plane is kept" : L"the planes it names are kept"));
+	upscaler_capture_.request_scope(dir, settings_.scope_frames, UpscalerCaptureD3D12::kScopeMaxBytes,
+		planes != 0 ? planes : UpscalerCaptureD3D12::kScopeAllPlanes);
 	diag_info("capture", L"scope capture started: " + std::to_wstring(settings_.scope_frames) + L" frames into " + dir);
 }
 
@@ -412,7 +436,7 @@ void App::run_engine_work(reshade::api::effect_runtime *runtime, const FrameInpu
 	scope_list_lost_ = false;
 	interface_restored_ = false;
 	bool registered = false;
-	if (hud_detected_ && !interface_split_ && backend != nullptr && backend != &fsr11_ && backend != &vsr11_) {
+	if (hud_detected_ && !interface_split_ && backend != nullptr && backend != &fsr11_) {
 		const StageScope register_time(stage_times_, StageTimings::Stage::Register, inputs);
 		registered = hud_restore_.register_input(inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state);
@@ -573,7 +597,7 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 	engine_journal_note(L"engine frame");
 	upscaler_capture_.begin_frame(inputs.engine.device, inputs.engine.queue);
 	const bool capturing = upscaler_capture_.recording() && backend != nullptr && backend != &fsr11_ &&
-		backend != &vsr11_ && inputs.engine.ready();
+		inputs.engine.ready();
 	bool split_moved = false;
 	float split_u = 0.0f, split_v = 0.0f;
 	StageTimings::Stage upscaler_stage = StageTimings::Stage::Upscaler;
@@ -601,7 +625,7 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		}
 	}
 	const bool scope = upscaler_capture_.scope_recording() && backend != nullptr && backend != &fsr11_ &&
-		backend != &vsr11_ && inputs.engine.ready();
+		inputs.engine.ready();
 	if (backend != nullptr) {
 		trace_cur_.set(ScopeColumn::ToldX, params.jitter_x);
 		trace_cur_.set(ScopeColumn::ToldY, params.jitter_y);
@@ -630,8 +654,7 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 			inputs.depth_provider == DepthProvider::Normalized ? inputs.engine.depth : nullptr,
 			inputs.engine.depth_state, std::move(info));
 	};
-	if (game_scale_.active && (backend == &vsr11_ || backend == &fsr11_ ||
-			(remote_.ready() && runs_remote(backend))))
+	if (game_scale_.active && (backend == &vsr11_ || backend == &fsr11_))
 		backend = nullptr;
 	if (remote_.ready() && runs_remote(backend)) {
 		if (capturing)
@@ -639,8 +662,20 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		if (scope)
 			upscaler_capture_.scope_copy(ScopePlane::UpscalerIn, inputs.engine.device, inputs.engine.cmd,
 				inputs.engine.color, inputs.engine.color_state);
-		run_remote_engine_work(runtime, inputs, plan, backend, params,
-			sizeof(void *) != 4 && !engine_route_now().all_in_host);
+		const bool neural_here = sizeof(void *) != 4 && !engine_route_now().neural_in_host;
+		if (plan.neural.run && !neural_here && hud_detected_ && !interface_restored_ && !game_scale_.active) {
+			FramePlan upscale_only = plan;
+			upscale_only.neural.run = false;
+			const bool upscaled = run_remote_engine_work(runtime, inputs, upscale_only, backend, params, false);
+			if (!scope_list_lost_) {
+				const FrameInputs &shown = game_scale_.active && game_scale_.done ? game_scale_shown_ : inputs;
+				restore_interface(shown);
+				engine_journal_note(L"neural pass");
+				run_remote_engine_work(runtime, shown, plan, nullptr, UpscalerParams{}, false, upscaled);
+			}
+		} else {
+			run_remote_engine_work(runtime, inputs, plan, backend, params, neural_here);
+		}
 		stage_times_.cancel(upscaler_stage);
 		stage_times_.cancel(StageTimings::Stage::Total);
 		stage_times_.note_remote_frame();
@@ -668,7 +703,14 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 	if (scope && backend != nullptr)
 		upscaler_capture_.scope_copy(ScopePlane::UpscalerIn, inputs.engine.device, inputs.engine.cmd,
 			inputs.engine.color, inputs.engine.color_state);
+	vsr11_.list_lost = false;
 	const bool ran = backend != nullptr && backend->run(runtime, inputs, params);
+	if (vsr11_.list_lost) {
+		hud_detected_ = false;
+		scope_list_lost_ = true;
+		stage_times_.abandon_frame();
+		return;
+	}
 	stage_times_.end(upscaler_stage, inputs.engine.cmd);
 	trace_cur_.set(ScopeColumn::Ran, ran ? 1.0 : 0.0);
 	if (game_scale_.active) {
@@ -689,26 +731,30 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 		jitter_.note_waiting();
 	float depth_u = 0.0f, depth_v = 0.0f;
 	jitter_.depth_uv(&depth_u, &depth_v);
+	if (plan.neural.run && remote_.ready()) {
+		const EngineRoute r = engine_route_now();
+		if (neural_crosses_alone(r, backend)) {
+			restore_interface(shown);
+			engine_journal_note(L"neural pass");
+			run_remote_engine_work(runtime, shown, plan, nullptr, UpscalerParams{}, false, ran);
+			stage_times_.cancel(StageTimings::Stage::Total);
+			stage_times_.note_remote_frame();
+			if (scope_list_lost_)
+				stage_times_.abandon_frame();
+			return;
+		}
+	}
 	restore_interface(shown);
 	engine_journal_note(L"neural pass");
 	const StageScope neural_time(stage_times_, StageTimings::Stage::Neural, shown);
 	run_neural_render(runtime, shown, plan.neural, depth_u, depth_v);
 }
 
-void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
+bool App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const FrameInputs &inputs,
 	const FramePlan &plan, UpscalerBackend *backend, const UpscalerParams &params,
-	bool neural_here)
+	bool neural_here, bool upscaled_here)
 {
 	const BackendChoice choice = choice_of(backend);
-	if (choice == BackendChoice::Vsr) {
-		if (backend != nullptr) {
-			backend->status = UpscalerStatus::UnsupportedApi;
-			backend->last_error = L"RTX VSR is a Direct3D 11 feature of the game's own device, "
-				L"so it cannot run in the helper process this game needs. Pick DLSS, FSR or XeSS.";
-		}
-		neural_last_ = 0;
-		return;
-	}
 
 	RemoteEngine::Request rq;
 	rq.inputs = &inputs;
@@ -720,10 +766,15 @@ void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 	rq.neural = plan.neural.params;
 	rq.guide = reinterpret_cast<ID3D12Resource *>(static_cast<uintptr_t>(params.bias_mask));
 	jitter_.drawn_uv(&rq.depth_jitter_u, &rq.depth_jitter_v);
+	rq.upscaled_here = upscaled_here;
+	remote_extras_.fsr_provider = settings_.fsr_provider;
+	rq.extras = remote_extras_;
 
 	RemoteEngine::Reply rp;
 	(void)remote_.run(engine_, rq, rp);
 	const bool ok = rp.step == remote::RemoteStep::Ok;
+	if (rp.info.valid)
+		remote_info_ = rp.info;
 	{
 		FlightRecord &fr = flight_.cur();
 		fr.host = rp.host_busy ? FlightHost::Busy
@@ -738,7 +789,8 @@ void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 		scope_list_lost_ = true;
 	}
 	const bool host_ran = ok && rp.backend_ran == choice && rp.upscaler_status == UpscalerStatus::Ready;
-	trace_cur_.set(ScopeColumn::Ran, host_ran ? 1.0 : 0.0);
+	if (!upscaled_here)
+		trace_cur_.set(ScopeColumn::Ran, host_ran ? 1.0 : 0.0);
 	if (host_ran && rp.list_recording && upscaler_capture_.scope_recording())
 		upscaler_capture_.scope_copy(ScopePlane::Upscaled, inputs.engine.device, inputs.engine.cmd, inputs.engine.color,
 			inputs.engine.color_state);
@@ -771,17 +823,23 @@ void App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 		neural12_.timer.last_ms = rp.neural_gpu_ms;
 	}
 
-	if (rp.step == remote::RemoteStep::Lost)
+	if (rp.step == remote::RemoteStep::Lost) {
 		remote_tried_ = false;
+		remote_info_ = RemoteEngine::Info{};
+	}
 
 	if (ok && rp.backend_ran == choice && rp.upscaler_status == UpscalerStatus::Ready)
 		jitter_.note_upscaled();
+	if (game_scale_.active && !upscaled_here)
+		game_scale_.done = host_ran && rp.list_recording;
 	if (!neural_here)
-		return;
-	restore_interface(inputs);
+		return host_ran;
+	const FrameInputs &shown = game_scale_.active && game_scale_.done ? game_scale_shown_ : inputs;
+	restore_interface(shown);
 	float depth_u = 0.0f, depth_v = 0.0f;
 	jitter_.depth_uv(&depth_u, &depth_v);
-	run_neural_render(runtime, inputs, plan.neural, depth_u, depth_v);
+	run_neural_render(runtime, shown, plan.neural, depth_u, depth_v);
+	return host_ran;
 }
 
 bool App::remote_wanted() const noexcept
@@ -789,7 +847,7 @@ bool App::remote_wanted() const noexcept
 	if constexpr (sizeof(void *) == 4)
 		return true;
 	const EngineRoute r = engine_route_now();
-	return r.dlss_in_host || r.all_in_host;
+	return r.dlss_in_host || r.all_in_host || r.neural_in_host;
 }
 
 EngineRoute App::engine_route_now() const noexcept
@@ -800,7 +858,46 @@ EngineRoute App::engine_route_now() const noexcept
 		settings_.enabled && (b == static_cast<unsigned>(BackendChoice::Dlss) ||
 			b == static_cast<unsigned>(BackendChoice::Fsr) || b == static_cast<unsigned>(BackendChoice::Xess)),
 		settings_.neural_render && gpu_.may_be_nvidia());
-	return with_ngx_override(r, dlss_override());
+	return with_layer_dlss(with_ngx_override(r, dlss_override()), !layer_dlss_path().empty(), game_dlss_for_layer(),
+		settings_.enabled && b == static_cast<unsigned>(BackendChoice::Dlss),
+		settings_.neural_render && gpu_.may_be_nvidia());
+}
+
+bool App::game_dlss_for_layer() const noexcept
+{
+	if (!layer_dlss_started_)
+		return native_dlss_seen_;
+	return native_before_layer_ || native_dlss_.game_marker;
+}
+
+const std::wstring &App::layer_dlss_path() const noexcept
+{
+	static const std::wstring none;
+	if constexpr (sizeof(void *) == 4)
+		return none;
+	return settings_.optiscaler_upscale ? ngx_layer_table_ : none;
+}
+
+void App::sync_dlss_layer()
+{
+	if constexpr (sizeof(void *) == 4)
+		return;
+	const EngineRoute r = engine_route_now();
+	const std::wstring want = r.dlss_to_layer ? layer_dlss_path() : std::wstring();
+	if (!want.empty() && !layer_dlss_started_) {
+		layer_dlss_started_ = true;
+		native_before_layer_ = native_dlss_seen_;
+	}
+	if (want == ngx12_.layer_path)
+		return;
+	dlss12_.shutdown();
+	ngx12_.layer_path = want;
+	ngx12_.status = dlss12_.status = UpscalerStatus::Idle;
+	ngx12_.last_error.clear();
+	dlss12_.last_error.clear();
+	diag_info("dlss", want.empty()
+		? std::wstring(L"DLSS no longer goes to OptiScaler")
+		: L"DLSS goes to " + want + L" as its DLSS input; OptiScaler runs the upscaler picked in its own menu");
 }
 
 bool App::dlss_override() const noexcept
@@ -812,11 +909,20 @@ bool App::dlss_override() const noexcept
 
 bool App::runs_remote(const UpscalerBackend *backend) const noexcept
 {
-	if constexpr (sizeof(void *) == 4)
-		return true;
 	if (backend != nullptr && !crosses(backend))
 		return false;
-	return backend == static_cast<const UpscalerBackend *>(&dlss12_) || engine_route_now().all_in_host;
+	if constexpr (sizeof(void *) == 4)
+		return true;
+	const EngineRoute r = engine_route_now();
+	if (backend == nullptr)
+		return r.neural_in_host;
+	return backend == static_cast<const UpscalerBackend *>(&dlss12_) ? !r.dlss_to_layer : r.all_in_host;
+}
+
+bool App::neural_crosses_alone(const EngineRoute &r, const UpscalerBackend *backend) const noexcept
+{
+	return neural_alone_after_local(r, backend != nullptr && !runs_remote(backend) &&
+		backend != static_cast<const UpscalerBackend *>(&fsr11_) && backend != static_cast<const UpscalerBackend *>(&dlss11_));
 }
 
 bool App::must_run_in_host(const UpscalerBackend *backend) const noexcept
@@ -824,7 +930,8 @@ bool App::must_run_in_host(const UpscalerBackend *backend) const noexcept
 	if (backend == nullptr || !crosses(backend))
 		return false;
 	if constexpr (sizeof(void *) == 4)
-		return backend == static_cast<const UpscalerBackend *>(&dlss12_);
+		return backend == static_cast<const UpscalerBackend *>(&dlss12_) ||
+			backend == static_cast<const UpscalerBackend *>(&vsr11_);
 	const EngineRoute r = engine_route_now();
 	return backend == static_cast<const UpscalerBackend *>(&dlss12_) ? r.dlss_in_host : r.all_in_host;
 }
@@ -836,6 +943,10 @@ bool App::upscaler_layer_seen() const noexcept
 
 bool App::crosses(const UpscalerBackend *backend) const noexcept
 {
+	if constexpr (sizeof(void *) == 4) {
+		if (backend == static_cast<const UpscalerBackend *>(&vsr11_))
+			return true;
+	}
 	return backend == static_cast<const UpscalerBackend *>(&dlss12_) ||
 		backend == static_cast<const UpscalerBackend *>(&fsr12_) ||
 		backend == static_cast<const UpscalerBackend *>(&xess12_);
@@ -846,6 +957,7 @@ void App::ensure_remote()
 	if (!remote_wanted()) {
 		if (remote_.ready()) {
 			remote_.stop();
+			remote_info_ = RemoteEngine::Info{};
 			diag_info("remote", L"the engine host was closed, nothing here needs it any more");
 		}
 		remote_tried_ = false;
@@ -893,11 +1005,21 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 		return;
 	if (!inputs.engine.ready() || neural12_.crashed)
 		return;
-	if (sizeof(void *) != 4 && engine_route_now().all_in_host) {
-		if (active_ != nullptr && !crosses(active_))
+	const EngineRoute route = engine_route_now();
+	if (sizeof(void *) != 4 && route.dlss_to_layer && route.neural_in_host) {
+		if (remote_tried_ && !remote_.ready())
+			neural12_.set_status(UpscalerStatus::InitFailed, L"OptiScaler does the upscale in this game, so DLSS "
+				L"neural rendering runs in AeonSRHost.exe, which did not start: " + remote_.last_error);
+		else
+			neural12_.set_status(UpscalerStatus::Loading, L"OptiScaler does the upscale in this game, so DLSS "
+				L"neural rendering runs in AeonSRHost.exe, which is starting");
+		return;
+	}
+	if (sizeof(void *) != 4 && route.all_in_host) {
+		if (active_ != nullptr && !crosses(active_) && active_ != static_cast<const UpscalerBackend *>(&vsr11_))
 			neural12_.set_status(UpscalerStatus::InitFailed, L"another program answers DLSS calls in this game, so "
-				L"DLSS neural rendering runs in AeonSRHost.exe, after an upscaler that runs there: DLSS, FSR or XeSS. "
-				L"The upscaler running now runs in the game.");
+				L"DLSS neural rendering runs in AeonSRHost.exe, after an upscaler that runs there or RTX VSR: DLSS, FSR, "
+				L"XeSS or RTX VSR. The upscaler running now writes the game's own texture.");
 		else if (remote_tried_ && !remote_.ready())
 			neural12_.set_status(UpscalerStatus::InitFailed, L"another program answers DLSS calls in this game, so "
 				L"DLSS neural rendering runs in AeonSRHost.exe, which did not start: " + remote_.last_error);
@@ -1068,12 +1190,14 @@ const char *api_label(reshade::api::device_api api) noexcept
 
 void App::update_ngx_layers()
 {
-	if (!ngx_layers_.empty())
+	if (!ngx_layers_.empty() && (!ngx_layer_table_.empty() || ngx_layers_rescans_ >= 30))
 		return;
 	const ULONGLONG now = GetTickCount64();
 	if (ngx_layers_scanned_ms_ != 0 && now - ngx_layers_scanned_ms_ < 1000)
 		return;
 	ngx_layers_scanned_ms_ = now;
+	if (!ngx_layers_.empty())
+		++ngx_layers_rescans_;
 	ngx_layers_ = scan_ngx_layers(module_);
 	if (dlss_override()) {
 		const std::wstring &own = ngx_override_path(ngx12_.addon_dir);
@@ -1084,18 +1208,27 @@ void App::update_ngx_layers()
 	std::wstring names;
 	for (const NgxLayer &l : ngx_layers_)
 		names += (names.empty() ? L"" : L", ") + ngx_layer_label(l) + L" at " + l.path;
+	for (const NgxLayer &l : ngx_layers_) {
+		const HMODULE m = l.optiscaler ? GetModuleHandleW(l.path.c_str()) : nullptr;
+		if (m != nullptr && ngx12_has_table(m)) {
+			ngx_layer_table_ = l.path;
+			break;
+		}
+	}
 	diag_state("ngx-layer", DiagLevel::Info, "aeonsr", names + L" is loaded in this game and answers upscaler "
 		L"calls in it; Aeon SR's DLSS, FSR, XeSS and DLSS neural rendering run in AeonSRHost.exe, apart from it, "
-		L"whenever they are on.");
+		L"whenever they are on, unless the panel hands the upscale to OptiScaler" +
+		std::wstring(ngx_layer_table_.empty() ? L" (none of them can take it: no NGX Direct3D 12 table)." : L"."));
 }
 
 void App::update_native_dlss()
 {
-	if (native_dlss_seen_)
+	if (native_dlss_seen_ && !(layer_dlss_started_ && !native_before_layer_))
 		return;
 	const ULONGLONG now = GetTickCount64();
-	const bool deciding = settings_.enabled && settings_.backend == static_cast<unsigned>(BackendChoice::Dlss) &&
-		!own_ngx_started();
+	const bool deciding = sizeof(void *) == 8 && settings_.enabled &&
+		settings_.backend == static_cast<unsigned>(BackendChoice::Dlss) &&
+		!own_ngx_started() && !(!ngx12_.layer_path.empty() && ngx12_.status == UpscalerStatus::InitFailed);
 	if (native_dlss_.queried && !deciding && now - native_dlss_scanned_ms_ < 1000)
 		return;
 	native_dlss_scanned_ms_ = now;
@@ -1107,7 +1240,11 @@ void App::update_native_dlss()
 	}
 	native_dlss_ = scan_native_dlss(dir.empty() ? std::wstring() : ngx_dll_path(dir));
 	native_dlss_seen_ = native_dlss_.native;
-	if (native_dlss_seen_) {
+	if (native_dlss_seen_ && layer_dlss_started_ && !game_dlss_for_layer()) {
+		diag_state("native-dlss", DiagLevel::Info, "aeonsr",
+			L"a DLSS module was loaded after Aeon SR's call went to OptiScaler, most likely OptiScaler's own to serve "
+			L"it: " + native_dlss_.source + L" from " + native_dlss_.dlss_path);
+	} else if (native_dlss_seen_) {
 		diag_state("native-dlss", DiagLevel::Info, "aeonsr",
 			L"the game runs NVIDIA's DLSS stack itself: " + native_dlss_.source + L" from " + native_dlss_.dlss_path +
 			L" (loaded: " + native_dlss_.modules + L")");
@@ -1176,6 +1313,8 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 		note_flow_state();
 		return;
 	}
+	if (depth12 != nullptr && upscaler_capture_.scope_recording())
+		upscaler_capture_.scope_copy(ScopePlane::Depth, dev12, cmd12, depth12, inputs.engine.depth_state);
 
 	game_depth_ = depth12 != nullptr;
 	if (depth12 != nullptr && settings_.spatial_jitter && !game_probe_failed_) {
@@ -1425,13 +1564,10 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 void App::publish_flow_to_game(FrameInputs &inputs, bool motion_read)
 {
 	inputs.motion_vectors = { 0 };
-	inputs.motion_confidence = { 0 };
 	inputs.global_flow = { 0 };
 
 	if (inputs.engine.native) {
 		inputs.motion_vectors = { reinterpret_cast<uintptr_t>(flow_.motion()) };
-		if (flow_.confidence() != nullptr)
-			inputs.motion_confidence = { reinterpret_cast<uintptr_t>(flow_.confidence()) };
 		if (flow_.global_flow() != nullptr)
 			inputs.global_flow = { reinterpret_cast<uintptr_t>(flow_.global_flow()) };
 		return;
@@ -2192,8 +2328,14 @@ void App::latency_apply(unsigned int mode, reshade::api::swapchain *swapchain)
 	reshade::api::device *const sdev = swapchain != nullptr ? swapchain->get_device() : nullptr;
 	if (sdev != nullptr && sdev->get_api() == reshade::api::device_api::vulkan)
 		mode = 0u;
-	if (mode == 2u && sizeof(void *) == 4 && sdev != nullptr && sdev->get_api() != reshade::api::device_api::d3d11 &&
-		sdev->get_api() != reshade::api::device_api::d3d12) {
+	static const int reflex32 = [] {
+		char v[16] = {};
+		const DWORD n = GetEnvironmentVariableA("AEONSR_REFLEX_32", v, sizeof(v));
+		return n == 0 || n >= sizeof(v) ? 0 : std::strcmp(v, "engine") == 0 ? 1 : std::strcmp(v, "plain") == 0 ? 2 : 0;
+	}();
+	const int reflex32_here = sizeof(void *) == 4 ? reflex32 : 0;
+	if (mode == 2u && sizeof(void *) == 4 && reflex32_here == 0 && sdev != nullptr &&
+		sdev->get_api() != reshade::api::device_api::d3d11 && sdev->get_api() != reshade::api::device_api::d3d12) {
 		if (!reflex_waiting_said_) {
 			reflex_waiting_said_ = true;
 			diag_info("latency", L"low latency: on a 32-bit game Reflex would run on the add-on's own device on this API, "
@@ -2240,7 +2382,7 @@ void App::latency_apply(unsigned int mode, reshade::api::swapchain *swapchain)
 			return;
 		}
 		if (!reflex_.attach(device, 0u, device == static_cast<IUnknown *>(engine_.device()) &&
-				!(api == reshade::api::device_api::d3d12))) {
+				!(api == reshade::api::device_api::d3d12) && reflex32_here != 2)) {
 			reflex_refused_ = true;
 			diag_logf(DiagLevel::Warn, "latency", L"low latency: %ls; AeonSR's own low latency instead",
 				reflex_.why().c_str());
@@ -2897,6 +3039,10 @@ void App::run_frame(
 
 	if (!settings_.neural_render) {
 		neural12_.accum.stop();
+		if (remote_extras_.accum_target != 0) {
+			++remote_extras_.accum_epoch;
+			remote_extras_.accum_target = 0;
+		}
 	}
 
 	if (!settings_.enabled && !settings_.neural_render)
@@ -3104,17 +3250,21 @@ void App::run_frame(
 	UpscalerBackend *fsr = &fsr12_;
 	UpscalerBackend *const xess = &xess12_;
 	UpscalerBackend *const vsr = &vsr11_;
-	const bool vsr_possible = (api == reshade::api::device_api::d3d11);
+	const bool vsr_possible = engine_.ready();
 
 	const bool nv = gpu_.may_be_nvidia();
-	const bool dlss_ok = nv || dlss_override();
+	sync_dlss_layer();
+	const bool dlss_ok = nv || dlss_override() || (!layer_dlss_path().empty() && !game_dlss_for_layer());
 	BackendSlots slots;
 	slots.is_d3d12 = is12;
 	slots.vendor = gpu_.vendor;
 
-	slots.vsr = nv
-		? BackendAvailability{ vsr_possible && vsr->runtime_present(), vsr->crashed, vsr->status }
-		: BackendAvailability{ false, false, UpscalerStatus::UnsupportedGpu };
+	if (nv && vsr_possible) {
+		slots.vsr = availability_of(vsr, BackendChoice::Vsr);
+	} else {
+		slots.vsr = BackendAvailability{ false, false,
+			nv ? UpscalerStatus::UnsupportedApi : UpscalerStatus::UnsupportedGpu };
+	}
 	const float frame_time_ms = clock_.frame_time_ms();
 	if (inputs.have_motion_vectors) {
 		slots.dlss = dlss_ok
@@ -3260,23 +3410,19 @@ bool App::game_scale_backend_takes() const noexcept
 {
 	if (settings_.backend == static_cast<unsigned>(BackendChoice::Vsr))
 		return false;
-	if (active_ == &fsr11_ || active_ == &vsr11_)
-		return false;
-	return !(active_ != nullptr && remote_.ready() && runs_remote(active_));
+	return !(active_ == &fsr11_ || active_ == &vsr11_);
 }
 
 void App::update_game_scale_hooks()
 {
-	const bool want = settings_.game_render_scale || game_integrated();
+	const bool want = game_integrated();
 	if (want && !game_scale_hooks_) {
 		game_scale_hooks_ = true;
 		register_game_render_scale([this](const GameScaleStretch &s) { return run_game_scale(s); });
-		diag_info("scale", game_integrated()
-			? L"render scale: the game's stretch is taken over (the game's integration sets its render scale)"
-			: L"render scale: watching for the game's own (Use the game's render scale is on)");
+		diag_info("scale", L"render scale: the game's stretch is taken over (the game's integration sets its render scale)");
 	}
 	set_game_render_scale_enabled(want);
-	set_game_render_scale_full(game_integrated() ? game_->routes_full_size() : settings_.game_render_scale);
+	set_game_render_scale_full(want && game_->routes_full_size());
 }
 
 void App::drive_game_scale(bool stretch_ran)
@@ -3327,8 +3473,7 @@ void App::drive_game_scale(bool stretch_ran)
 
 bool App::run_game_scale(const GameScaleStretch &s)
 {
-	if (game_scale_.active || game_scale_.attempted || s.cmd == nullptr ||
-		!(settings_.game_render_scale || game_integrated()) ||
+	if (game_scale_.active || game_scale_.attempted || s.cmd == nullptr || !game_integrated() ||
 		!settings_.enabled || settings_.backend == static_cast<unsigned>(BackendChoice::None) ||
 		!game_scale_backend_takes())
 		return false;
@@ -3553,7 +3698,7 @@ PanelState App::panel_state(bool for_overlay)
 		const bool api_ok = last_api_ == reshade::api::device_api::d3d10 || last_api_ == reshade::api::device_api::d3d11;
 		s.game_scale_verdict = game_scale_verdict(settings_.game_render_scale, api_ok, g, game_scale_watch_);
 	}
-	if (settings_.game_render_scale || game_integrated()) {
+	if (game_integrated()) {
 		const GameScaleState g = game_render_scale_state();
 		if (g.replaced != 0 && g.found_frame + 90u >= g.presents) {
 			s.game_scale_render_w = g.render_w;
@@ -3572,7 +3717,7 @@ PanelState App::panel_state(bool for_overlay)
 	}
 	s.log_path = diag_log_path();
 
-	s.native_dlss = native_dlss_seen_;
+	s.native_dlss = game_dlss_for_layer();
 	s.native_dlss_modules = native_dlss_.source;
 	s.ngx_layer.clear();
 	for (const NgxLayer &l : ngx_layers_)
@@ -3582,9 +3727,15 @@ PanelState App::panel_state(bool for_overlay)
 	{
 		const EngineRoute r = engine_route_now();
 		s.ngx_layer_relevant = sizeof(void *) != 4 && upscaler_layer_seen() && (r.all_in_host || r.dlss_in_host);
+		s.optiscaler_offered = sizeof(void *) != 4 && !ngx_layer_table_.empty();
+		s.dlss_without_layer = gpu_.may_be_nvidia() || dlss_override();
+		s.optiscaler_upscales = r.dlss_to_layer;
+		s.optiscaler_held = PanelState::OptiscalerHeld::No;
+		if (s.optiscaler_offered && settings_.optiscaler_upscale && !r.dlss_to_layer)
+			s.optiscaler_held = !settings_.enabled || settings_.backend != static_cast<unsigned>(BackendChoice::Dlss)
+				? PanelState::OptiscalerHeld::PickDlss : PanelState::OptiscalerHeld::GameDlss;
 	}
 	s.gpu_vendor = gpu_.vendor;
-	s.gpu_vendor_id = gpu_.vendor_id;
 	s.gpu_name = gpu_.name;
 	s.active_name = active_ != nullptr ? active_->name() : nullptr;
 	s.active_status = active_status();
@@ -3600,8 +3751,6 @@ PanelState App::panel_state(bool for_overlay)
 	s.api_name = api_label(last_api_);
 	s.bridge_any_ready = bridge_ != nullptr && bridge_->ready();
 	s.bridge_fsr_adapter_matched = engine_.adapter_matched();
-	s.active_on12 = bridge_ != nullptr && bridge_->kind() != BridgeKind::Native12;
-	s.vsr_possible = last_api_ == reshade::api::device_api::d3d11;
 
 	const bool probe = for_overlay || settings_.debug_info;
 	const bool fsr_is_11 = active_ == static_cast<const UpscalerBackend *>(&fsr11_);
@@ -3614,8 +3763,6 @@ PanelState App::panel_state(bool for_overlay)
 		s.upscaler_out_height = fsr_is_11 ? fsr11_.out_height() : fsr12_.out_height();
 		s.upscaler_render_width = fsr_is_11 ? fsr11_.fsr_render_width() : fsr12_.fsr_render_width();
 		s.upscaler_render_height = fsr_is_11 ? fsr11_.fsr_render_height() : fsr12_.fsr_render_height();
-		s.upscaler_bridge_ready = s.bridge_any_ready;
-		s.upscaler_bridge_adapter_matched = engine_.adapter_matched();
 
 		if (!fsr_is_11) {
 			if (!fsr12_.fsr_loading()) {
@@ -3623,17 +3770,6 @@ PanelState App::panel_state(bool for_overlay)
 				for (const auto &pv : fsr12_.providers)
 					s.fsr_providers.push_back(pv.name);
 			}
-		} else if (for_overlay) {
-			s.fsr_dx12_dlls_present = false;
-			for (const std::wstring &p : runtime_candidates(
-					fsr_search_dirs(module_directory(module_), exe_directory_w()),
-					L"amd_fidelityfx_upscaler_dx12.dll")) {
-				if (file_exists_w(p)) {
-					s.fsr_dx12_dlls_present = true;
-					break;
-				}
-			}
-			s.fsr11_loaded_dll_name = fsr11_.loaded_dll_name;
 		}
 	} else if (s.active_is_xess) {
 		UpscalerBackend &xess = xess12_;
@@ -3643,20 +3779,27 @@ PanelState App::panel_state(bool for_overlay)
 		s.upscaler_out_height = xess12_.out_height();
 		s.upscaler_render_width = xess12_.xess_render_width();
 		s.upscaler_render_height = xess12_.xess_render_height();
-		s.upscaler_bridge_ready = s.bridge_any_ready;
 	} else if (s.active_is_vsr) {
-
-		s.upscaler_dll_present = !d3d12;
-		s.upscaler_initialized = vsr11_.vsr_initialized();
-		s.upscaler_out_width = vsr11_.out_width();
-		s.upscaler_out_height = vsr11_.out_height();
-		s.upscaler_render_width = vsr11_.vsr_render_width();
-		s.upscaler_render_height = vsr11_.vsr_render_height();
-		const VsrProcessorStatus &v = vsr11_.vsr_status();
-		s.vsr_capable = v.capable;
-		s.vsr_enabled = v.enabled;
-		s.vsr_in_use = v.in_use;
-		s.vsr_level = v.level;
+		s.upscaler_dll_present = true;
+		if (remote_.ready() && runs_remote(active_)) {
+			const uint32_t v = remote_info_.vsr_status;
+			s.upscaler_initialized = (v & remote::kVsrQueried) != 0;
+			s.vsr_capable = (v & remote::kVsrCapable) != 0;
+			s.vsr_enabled = (v & remote::kVsrEnabled) != 0;
+			s.vsr_in_use = (v & remote::kVsrInUse) != 0;
+			s.vsr_level = (v >> 8) & 0xFFu;
+		} else {
+			s.upscaler_initialized = vsr11_.vsr_initialized();
+			s.upscaler_out_width = vsr11_.out_width();
+			s.upscaler_out_height = vsr11_.out_height();
+			s.upscaler_render_width = vsr11_.vsr_render_width();
+			s.upscaler_render_height = vsr11_.vsr_render_height();
+			const VsrProcessorStatus &v = vsr11_.vsr_status();
+			s.vsr_capable = v.capable;
+			s.vsr_enabled = v.enabled;
+			s.vsr_in_use = v.in_use;
+			s.vsr_level = v.level;
+		}
 	}
 
 	const NgxSession &session = active_ == static_cast<const UpscalerBackend *>(&dlss11_)
@@ -3710,7 +3853,6 @@ PanelState App::panel_state(bool for_overlay)
 		s.neural_eval_count = nr.eval_count;
 		s.neural_last = neural_last_;
 		s.neural_init_failed = neural_init_failed_;
-		s.neural_via_bridge = last_api_ == reshade::api::device_api::d3d11;
 		s.neural_color_space = color_space_;
 		const NeuralRenderD3D12 &nr12 = neural12_;
 		s.neural_model_width = nr12.model_width;
@@ -3740,7 +3882,6 @@ PanelState App::panel_state(bool for_overlay)
 	for (const std::string &name : depth_resolved_.overridden)
 		s.depth_overridden += (s.depth_overridden.empty() ? "" : ", ") + name;
 	s.have_global_flow = last_inputs_.have_global_flow;
-	s.have_motion_confidence = last_inputs_.have_motion_confidence;
 	s.color_info = last_inputs_.color_info;
 	s.motion_info = last_inputs_.motion_info;
 	s.depth_info = last_inputs_.depth_info;
@@ -3752,7 +3893,6 @@ PanelState App::panel_state(bool for_overlay)
 	s.probe_max_px = probes_.mv.max_px;
 	s.scene_state = last_plan_.scene_state;
 	s.reset_this_frame = last_plan_.params.reset;
-	s.camera_cut = last_plan_.camera_cut;
 	s.frame_time_ms = last_plan_.params.frame_time_ms;
 	s.jitter_active = last_plan_.jitter_active;
 	s.jitter_refused = dlss11_.rt != nullptr && dlss11_.rt->jitter_failed;
@@ -3844,6 +3984,61 @@ PanelState App::panel_state(bool for_overlay)
 		s.upscaler_dll_present = true;
 	}
 
+	if (s.host_ready && active_ != nullptr && runs_remote(active_)) {
+		if (remote_out_width_ != 0) {
+			s.upscaler_out_width = remote_out_width_;
+			s.upscaler_out_height = remote_out_height_;
+		}
+		if (remote_in_width_ != 0) {
+			s.upscaler_render_width = remote_in_width_;
+			s.upscaler_render_height = remote_in_height_;
+		}
+		if (remote_info_.valid && active_ == static_cast<const UpscalerBackend *>(&fsr12_)) {
+			s.fsr_providers = remote_info_.fsr_providers;
+			s.fsr_provider_version = remote_info_.fsr_provider_version;
+		}
+	}
+	if (remote_info_.valid && neural_remote_now()) {
+		const RemoteEngine::Info &i = remote_info_;
+		const auto has = [&](uint32_t bit) { return (i.neural_flags & bit) != 0; };
+		s.neural_dll_present = has(remote::kNeuralDllPresent);
+		s.neural_shim_present = has(remote::kNeuralShimPresent);
+		s.neural_dll_found = s.neural_dll_present && s.neural_shim_present;
+		s.neural_initialized = has(remote::kNeuralInitialized);
+		s.neural_crashed = has(remote::kNeuralCrashed);
+		s.neural_driver_too_old = has(remote::kNeuralDriverTooOld);
+		s.neural_adapter_unsupported = has(remote::kNeuralAdapterUnsupported);
+		s.neural_feature_unsupported = has(remote::kNeuralFeatureUnsupported);
+		s.neural_runtime_serves_card = has(remote::kNeuralServesCard);
+		s.neural_requirement_known = has(remote::kNeuralRequirementKnown);
+		s.neural_init_failed = s.neural_init_failed || has(remote::kNeuralInitFailed);
+		s.neural_driver_major = i.neural_driver_major;
+		s.neural_driver_minor = i.neural_driver_minor;
+		s.neural_required_driver_major = i.neural_required_major;
+		s.neural_required_driver_minor = i.neural_required_minor;
+		s.neural_min_architecture = i.neural_min_architecture;
+		s.neural_gpu_architecture = i.neural_card_architecture;
+		s.neural_allgpu_build_targets = neural_allgpu_build_targets(i.neural_card_architecture);
+		s.neural_runtime_minimum = i.neural_runtime_minimum;
+		s.neural_reported_architecture = i.neural_reported_architecture;
+		s.neural_eval_count = i.neural_eval_count;
+		if (has(remote::kNeuralTargetsKnown)) {
+			s.neural_runtime_kernels = i.neural_runtime_kernels;
+			s.neural_runtime_cards = i.neural_runtime_cards;
+			s.neural_runtime_file = i.neural_runtime_file;
+			s.neural_runtime_version = i.neural_runtime_version;
+			s.neural_runtime_certificate = has(remote::kNeuralCertificate);
+			s.neural_runtime_sha256 = i.neural_runtime_sha256;
+		}
+		s.neural_area_share = i.neural_area_share;
+		if (!i.neural_capture_status.empty())
+			s.neural_capture_status = i.neural_capture_status;
+		s.accum_running = i.accum_running;
+		s.accum_holding = i.accum_holding;
+		s.accum_done = i.accum_done;
+		s.accum_target = i.accum_target;
+	}
+
 	if (s.upscalers_remote && s.host_ready) {
 		s.host_pid = remote_.host_pid();
 		const bool neural_there = remote_.neural_present();
@@ -3860,14 +4055,12 @@ PanelState App::panel_state(bool for_overlay)
 			s.upscaler_dll_present = remote_.backend_present(BackendChoice::Fsr);
 		else if (s.active_is_xess)
 			s.upscaler_dll_present = remote_.backend_present(BackendChoice::Xess);
-		if (remote_out_width_ != 0) {
-			s.upscaler_out_width = remote_out_width_;
-			s.upscaler_out_height = remote_out_height_;
-		}
 	}
 
 	s.upscaler_label = upscaler_display_name(s.active_name, s.active_is_fsr,
 		diag_narrow(s.fsr_provider_version));
+	if (s.optiscaler_upscales && s.active_is_dlss)
+		s.upscaler_label = "OptiScaler (DLSS input)";
 #if AEONSR_FRAME_GENERATION
 	s.framegen = framegen_.readout();
 #endif
@@ -3883,6 +4076,8 @@ void App::apply_panel_actions(const PanelActions &actions)
 
 	if (actions.accum_start || actions.accum_stop) {
 		NeuralRenderD3D12 &nr = neural12_;
+		++remote_extras_.accum_epoch;
+		remote_extras_.accum_target = actions.accum_start ? clamp_accum_iterations(settings_.accum_iterations) : 0u;
 		if (actions.accum_start) {
 			nr.accum.start(clamp_accum_iterations(settings_.accum_iterations));
 			diag_logf(DiagLevel::Info, "neural",
@@ -3910,8 +4105,9 @@ void App::apply_panel_actions(const PanelActions &actions)
 	}
 }
 
-void App::draw_overlay(reshade::api::effect_runtime *)
+void App::draw_overlay(reshade::api::effect_runtime *runtime)
 {
+	i18n::follow_reshade(runtime);
 	neural_runtime_present();
 	const PanelState state = panel_state(true);
 	PanelActions actions;
@@ -4168,10 +4364,11 @@ void App::service_report()
 	});
 }
 
-void App::draw_osd(reshade::api::effect_runtime *)
+void App::draw_osd(reshade::api::effect_runtime *runtime)
 {
 	if (!settings_.show_osd)
 		return;
+	i18n::follow_reshade(runtime);
 	panel::draw_osd(panel_state(false), settings_);
 }
 

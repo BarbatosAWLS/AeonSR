@@ -20,27 +20,31 @@ Author: **Barbatos AWLS**
 - **Sub-pixel jitter** drawn into the game's own rendering
 - **Every graphics API**: DirectX 8, 9, 10, 11 and 12, OpenGL and Vulkan
 - **32-bit and 64-bit games**
+- **The panel in your language**: it follows the language chosen in ReShade, in all
+  sixteen languages ReShade offers
 - **Frame generation** (experimental): Aeon SR's own generator, AMD FSR, Intel XeSS or
   NVIDIA DLSS Frame Generation, shown in a window of its own over the game
 - **Low latency**: Aeon SR's own mode or NVIDIA Reflex, on every graphics API
 - **Even frame pacing** for games that run faster than the screen
 - **The game's own render scale**, used for real in DirectX 10 and 11 games that have one
 - **DLSS Neural Rendering** as an optional pass, with a runtime you supply
-- **RTX Video Super Resolution** as an experiment: a spatial upscaler for
-  DirectX 11 games that rarely improves on the temporal ones
+- **Let OptiScaler upscale**: with OptiScaler in a 64-bit game, Aeon SR's DLSS call
+  can go to OptiScaler, which runs the upscaler picked in its own menu
+- **RTX Video Super Resolution** as an experiment: a spatial upscaler, on every
+  graphics API, that rarely improves on the temporal ones
 
 ## Download
 
 Ready-to-install packages are on the [Releases](../../releases) page. Each one
-holds the add-on, `AeonSR.addonfx`, `AeonSRHost.exe`, `ngxshim\`, `runtime\` with the vendor DLLs
-listed below, and `Licenses\` with every vendor's licence.
+holds the add-on, `AeonSR.addonfx`, `AeonSRHost.exe`, `AeonSRPrebuild.exe`, `ngxshim\`, `runtime\`
+with the vendor DLLs listed below, and `Licenses\` with every vendor's licence.
 
 ## Installing
 
 1. Install ReShade **with add-on support** for the game.
 2. Copy the add-on (`AeonSR.addon64`, or `AeonSR.addon32` for a 32-bit game),
-   `AeonSR.addonfx`, `AeonSRHost.exe`, `ngxshim\` and `runtime\` next to the game's
-   executable.
+   `AeonSR.addonfx`, `AeonSRHost.exe`, `AeonSRPrebuild.exe`, `ngxshim\` and `runtime\`
+   next to the game's executable.
 3. Open the ReShade overlay and configure Aeon SR in its Add-ons tab.
 
 Do not use Aeon SR in games protected by anti-cheat.
@@ -50,7 +54,9 @@ Do not use Aeon SR in games protected by anti-cheat.
 Aeon SR drives the vendors' own runtime DLLs. They are not part of Aeon SR and
 keep their own licences (see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
 None of them is committed to this repository: each vendor SDK is a git submodule
-pinned to an official release, and the build copies the DLLs from there.
+pinned to an official release, and the build copies the DLLs from there. Microsoft's
+Direct3D 12 core comes from its NuGet package through `tools/fetch_agility_sdk.ps1`
+(see [Building](#building)).
 
 | Runtime | File | Source | In the release package |
 | --- | --- | --- | --- |
@@ -60,6 +66,7 @@ pinned to an official release, and the build copies the DLLs from there.
 | NVIDIA DLSS Frame Generation | `nvngx_dlssg.dll` | [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) v310.9.1 | yes |
 | AMD FSR Frame Generation | `amd_fidelityfx_framegeneration_dx12.dll` | [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) v2.3.0, AMD-signed | yes |
 | Intel XeSS Frame Generation | `libxess_fg.dll`, `libxell.dll` | [Intel XeSS SDK](https://github.com/intel/xess) v3.0.2 | yes |
+| Microsoft Direct3D 12 Agility SDK core | `D3D12Core.dll` | [Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.0) 1.619.0, Microsoft-signed | yes |
 | NVIDIA DLSS Neural Rendering | `nvngx_dlssnr.dll` | none official | **no**, see below |
 
 ### DLSS Neural Rendering
@@ -122,10 +129,14 @@ flowchart TB
   interface can still shake with the jitter.
 - **32-bit games.** The vendor runtimes are 64-bit only. `AeonSR.addon32` hands
   the frame to `AeonSRHost.exe`, a 64-bit process that holds the engine and runs
-  DLSS, FSR and XeSS.
-- **RTX Video Super Resolution** is an experiment. It runs through NVAPI on the
-  game's own Direct3D 11 device, needs no motion vectors and, being spatial,
-  rarely improves on DLSS, FSR and XeSS.
+  DLSS, FSR, XeSS, RTX VSR, DLSS Neural Rendering and the vendors' frame generation.
+- **RTX Video Super Resolution** is an experiment. It runs on a Direct3D 11 device
+  of the add-on's own, so it works on every graphics API, needs no motion vectors
+  and, being spatial, rarely improves on DLSS, FSR and XeSS.
+- **`runtime\D3D12Core.dll`** is Microsoft's Direct3D 12 Agility SDK core. FSR 4
+  needs Shader Model 6.6, which the core Windows 10 ships does not offer, so where
+  the system's core lacks it the engine device is made on this one instead
+  ([docs/agility-core.md](docs/agility-core.md)). Windows 11 keeps its own core.
 - **`ngxshim\nvngx.dll`** is a small forwarder through which the add-on loads the
   DLSS Neural Rendering runtime. It sits in its own folder so it is never mistaken
   for NVIDIA's NGX core.
@@ -145,6 +156,7 @@ git clone https://github.com/BarbatosAWLS/AeonSR.git
 cd AeonSR
 git submodule update --init --depth 1
 git -C external/reshade submodule update --init --depth 1 deps/imgui deps/minhook deps/spirv
+powershell -ExecutionPolicy Bypass -File tools\fetch_agility_sdk.ps1
 cmake -S . -B build\x64 -G "Visual Studio 17 2022" -A x64
 cmake --build build\x64 --config Release
 cmake -S . -B build\x86 -G "Visual Studio 17 2022" -A Win32
@@ -155,6 +167,9 @@ The submodules under `external/` are ReShade (headers, ImGui, MinHook, the effec
 compiler), the NVIDIA DLSS SDK, the Intel XeSS SDK, the AMD FidelityFX SDK and the
 Vulkan headers. The FidelityFX API and DX11 headers, the OpenGL headers and the
 XeSS declarations the add-on compiles against are in `third_party/`.
+`tools\fetch_agility_sdk.ps1` downloads Microsoft's `D3D12Core.dll` into
+`external\D3D12Core\` and checks its signature and SHA-256; without it the build
+still succeeds, and FSR 4 is then refused on Windows 10.
 
 The x64 build produces, in `build\x64\Release\`, `AeonSR.addon64`,
 `AeonSR.addonfx`, `AeonSRHost.exe` (the 64-bit process that runs DLSS, FSR and XeSS for 32-bit
@@ -163,9 +178,7 @@ produces `AeonSR.addon32`; a 32-bit game also needs `AeonSRHost.exe` and
 `runtime\` from the x64 build next to it.
 
 `cmake --install build\x64 --config Release --prefix package` followed by the
-same for `build\x86` assembles the release layout, `Licenses\` included. The
-`Build and release` workflow does exactly that on every `v*` tag and attaches the
-zip to a GitHub release.
+same for `build\x86` assembles the release layout, `Licenses\` included.
 
 ## Source layout
 

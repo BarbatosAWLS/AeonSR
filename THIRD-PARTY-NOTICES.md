@@ -85,6 +85,24 @@ The declarations in `third_party/xess/include` are Aeon SR's own, written agains
 the public XeSS API. The XeSS Frame Generation and XeLL headers are not in this
 repository: the build reads them from the SDK submodule (`external/xess/inc`).
 
+## Microsoft Direct3D 12 Agility SDK: `D3D12Core.dll`
+
+Shipped unmodified in `runtime/` of the release packages: Microsoft's own signed
+`D3D12Core.dll`, version 1.619.0, from the NuGet package `Microsoft.Direct3D.D3D12`
+1.619.0 (<https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.0>), whose
+licence lets applications distribute it beside them. It is not committed to this
+repository: `tools/fetch_agility_sdk.ps1` downloads it into `external/D3D12Core/` and
+checks Microsoft's signature and its SHA-256. It remains under Microsoft's licence
+terms for that package
+(<https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.0/License>), not under
+the MIT licence of Aeon SR.
+
+| File | SHA-256 (first 16) |
+| --- | --- |
+| `D3D12Core.dll` | `1CABFEE659368877` |
+
+Microsoft, DirectX and Direct3D are trademarks of the Microsoft group of companies.
+
 ## ReShade
 
 Aeon SR is a ReShade add-on. ReShade (<https://github.com/crosire/reshade>, BSD

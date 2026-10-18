@@ -1,6 +1,7 @@
 #include "aeon_sr/core/panel.hpp"
 #include "aeon_sr/core/diag_report.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/i18n.hpp"
 #include "aeon_sr/core/imgui_reshade.hpp"
 #include "aeon_sr/core/panel_widgets.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
@@ -12,12 +13,29 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace aeon_sr {
 namespace panel {
 namespace {
+
+std::string build_date(const char *stamp)
+{
+	static const char *const kMonths[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+	unsigned int day = 0, year = 0;
+	char month[4]{};
+	if (stamp == nullptr || std::sscanf(stamp, "%3s %u %u", month, &day, &year) != 3)
+		return stamp != nullptr ? stamp : "";
+	for (unsigned int m = 0; m < 12; ++m)
+		if (std::strcmp(month, kMonths[m]) == 0) {
+			char out[16];
+			std::snprintf(out, sizeof(out), "%04u-%02u-%02u", year, m + 1, day);
+			return out;
+		}
+	return stamp;
+}
 
 std::string narrow_lossy(const std::wstring &ws)
 {
@@ -67,10 +85,12 @@ void hint(const char *text)
 	ui::tooltip_alpha_end();
 }
 
+void technical_hint(const std::string &tech);
+
 void note(const char *fmt, ...) IM_FMTARGS(1);
 void note(const char *fmt, ...)
 {
-	char text[1024];
+	char text[2048];
 	va_list args;
 	va_start(args, fmt);
 	std::vsnprintf(text, sizeof(text), fmt, args);
@@ -81,7 +101,7 @@ void note(const char *fmt, ...)
 void line(const char *fmt, ...) IM_FMTARGS(1);
 void line(const char *fmt, ...)
 {
-	char text[1024];
+	char text[2048];
 	va_list args;
 	va_start(args, fmt);
 	std::vsnprintf(text, sizeof(text), fmt, args);
@@ -130,14 +150,14 @@ void status_line(const ImVec4 &colour, const char *word, bool see_diagnostics)
 {
 	const float gap = ImGui::CalcTextSize(" ").x;
 	ImGui::AlignTextToFramePadding();
-	if (ImGui::CalcTextSize("Status:").x + gap + ui::pill_width(word) <= ui::avail_width()) {
-		ImGui::TextDisabled("Status:");
+	if (ImGui::CalcTextSize(TR(st_status_prefix)).x + gap + ui::pill_width(word) <= ui::avail_width()) {
+		ImGui::TextDisabled("%s", TR(st_status_prefix));
 		ImGui::SameLine(0.0f, gap);
 	}
 	ui::pill(colour, word);
 	if (!see_diagnostics)
 		return;
-	const char *pointer = "See Diagnostics";
+	const char *pointer = TR(st_see_diagnostics);
 	const float w = ImGui::CalcTextSize(pointer).x;
 	const float pill_x = ImGui::GetItemRectMin().x;
 	const float space = gap * 1.5f;
@@ -449,69 +469,67 @@ void draw_jitter_numbers(const PanelState &state, PanelActions &actions)
 void draw_quality_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	const bool idle = !upscaler_lit(state, settings);
-	ui::subsection("Image");
+	ui::subsection(TR(sub_image));
 	{
 		const ui::Dim dim(idle);
-		ui::slider_float("Sharpness", &settings.sharpness, 0.0f, 1.0f, "%.2f");
-		hint("How sharp the final image looks.");
+		ui::slider_float(TR(img_sharpness), &settings.sharpness, 0.0f, kSharpnessMax, "%.2f",
+			ImGuiSliderFlags_AlwaysClamp);
+		hint(TR(img_sharpness_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
 		if (state.active_is_dlss) {
 			constexpr ui::Brand nv = ui::Brand::Nvidia;
-			static const RowOption kPresetOptions[] = {
-				{ "Default", "Lets the driver choose", nv },
-				{ "E", "Older model", nv },
-				{ "F", "Older model", nv },
-				{ "J", "Less trailing, a little more shimmer", nv },
-				{ "K", "Recommended", nv },
-				{ "L", "Suits Ultra Performance", nv },
-				{ "M", "Suits Performance", nv },
+			const RowOption kPresetOptions[] = {
+				{ TR(opt_default), TR(img_preset_default_tip), nv },
+				{ "E", TR(img_preset_older_tip), nv },
+				{ "F", TR(img_preset_older_tip), nv },
+				{ "J", TR(img_preset_j_tip), nv },
+				{ "K", TR(img_preset_k_tip), nv },
+				{ "L", TR(img_preset_l_tip), nv },
+				{ "M", TR(img_preset_m_tip), nv },
 			};
-			if (button_row_value("DLSS preset", &settings.render_preset, kPresetOptions, kFunctionalRenderPresets,
-					"Which DLSS image model to use.", !idle)) {
+			if (button_row_value(TR(img_dlss_preset), &settings.render_preset, kPresetOptions, kFunctionalRenderPresets,
+					TR(img_dlss_preset_tip), !idle)) {
 				actions.reset = true;
 				actions.persist = true;
 			}
 		}
 	}
 
-	ui::subsection("Reconstruction");
+	ui::subsection(TR(sub_reconstruction));
 	{
 		const ui::Dim dim(idle);
-		if (ui::toggle("Sub-pixel jitter", &settings.spatial_jitter)) {
+		if (ui::toggle(TR(rec_jitter), &settings.spatial_jitter)) {
 			actions.reset = true;
 			actions.invalidate_history = true;
 			actions.persist = true;
 		}
-		hint("Improves edge quality. Leave it on unless something looks wrong.");
+		hint(TR(rec_jitter_tip));
 	}
 
 	if (settings.spatial_jitter && state.jitter_refused)
-		note("Not applied - the upscaler is running without it.");
+		note("%s", TR(rec_jitter_refused));
 	const ui::Dim dim(idle && !(settings.neural_render && state.neural_last == 1));
-	if (ui::toggle("Upscale the ReShade effects", &settings.upscale_effects)) {
+	if (ui::toggle(TR(rec_upscale_effects), &settings.upscale_effects)) {
 		actions.reset = true;
 		actions.invalidate_history = true;
 		actions.persist = true;
 	}
-	hint("Also upscales the other ReShade effects.\n"
-		"Turn it off if your sharpening or grain looks washed out.");
-	if (ui::button(ui::icon::kUndo, "Reset temporal history"))
+	hint(TR(rec_upscale_effects_tip));
+	if (ui::button(ui::icon::kUndo, TR(rec_reset_history)))
 		actions.reset = true;
-	hint("Clears what the upscaler remembers from previous frames.\n"
-		"Try this after a glitch.");
+	hint(TR(rec_reset_history_tip));
 }
 
 void draw_neural_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	ui::band_begin("##neural_band");
-	if (ui::toggle("Enable neural rendering", &settings.neural_render)) {
+	if (ui::toggle(TR(nr_enable), &settings.neural_render)) {
 		if (!settings.neural_render)
 			actions.neural_restart = true;
 		actions.persist = true;
 	}
-	hint("Adds fine detail to the finished image with NVIDIA DLSS 5.\n"
-		"Works with any upscaler, or on its own. Needs an extra runtime file.");
+	hint(TR(nr_enable_tip));
 
 	const bool nvidia = vendor_may_be_nvidia(state.gpu_vendor);
 	const bool gpu_refused = nvidia &&
@@ -522,11 +540,11 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 	const bool running = settings.neural_render && state.neural_last == 1;
 	const ImVec4 verdict = settings.neural_render ? neural_verdict_colour(state, settings) : pal.off;
 	const bool failed = verdict.x == pal.fail.x && verdict.y == pal.fail.y && verdict.z == pal.fail.z;
-	const char *word = running ? "Running"
-		: !failed ? "Not running"
-		: state.neural_driver_too_old || !state.neural_initialized ? "Could not start" : "Failed";
+	const char *word = running ? TR(st_running)
+		: !failed ? TR(st_not_running)
+		: state.neural_driver_too_old || !state.neural_initialized ? TR(st_could_not_start) : TR(st_failed);
 	if (!nvidia || gpu_refused)
-		status_line(verdict, "Not available on this GPU", true);
+		status_line(verdict, TR(nr_not_available_gpu), true);
 	else if (settings.neural_render)
 		status_line(verdict, word, !running);
 	ui::band_end(!settings.neural_render);
@@ -534,45 +552,52 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 		return;
 	const bool faded = !nvidia || gpu_refused || (!running && failed);
 
-	ui::subsection("Performance");
+	ui::subsection(TR(sub_performance));
 	{
 		const ui::Dim dim(faded);
-		static const RowOption kScaleOptions[] = {
-			{ "Full", "Full resolution: most detail, heaviest" },
+		const RowOption kScaleOptions[] = {
+			{ TR(nr_scale_full), TR(nr_scale_full_tip) },
 			{ "90%", "" },
-			{ "80%", "" },
+			{ "80%", TR(nr_scale_80_tip) },
 			{ "70%", "" },
-			{ "60%", "Good balance" },
+			{ "60%", "" },
 			{ "50%", "" },
-			{ "40%", "Fastest, softest" },
+			{ "40%", TR(nr_scale_40_tip) },
 		};
-		if (button_row_index<kNeuralModelScaleCount>("Resolution", &settings.neural_model_scale,
+		if (button_row_index<kNeuralModelScaleCount>(TR(nr_resolution), &settings.neural_model_scale,
 				kScaleOptions,
-				"The resolution neural rendering works at; the game is not changed.\n"
-				"Lower runs faster with softer detail.", false, running))
+				TR(nr_resolution_tip), false, running))
 			actions.persist = true;
 
 		constexpr ui::Brand nv = ui::Brand::Nvidia;
-		static const RowOption kModeOptions[] = {
-			{ "Quality", "Full detail everywhere", nv },
-			{ "Balanced", "Faster; full detail in the middle", nv },
-			{ "Performance", "Faster still; less detail towards the edges", nv },
-			{ "Ultra Performance", "Fastest; least detail at the edges", nv },
+		const RowOption kModeOptions[] = {
+			{ TR(mode_quality), TR(nr_mode_quality_tip), nv },
+			{ TR(mode_balanced), TR(nr_mode_balanced_tip), nv },
+			{ TR(mode_performance), TR(nr_mode_performance_tip), nv },
+			{ TR(mode_ultra_performance), TR(nr_mode_ultra_tip), nv },
 		};
-		if (button_row_index<kNeuralModeCount>("DLSS 5 mode", &settings.neural_mode, kModeOptions,
-				"Every mode updates the whole picture every frame.", false, running))
+		if (button_row_index<kNeuralModeCount>(TR(nr_mode), &settings.neural_mode, kModeOptions,
+				TR(nr_mode_tip), false, running))
 			actions.persist = true;
 
-		if (ui::toggle("Run without depth", &settings.neural_no_depth)) {
+		if (ui::toggle(TR(nr_no_depth), &settings.neural_no_depth)) {
 			actions.neural_restart = true;
 			actions.persist = true;
 		}
-		hint("Skips the depth buffer. Slightly faster.");
+		hint(TR(nr_no_depth_tip));
 
 		const unsigned int cost_mode = clamp_neural_mode(settings.neural_mode);
-		const float rows = cost_mode == 0u ? 1.0f
-			: (state.neural_area_share > 0.0f ? state.neural_area_share
-				: kNeuralModeKeep[cost_mode] * kNeuralModeKeep[cost_mode]);
+		float rows = 1.0f;
+		if (cost_mode != 0u && state.neural_area_share > 0.0f) {
+			rows = state.neural_area_share;
+		} else if (cost_mode != 0u) {
+			const uint32_t fw = state.upscaler_out_width != 0u ? state.upscaler_out_width : 2560u;
+			const uint32_t fh = state.upscaler_out_width != 0u ? state.upscaler_out_height : 1440u;
+			const float sc = neural_model_scale_factor(settings.neural_model_scale);
+			const float k = static_cast<float>(neural_mode_width(fw, sc, cost_mode, fh)) /
+				static_cast<float>((std::max)(neural_mode_width(fw, sc, 0u, fh), 1u));
+			rows = k * k;
+		}
 		const float rel = neural_chain_relative_cost(
 			neural_model_scale_factor(settings.neural_model_scale),
 			settings.neural_passes, rows);
@@ -580,127 +605,122 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 			if (state.neural_gpu_ms > 0.0f) {
 				char ms[32];
 				std::snprintf(ms, sizeof(ms), "%.2f ms", state.neural_gpu_ms);
-				const ui::Span cost[] = { { "Neural pass: ", pal.muted }, { ms, pal.text },
-					{ " of GPU time per frame", pal.muted } };
+				const std::string line_text = TR(nr_cost_line);
+				const size_t at = line_text.find("%s");
+				const std::string before = line_text.substr(0, at);
+				const std::string after = at == std::string::npos ? std::string() : line_text.substr(at + 2);
+				const ui::Span cost[] = { { before.c_str(), pal.muted }, { ms, pal.text },
+					{ after.c_str(), pal.muted } };
 				ui::flow(cost, IM_ARRAYSIZE(cost));
-				hint("A 60 fps frame has 16.7 ms in total, and the game needs most of it.");
+				hint(TR(nr_cost_tip));
 			}
-			note("About %.2fx the cost at Full, Quality and 1 pass", rel);
-			hint("Against the same pass at Full resolution, Quality mode and one pass.");
+			note(TR(nr_cost_estimate), rel);
+			hint(TR(nr_cost_estimate_tip));
 		}
 	}
 
-	ui::subsection("Look");
+	ui::subsection(TR(sub_look));
 	{
 		const ui::Dim dim(faded);
-		static const RowOption kStyleOptions[] = {
-			{ "Standard", "Neutral" },
-			{ "Natural", "Brighter, livelier - can look shiny" },
-			{ "Cinematic", "Softer light" },
+		const RowOption kStyleOptions[] = {
+			{ TR(nr_style_standard), TR(nr_style_standard_tip) },
+			{ TR(nr_style_natural), TR(nr_style_natural_tip) },
+			{ TR(nr_style_cinematic), TR(nr_style_cinematic_tip) },
 		};
-		if (button_row_index<kNeuralStyleCount>("Style", &settings.neural_style, kStyleOptions,
-				"Overall look of the effect.", false, running))
+		if (button_row_index<kNeuralStyleCount>(TR(nr_style), &settings.neural_style, kStyleOptions,
+				TR(nr_style_tip), false, running))
 			actions.persist = true;
-		ui::slider_float("Detail strength", &settings.neural_detail_strength,
+		ui::slider_float(TR(nr_detail), &settings.neural_detail_strength,
 			0.0f, kNeuralDetailMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		hint("How much of the added detail reaches the picture. This is the main slider.");
+		hint(TR(nr_detail_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
-		ui::slider_float("Colour strength", &settings.neural_colour_strength,
+		ui::slider_float(TR(nr_colour), &settings.neural_colour_strength,
 			0.0f, kNeuralUnitMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		hint("How much of the effect's colour is used.\n"
-			"0 keeps the game's own colours and changes only brightness.");
+		hint(TR(nr_colour_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
-		ui::slider_float("Neural intensity", &settings.neural_intensity, 0.0f, kNeuralUnitMax, "%.2f",
+		ui::slider_float(TR(nr_intensity), &settings.neural_intensity, 0.0f, kNeuralUnitMax, "%.2f",
 			ImGuiSliderFlags_AlwaysClamp);
-		hint("Strength of the effect itself. It can only reduce it -\n"
-			"use Detail strength to push further.");
+		hint(TR(nr_intensity_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
-		ui::slider_float("Local structure", &settings.neural_local_structure, 0.0f, kNeuralExtendedMax, "%.2f",
+		ui::slider_float(TR(nr_structure), &settings.neural_local_structure, 0.0f, kNeuralExtendedMax, "%.2f",
 			ImGuiSliderFlags_AlwaysClamp);
-		hint("How much fine texture neural rendering creates. 1.00 is the default.");
+		hint(TR(nr_structure_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
-		ui::slider_float("Local tone", &settings.neural_local_tone, 0.0f, kNeuralExtendedMax, "%.2f",
+		ui::slider_float(TR(nr_tone), &settings.neural_local_tone, 0.0f, kNeuralExtendedMax, "%.2f",
 			ImGuiSliderFlags_AlwaysClamp);
-		hint("Local contrast. Lower it if the lighting reacts too strongly.");
+		hint(TR(nr_tone_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
-		ui::slider_float("Skin structure", &settings.neural_skin_structure,
+		ui::slider_float(TR(nr_skin), &settings.neural_skin_structure,
 			kNeuralSkinMin, kNeuralSkinMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		hint("Detail on skin, set separately from the rest of the frame.\n"
-			"-1.00 is the default.");
+		hint(TR(nr_skin_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit()) {
 			settings.neural_skin_structure = clamp_neural_skin(settings.neural_skin_structure);
 			actions.persist = true;
 		}
-		if (ui::toggle("Auto skin mask", &settings.neural_auto_mask))
+		if (ui::toggle(TR(nr_auto_mask), &settings.neural_auto_mask))
 			actions.persist = true;
-		hint("Finds skin automatically for the slider above.");
+		hint(TR(nr_auto_mask_tip));
 	}
 
-	ui::subsection("Stability");
+	ui::subsection(TR(sub_stability));
 	{
 		const ui::Dim dim(faded);
-		if (ui::toggle("Smoothing", &settings.neural_smoothing))
+		if (ui::toggle(TR(nr_smoothing), &settings.neural_smoothing))
 			actions.persist = true;
-		hint("Steadies the effect between frames and removes trails behind\n"
-			"moving objects. Off is sharper but restless.");
-		if (ui::toggle("Model without motion vectors", &settings.neural_no_motion_vectors)) {
+		hint(TR(nr_smoothing_tip));
+		if (ui::toggle(TR(nr_no_motion), &settings.neural_no_motion_vectors)) {
 			actions.neural_restart = true;
 			actions.persist = true;
 		}
-		hint("Makes the effect judge each frame on its own.\n"
-			"Removes smearing around moving objects, and costs performance.");
-		if (ui::toggle("Reset on camera cut", &settings.neural_reset_on_cut))
+		hint(TR(nr_no_motion_tip));
+		if (ui::toggle(TR(nr_reset_on_cut), &settings.neural_reset_on_cut))
 			actions.persist = true;
-		hint("Clears the effect's history on scene changes.\n"
-			"Off by default - it can make the lighting jump.");
+		hint(TR(nr_reset_on_cut_tip));
 	}
 
-	ui::subsection("HDR and highlights");
+	ui::subsection(TR(sub_hdr));
 	{
 		const ui::Dim dim(faded);
-		ui::slider_float("Paper white", &settings.neural_paper_white,
+		ui::slider_float(TR(nr_paper_white), &settings.neural_paper_white,
 			kNeuralPaperWhiteMin, kNeuralPaperWhiteMax, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
-		hint("Raise it if highlights look blown out in HDR.\n"
-			"1.00 changes nothing.");
+		hint(TR(nr_paper_white_tip));
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			actions.persist = true;
-		if (ui::toggle("Highlight guard", &settings.neural_highlight_guard_on))
+		if (ui::toggle(TR(nr_highlight_guard), &settings.neural_highlight_guard_on))
 			actions.persist = true;
-		hint("Limits how much brighter the effect may make a pixel.\n"
-			"Turn it on if bright edges glow; it costs some detail in shadows.");
+		hint(TR(nr_highlight_guard_tip));
 	}
 
-	ui::subsection("Tools");
+	ui::subsection(TR(sub_tools));
 	{
 		const ui::Dim dim(faded);
-		static const RowOption kDebugOptions[] = {
-			{ "Off", nullptr },
-			{ "Input", "What the effect is given" },
-			{ "Output", "What the effect produces" },
-			{ "Difference", "What it is changing, exaggerated" },
+		const RowOption kDebugOptions[] = {
+			{ TR(opt_off), nullptr },
+			{ TR(nr_debug_input), TR(nr_debug_input_tip) },
+			{ TR(nr_debug_output), TR(nr_debug_output_tip) },
+			{ TR(nr_debug_difference), TR(nr_debug_difference_tip) },
 		};
-		button_row_index<kNeuralDebugViewCount>("Neural debug view", &settings.neural_debug_view, kDebugOptions,
-			"Shows one of the effect's internal images instead of the game.\n"
-			"Not saved between sessions.", false, running);
+		button_row_index<kNeuralDebugViewCount>(TR(nr_debug_view), &settings.neural_debug_view, kDebugOptions,
+			TR(nr_debug_view_tip), false, running);
 
-		static const RowOption kKeyOptions[] = {
-			{ "None", nullptr }, { "F5", nullptr }, { "F6", nullptr }, { "F7", nullptr }, { "F8", nullptr },
+		const RowOption kKeyOptions[] = {
+			{ TR(opt_none), nullptr }, { "F5", nullptr }, { "F6", nullptr }, { "F7", nullptr }, { "F8", nullptr },
 		};
 		static const unsigned int kKeyCodes[] = { 0u, 0x74u, 0x75u, 0x76u, 0x77u };
-		if (button_row_value("Neural on/off key", &settings.neural_toggle_key, kKeyOptions, kKeyCodes,
-				"Key that turns neural rendering on and off while playing.", running))
+		if (button_row_value(TR(nr_toggle_key), &settings.neural_toggle_key, kKeyOptions, kKeyCodes,
+				TR(nr_toggle_key_tip), running))
 			actions.persist = true;
 
-		if (ui::button(ui::icon::kRefresh, "Restart neural pass")) {
+		if (ui::button(ui::icon::kRefresh, TR(nr_restart))) {
 			actions.neural_restart = true;
 			actions.persist = true;
 		}
-		hint("Reloads the effect. Try this if it stops working.");
+		hint(TR(nr_restart_tip));
 		if (state.scope_capture_enabled) {
 			ui::same_line_if_fits(ui::button_width(ui::icon::kCamera, "Capture neural frame"));
 			if (ui::button(ui::icon::kCamera, "Capture neural frame"))
@@ -713,154 +733,151 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 		}
 	}
 
-	ui::subsection("Advanced");
+	ui::subsection(TR(sub_advanced));
 	{
 		const ui::Dim dim(faded);
 		static const RowOption kPassOptions[] = { { "1x", nullptr }, { "2x", nullptr }, { "3x", nullptr } };
 		static const unsigned int kPassValues[] = { 1u, 2u, 3u };
 		static_assert(IM_ARRAYSIZE(kPassValues) == static_cast<int>(kNeuralPassMax),
 			"the row must offer every pass count up to kNeuralPassMax");
-		if (button_row_value("Neural passes##chain", &settings.neural_passes, kPassOptions, kPassValues,
-				"Runs neural rendering more than once for stronger detail.\n"
-				"Each extra pass costs as much as the first.", running))
+		if (button_row_value((std::string(TR(nr_passes)) + "##chain").c_str(), &settings.neural_passes, kPassOptions, kPassValues,
+				TR(nr_passes_tip), running))
 			actions.persist = true;
 
 		if (clamp_neural_passes(settings.neural_passes) > 1u &&
 			settings.neural_model_scale > 1u)
-			ui::callout(pal.warn, ui::icon::kWarn,
-				"Extra passes are wasted below 80% Resolution.\n"
-				"Raise Resolution, or set Neural passes back to 1x.");
+			ui::calloutf(pal.warn, ui::icon::kWarn, TR(nr_passes_wasted));
 	}
 }
 
 #if AEONSR_FRAME_GENERATION
 void draw_framegen_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
-	if (ui::toggle("Frame generation", &settings.frame_generation))
+	if (ui::toggle(TR(fg_enable), &settings.frame_generation))
 		actions.persist = true;
-	hint("Adds frames made from the game's own for smoother motion.\n"
-		"Costs a little input delay; moving edges can shimmer slightly.");
+	hint(TR(fg_enable_tip));
 
 	const FrameGenReadout &f = state.framegen;
 	const bool running = settings.frame_generation && f.generating;
-	static const RowOption kGeneratorOptions[] = {
-		{ "AeonSR", "Runs on any graphics card, at any multiplier", ui::Brand::Neutral },
-		{ "FSR", "AMD's frame generation. Runs on any graphics card, up to 2x", ui::Brand::Amd },
-		{ "XeSS", "Intel's frame generation. Runs on any graphics card, up to 2x", ui::Brand::Intel },
-		{ "DLSS", "NVIDIA's frame generation. GeForce RTX 40 up to 2x, RTX 50 up to 6x", ui::Brand::Nvidia },
+	const RowOption kGeneratorOptions[] = {
+		{ "AeonSR", TR(fg_aeonsr_tip), ui::Brand::Neutral },
+		{ "FSR", TR(fg_fsr_tip), ui::Brand::Amd },
+		{ "XeSS", TR(fg_xess_tip), ui::Brand::Intel },
+		{ "DLSS", TR(fg_dlss_tip), ui::Brand::Nvidia },
 	};
-	if (button_row_index<kFrameGeneratorCount>("Generator", &settings.frame_generator, kGeneratorOptions,
-			"Which frame generation makes the frames.\n"
-			"If the one chosen cannot run, AeonSR's is used and the panel says why.", false, running))
+	if (button_row_index<kFrameGeneratorCount>(TR(fg_generator), &settings.frame_generator, kGeneratorOptions,
+			TR(fg_generator_tip), false, running))
 		actions.persist = true;
 
-	static const RowOption kMultiplyOptions[] = {
-		{ "Auto", "As many frames as the screen's refresh has room for, none when the game is as fast" },
+	const RowOption kMultiplyOptions[] = {
+		{ TR(opt_auto), TR(fg_auto_tip) },
 		{ "2x", nullptr }, { "3x", nullptr }, { "4x", nullptr }, { "5x", nullptr }, { "6x", nullptr },
 	};
 	static const unsigned int kMultiplyValues[] = { 0u, 2u, 3u, 4u, 5u, 6u };
 	static_assert(IM_ARRAYSIZE(kMultiplyValues) == static_cast<int>(kFrameGenerationMultiplierMax),
 		"the row must offer Auto and every multiplier up to kFrameGenerationMultiplierMax");
-	if (button_row_value("Multiply by", &settings.frame_generation_multiplier, kMultiplyOptions, kMultiplyValues,
-			"Frames shown for every real one. The screen still shows at most its refresh rate.",
+	if (button_row_value(TR(fg_multiply), &settings.frame_generation_multiplier, kMultiplyOptions, kMultiplyValues,
+			TR(fg_multiply_tip),
 			running && !f.through_game_present))
 		actions.persist = true;
 	if (running && f.through_game_present)
-		note("2x here: the frames go through the game's own present");
+		note("%s", TR(fg_through_present));
 	if (running && f.own_window && f.own_asked >= 2 && f.own_steps_max >= 1 && f.own_asked > f.own_steps_max)
-		note("%s goes up to %ux here", frame_generator_label(f.generator), f.own_steps_max);
+		note(TR(fg_goes_up_to), frame_generator_label(f.generator), f.own_steps_max);
 
 	int limit = static_cast<int>(settings.frame_generation_limit);
-	if (ui::slider_int("Frame rate limit", &limit, 0, 240, limit == 0 ? "Off" : "%d fps")) {
+	if (ui::slider_int(TR(fg_limit), &limit, 0, 240, limit == 0 ? TR(fg_limit_off) : "%d fps")) {
 		settings.frame_generation_limit = static_cast<unsigned int>(std::clamp(limit, 0, 240));
 	}
 	if (ImGui::IsItemDeactivatedAfterEdit())
 		actions.persist = true;
 	if (running && f.own_window && f.even_cap_fps != 0) {
-		char cap[160];
-		std::snprintf(cap, sizeof cap, "Caps the game's real frames.\nAt %u fps motion is even on this %.0f Hz screen.",
+		char cap[1024];
+		std::snprintf(cap, sizeof cap, TR(fg_cap_even_tip),
 			f.even_cap_fps, f.screen_hz);
 		hint(cap);
 	} else {
-		hint("Caps the game's real frames. A cap that divides the screen's refresh\n"
-			"(30 or 20 fps on 60 Hz, 25 on 75 Hz) gives the most even motion.");
+		hint(TR(fg_cap_tip));
 	}
 
 	if (settings.frame_generation) {
 		if (!f.status.empty())
-			line("%s", narrow_lossy(f.status).c_str());
+		{
+			std::string tech;
+			line("%s", diag_said(narrow_lossy(f.status), i18n::current(), i18n::S::fg_status_generic, &tech).c_str());
+			technical_hint(tech);
+		}
 		if (f.real_fps > 0.0) {
 			if (f.own_window && f.added_latency_ms > 0.0)
-				line("Real %.0f fps, shown %.0f fps, +%.0f ms delay", f.real_fps, f.shown_fps, f.added_latency_ms);
+				line(TR(fg_rates_delay), f.real_fps, f.shown_fps, f.added_latency_ms);
 			else
-				line("Real %.0f fps, shown %.0f fps", f.real_fps, f.shown_fps);
+				line(TR(fg_rates), f.real_fps, f.shown_fps);
 			std::string more;
-			char b[256];
+			char b[1024];
 			if (f.generating && f.own_window && f.own_steps == 1) {
-				more += "Nothing made: the game is as fast as the screen.";
+				more += TR(fg_nothing_made);
 			} else if (f.generating) {
-				std::snprintf(b, sizeof b, "Made by %s%s%s", frame_generator_label(f.generator),
-					f.generator_version.empty() ? "" : " ", narrow_lossy(f.generator_version).c_str());
-				more += b;
+				const std::string by = std::string(frame_generator_label(f.generator)) +
+					(f.generator_version.empty() ? "" : " ") + narrow_lossy(f.generator_version);
 				if (f.own_window && f.own_steps >= 2)
-					std::snprintf(b, sizeof b, " at %ux%s.", f.own_steps, f.own_auto ? " (Auto)" : "");
+					std::snprintf(b, sizeof b, f.own_auto ? TR(fg_made_by_at_auto) : TR(fg_made_by_at), by.c_str(), f.own_steps);
 				else if (f.own_window)
-					std::snprintf(b, sizeof b, " at every refresh (Auto).");
+					std::snprintf(b, sizeof b, TR(fg_made_by_every), by.c_str());
 				else
-					std::snprintf(b, sizeof b, ".");
+					std::snprintf(b, sizeof b, TR(fg_made_by), by.c_str());
 				more += b;
 			}
 			if (f.own_window && f.screen_latency_ms > 0.0 && f.added_latency_ms > 0.0) {
-				std::snprintf(b, sizeof b, "\nA real frame reaches the screen %.0f ms after the game presents it;\n"
-					"%.0f ms of that is frame generation.", f.screen_latency_ms, f.added_latency_ms);
+				std::snprintf(b, sizeof b, TR(fg_screen_latency), f.screen_latency_ms, f.added_latency_ms);
+				more += "\n";
 				more += b;
 			}
-			if (f.own_window)
-				more += "\nReShade's own FPS counter and screenshots see the real frames only.";
-			if (!f.route.empty())
-				more += "\nPresented with " + f.route + ".";
+			if (f.own_window) {
+				more += "\n";
+				more += TR(fg_counter_note);
+			}
+			if (!f.route.empty()) {
+				std::snprintf(b, sizeof b, TR(diag_technical), f.route.c_str());
+				more += "\n";
+				more += b;
+			}
 			if (!more.empty())
 				hint(more.c_str());
 		}
 	}
 
-	ui::subsection("Pacing and latency");
-	if (ui::toggle("Even frame pacing", &settings.pace_to_display))
+	ui::subsection(TR(sub_pacing));
+	if (ui::toggle(TR(fg_even_pacing), &settings.pace_to_display))
 		actions.persist = true;
-	hint("When the game runs a little faster than the screen (up to 2.5x its refresh),\n"
-		"shows one frame per refresh so motion is even. Frame generation paces its own frames.");
+	hint(TR(fg_even_pacing_tip));
 
-	static const RowOption kLatencyOptions[] = {
-		{ "Off", "Frames start when the game starts them", ui::Brand::Neutral },
-		{ "AeonSR", "AeonSR's own: the frame waits before the game reads your input, not after.\n"
-			"Any graphics card", ui::Brand::Neutral },
-		{ "Reflex", "NVIDIA Reflex, on every graphics API. Needs a GeForce card;\n"
-			"elsewhere AeonSR's own is used", ui::Brand::Nvidia },
+	const RowOption kLatencyOptions[] = {
+		{ TR(opt_off), TR(fg_latency_off_tip), ui::Brand::Neutral },
+		{ "AeonSR", TR(fg_latency_aeonsr_tip), ui::Brand::Neutral },
+		{ "Reflex", TR(fg_latency_reflex_tip), ui::Brand::Nvidia },
 	};
-	if (button_row_index<3>("Low latency", &settings.low_latency, kLatencyOptions,
-			"Less delay between your input and the screen, with frame generation too\n"
-			"(not in exclusive fullscreen, where frame generation paces the game's presents)."))
+	if (button_row_index<3>(TR(fg_low_latency), &settings.low_latency, kLatencyOptions,
+			TR(fg_low_latency_tip)))
 		actions.persist = true;
 }
 #endif
 
 void draw_experiments_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
-	ui::subsection("Upscaler input");
-	static const RowOption kUpscaleOptions[] = {
-		{ "Native", "Full resolution - anti-aliasing only" },
-		{ "Ultra Quality", "Not offered by every upscaler; falls back to Quality" },
-		{ "Quality" },
-		{ "Balanced" },
-		{ "Performance" },
-		{ "Ultra Performance" },
+	ui::subsection(TR(sub_upscaler_input));
+	const RowOption kUpscaleOptions[] = {
+		{ TR(mode_native), TR(exp_native_tip) },
+		{ TR(mode_ultra_quality), TR(exp_ultra_quality_tip) },
+		{ TR(mode_quality) },
+		{ TR(mode_balanced) },
+		{ TR(mode_performance) },
+		{ TR(mode_ultra_performance) },
 	};
 	constexpr unsigned int kUpscaleModeCount = static_cast<unsigned int>(UpscaleMode::UltraPerformance) + 1u;
 	{
 		const ui::Dim dim(upscaler_off(settings));
-		if (button_row_index<kUpscaleModeCount>("Mode", &settings.upscale_mode, kUpscaleOptions,
-				"The resolution the upscaler works from. The game still renders at full\n"
-				"resolution: lower only makes the upscaler's own work cheaper, and loses detail.",
+		if (button_row_index<kUpscaleModeCount>(TR(exp_mode), &settings.upscale_mode, kUpscaleOptions,
+				TR(exp_mode_tip),
 				false, true, true)) {
 			actions.reset = true;
 			actions.invalidate_history = true;
@@ -868,117 +885,82 @@ void draw_experiments_section(const PanelState &state, Settings &settings, Panel
 		}
 	}
 	if (upscaler_off(settings))
-		note("Needs an upscaler on (Temporal Anti-Aliasing).");
+		note("%s", TR(exp_needs_upscaler));
 	const GameScaleVerdict verdict = state.game_scale_verdict;
 	const bool wrong_api = verdict == GameScaleVerdict::WrongApi;
-	{
+	if (state.game_integrated) {
 		const ui::Dim dim(upscaler_off(settings) || wrong_api);
 		bool scale_on = settings.game_render_scale;
-		if (ui::toggle("Use the game's render scale", &scale_on) && (!wrong_api || !scale_on)) {
+		if (ui::toggle(TR(exp_game_scale), &scale_on) && (!wrong_api || !scale_on)) {
 			settings.game_render_scale = scale_on;
 			actions.reset = true;
 			actions.invalidate_history = true;
 			actions.persist = true;
 		}
-		if (state.game_integrated)
-			hint("The game really draws a smaller picture, at the size Mode above asks for:\n"
-				"Aeon SR sets the game's own image quality, and the upscaler brings the picture\n"
-				"back to full size. The game's interface stays at full resolution.\n"
-				"Off, the game draws at its own setting.");
-		else
-			hint("For games with their own render scale (image quality, resolution scale):\n"
-				"lower it in the game and the game really draws a smaller picture, so it runs\n"
-				"faster, and the upscaler brings it back to full size. The game's interface\n"
-				"stays at full resolution. Mode above has no effect while this is in use.");
+		hint(TR(exp_game_scale_integrated_tip));
 	}
 	if (state.game_integrated) {
 		if (!settings.game_render_scale)
-			note("%s is supported: turn this on and Mode above sets the game's own image quality.",
+			note(TR(exp_supported_turn_on),
 				state.game_title.c_str());
 		else if (upscaler_off(settings))
-			note("%s: with no upscaler on, the game draws at its own setting.", state.game_title.c_str());
+			note(TR(exp_no_upscaler_own), state.game_title.c_str());
 		else if (state.game_scale_render_w == 0 && !state.game_note.empty())
-			note("%s: %s.", state.game_title.c_str(), narrow_lossy(state.game_note).c_str());
-		else
-			note("%s: the game itself draws at the size Mode asks for.", state.game_title.c_str());
-		if (settings.game_render_scale && state.game_scale_render_w != 0)
-			note("Drawn at %ux%u, brought to %ux%u by the upscaler.", state.game_scale_render_w,
-				state.game_scale_render_h, state.game_scale_w, state.game_scale_h);
-	} else {
-		if (!state.game_title.empty())
-			note("%s: its render scale is left to the game (%s).", state.game_title.c_str(),
-				narrow_lossy(state.game_note).c_str());
-		switch (verdict) {
-		case GameScaleVerdict::WrongApi:
-			note("Not supported in this game: it runs on %s, and this works only in Direct3D 10 and 11 games.",
-				state.api_name != nullptr ? state.api_name : "another graphics API");
-			break;
-		case GameScaleVerdict::Working:
-		case GameScaleVerdict::Idle:
-			if (state.game_scale_render_w != 0 && state.game_scale_render_w < state.game_scale_w)
-				note("Working: the game draws at %ux%u; the upscaler brings it to %ux%u.", state.game_scale_render_w,
-					state.game_scale_render_h, state.game_scale_w, state.game_scale_h);
-			else if (state.game_scale_render_w != 0)
-				note("Working, at the game's 100%%: lower its own render scale to make it draw less.");
-			else
-				note("Supported in this game; not in use on this screen (menus and loading screens).");
-			break;
-		case GameScaleVerdict::Looking:
-			note("Looking for the game's render scale. Play for a moment with it below 100%%.");
-			break;
-		case GameScaleVerdict::OtherCorner:
-			note("Not supported in this game: it shrinks a picture, but not the one it draws the scene in.");
-			break;
-		case GameScaleVerdict::NotFound:
-			note("Not supported in this game: in 30 s of play it never drew a smaller picture to stretch. "
-				"(At 100%% of its own render scale a game draws none: lower it first.)");
-			break;
-		case GameScaleVerdict::Off:
-			break;
+		{
+			std::string tech;
+			note(TR(exp_game_note), state.game_title.c_str(),
+				diag_said(narrow_lossy(state.game_note), i18n::current(), i18n::S::exp_game_note_generic, &tech).c_str());
+			technical_hint(tech);
 		}
+		else
+			note(TR(exp_game_draws_mode), state.game_title.c_str());
+		if (settings.game_render_scale && state.game_scale_render_w != 0)
+			note(TR(exp_drawn_at), state.game_scale_render_w,
+				state.game_scale_render_h, state.game_scale_w, state.game_scale_h);
+	} else if (!state.game_title.empty()) {
+		std::string tech;
+		note(TR(exp_left_to_game), state.game_title.c_str(),
+			diag_said(narrow_lossy(state.game_note), i18n::current(), i18n::S::exp_game_note_generic, &tech).c_str());
+		technical_hint(tech);
 	}
 
-	ui::subsection("Neural screenshot (DLSS 5)");
+	ui::subsection(TR(sub_neural_screenshot));
 	{
-		static const RowOption kAccumOptions[] = {
-			{ "2x", nullptr }, { "4x", nullptr }, { "8x", "A good place to start" },
-			{ "16x", nullptr }, { "32x", nullptr }, { "64x", "Slowest, and it can look overcooked" },
+		const RowOption kAccumOptions[] = {
+			{ "2x", nullptr }, { "4x", nullptr }, { "8x", TR(exp_accum_8x_tip) },
+			{ "16x", nullptr }, { "32x", nullptr }, { "64x", TR(exp_accum_64x_tip) },
 		};
 		static const unsigned int kAccumValues[] = { 2u, 4u, 8u, 16u, 32u, 64u };
 		const bool neural_running = settings.neural_render && state.neural_last == 1;
-		if (button_row_value("Screenshot passes##screenshot", &settings.accum_iterations,
+		if (button_row_value((std::string(TR(exp_accum_passes)) + "##screenshot").c_str(), &settings.accum_iterations,
 				kAccumOptions, kAccumValues,
-				"How many neural rendering passes to stack on the held picture.\n"
-				"More adds detail and takes longer.", neural_running))
+				TR(exp_accum_passes_tip), neural_running))
 			actions.persist = true;
 
-		const bool can_run = neural_running && !state.upscalers_remote;
+		const bool can_run = neural_running;
 		ImGui::BeginDisabled(!can_run && !state.accum_running);
 		if (!state.accum_running) {
-			if (ui::button(ui::icon::kPlay, "Freeze and add neural detail"))
+			if (ui::button(ui::icon::kPlay, TR(exp_accum_start)))
 				actions.accum_start = true;
-		} else if (ui::button(ui::icon::kStop, "Release picture")) {
+		} else if (ui::button(ui::icon::kStop, TR(exp_accum_release))) {
 			actions.accum_stop = true;
 		}
 		ImGui::EndDisabled();
-		hint("Holds the picture and runs neural rendering over it again and again.\n"
-			"Release picture returns to the game.");
-		if (state.upscalers_remote)
-			note("Not available in this game: the neural pass runs in a helper process.");
+		hint(TR(exp_accum_tip));
 
 		const ui::Palette &pal = ui::palette();
 		if (state.accum_running && !state.accum_holding) {
-			char progress[64];
-			std::snprintf(progress, sizeof(progress), "Adding neural detail: pass %u of %u",
+			char progress[512];
+			std::snprintf(progress, sizeof(progress), TR(exp_accum_progress),
 				state.accum_done, state.accum_target);
 			ImGui::ProgressBar(state.accum_target != 0
 					? static_cast<float>(state.accum_done) / static_cast<float>(state.accum_target) : 0.0f,
 				ImVec2(ui::avail_width(), 0.0f), progress);
 		} else if (state.accum_holding) {
 			ui::calloutf(pal.ok, ui::icon::kOk,
-				"Held after %u neural passes - take the screenshot, then Release picture.", state.accum_done);
-		} else if (!can_run && !state.upscalers_remote) {
-			note("Needs neural rendering to be on and running.");
+				TR(exp_accum_held), state.accum_done);
+		} else if (!can_run) {
+			note("%s", TR(exp_accum_needs_neural));
 		}
 	}
 }
@@ -1003,6 +985,17 @@ ImVec4 neural_verdict_colour(const PanelState &state, const Settings &settings)
 	return ui::palette().off;
 }
 
+const char *check_state_text(CheckState s)
+{
+	switch (s) {
+	case CheckState::Ok: return TR(check_ok);
+	case CheckState::Warn: return TR(check_warn);
+	case CheckState::Fail: return TR(check_fail);
+	case CheckState::Off: break;
+	}
+	return TR(check_off);
+}
+
 const char *check_icon(CheckState s)
 {
 	switch (s) {
@@ -1024,19 +1017,20 @@ void technical_hint(const std::string &tech)
 {
 	if (tech.empty())
 		return;
-	const std::string tip = "Technical: " + tech + "\nThe saved report has it too.";
-	hint(tip.c_str());
+	char tip[2048];
+	std::snprintf(tip, sizeof(tip), TR(diag_technical), tech.c_str());
+	hint(tip);
 }
 
 void draw_health(const PanelState &state, const Settings &settings, bool skip_log)
 {
-	std::vector<DiagCheck> checks = diag_checks(state, settings);
+	std::vector<DiagCheck> checks = diag_checks(state, settings, i18n::current());
 	if (skip_log)
 		checks.erase(std::remove_if(checks.begin(), checks.end(),
 			[](const DiagCheck &c) { return std::string(c.name) == "Log"; }), checks.end());
 	float name_w = 0.0f;
 	for (const DiagCheck &c : checks)
-		name_w = std::max(name_w, ImGui::CalcTextSize(c.name).x);
+		name_w = std::max(name_w, ImGui::CalcTextSize(c.title).x);
 	ui::tray_begin("##health_tray");
 	const bool beside = room_beside(name_w + ImGui::GetFontSize() * 1.2f, 3);
 	if (!ImGui::BeginTable("##health", beside ? 3 : 2,
@@ -1055,20 +1049,20 @@ void draw_health(const PanelState &state, const Settings &settings, bool skip_lo
 		const char *g = ui::glyph(check_icon(c.state));
 		if (*g != '\0') {
 			ui::icon_text(check_colour(c.state), g);
-			hint(check_state_label(c.state));
+			hint(check_state_text(c.state));
 		} else {
-			ImGui::TextColored(check_colour(c.state), "[%s]", check_state_label(c.state));
+			ImGui::TextColored(check_colour(c.state), "[%s]", check_state_text(c.state));
 		}
 		ImGui::TableNextColumn();
 		if (beside) {
-			ImGui::TextUnformatted(c.name);
+			ImGui::TextUnformatted(c.title);
 			ImGui::TableNextColumn();
 		}
 		if (!beside)
-			ImGui::TextColored(ui::palette().label, "%s", c.name);
+			ImGui::TextColored(ui::palette().label, "%s", c.title);
 		std::string tech;
 		line("%s", diag_player_text(c.detail, &tech).c_str());
-		technical_hint(tech);
+		technical_hint(c.tech.empty() ? tech : tech.empty() ? c.tech : c.tech + "\n" + tech);
 		if (!c.action.empty())
 			note("%s", c.action.c_str());
 	}
@@ -1078,59 +1072,63 @@ void draw_health(const PanelState &state, const Settings &settings, bool skip_lo
 
 void draw_report_tools(const PanelState &state, Settings &settings, PanelActions &actions)
 {
-	if (ui::button(ui::icon::kSave, "Save report"))
+	if (ui::button(ui::icon::kSave, TR(diag_save_report)))
 		actions.save_report = true;
-	hint("Writes a .zip beside the add-on with this report, the logs, the settings,\n"
-		"the last seconds of frames and a picture of this frame before and after\n"
-		"Aeon SR. Attach it when reporting a problem.");
-	ui::same_line_if_fits(ui::button_width(ui::icon::kCopy, "Copy report"));
-	if (ui::button(ui::icon::kCopy, "Copy report"))
+	hint(TR(diag_save_report_tip));
+	ui::same_line_if_fits(ui::button_width(ui::icon::kCopy, TR(diag_copy_report)));
+	if (ui::button(ui::icon::kCopy, TR(diag_copy_report)))
 		actions.copy_report = true;
-	hint("The same report, straight to the clipboard.");
+	hint(TR(diag_copy_report_tip));
 
-	if (!state.report_error.empty())
-		ui::callout(ui::palette().fail, ui::icon::kAlert, narrow_lossy(state.report_error).c_str());
+	if (!state.report_error.empty()) {
+		ui::callout(ui::palette().fail, ui::icon::kAlert, TR(diag_report_failed));
+		technical_hint(narrow_lossy(state.report_error));
+	}
 	else if (!state.report_path.empty())
-		note("Report: %s", narrow_lossy(state.report_path).c_str());
+		note(TR(diag_report_path), narrow_lossy(state.report_path).c_str());
 
-	if (ui::toggle("Detailed log", &settings.verbose_log))
+	if (ui::toggle(TR(diag_detailed_log), &settings.verbose_log))
 		actions.persist = true;
-	hint("Records every step of every frame into AeonSR.log.\n"
-		"Turn it on only while reproducing a problem - it costs performance.");
+	hint(TR(diag_detailed_log_tip));
 	if (!state.log_path.empty())
-		note("Log: %s", narrow_lossy(state.log_path).c_str());
+		note(TR(diag_log_path), narrow_lossy(state.log_path).c_str());
 }
 
-std::string problem_source(const std::string &tag)
+std::string problem_source(const std::string &tag, i18n::Lang lang = i18n::Lang::en_US)
 {
 	std::string key;
 	for (char c : tag)
 		if (std::isalnum(static_cast<unsigned char>(c)))
 			key.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-	static const struct { const char *key, *name; } kNames[] = {
-		{ "neural", "Neural rendering" }, { "neuralrender", "Neural rendering" }, { "dlss", "DLSS" },
-		{ "vsr", "RTX VSR" }, { "d3d12", "Direct3D 12" }, { "hud", "HUD" }, { "aeonsr", "Aeon SR" },
-		{ "host", "Helper process" }, { "remote", "Helper process" }, { "debugview", "Motion and depth view" },
-		{ "flow", "Motion vectors" }, { "probe", "Motion probe" }, { "interop", "Bridge" }, { "shader", "Shaders" },
+	using i18n::S;
+	static const struct { const char *key; S name; } kNames[] = {
+		{ "neural", S::hn_neural }, { "neuralrender", S::hn_neural },
+		{ "host", S::src_helper_process }, { "remote", S::src_helper_process }, { "debugview", S::hn_motion_depth_view },
+		{ "flow", S::hn_motion }, { "probe", S::src_motion_probe }, { "interop", S::src_bridge }, { "shader", S::src_shaders },
+		{ "upscaler", S::hn_upscaler }, { "framegen", S::fg_enable }, { "gpu", S::hn_gpu }, { "report", S::sub_report },
+		{ "jitter", S::rec_jitter }, { "latency", S::fg_low_latency }, { "interface", S::src_interface },
+		{ "game", S::src_game }, { "scale", S::src_scale }, { "files", S::src_files }, { "crash", S::src_crash },
+		};
+	static const struct { const char *key, *name; } kProper[] = {
+		{ "dlss", "DLSS" }, { "vsr", "RTX VSR" }, { "d3d12", "Direct3D 12" }, { "hud", "HUD" }, { "aeonsr", "Aeon SR" },
 	};
 	for (const auto &n : kNames)
 		if (key == n.key)
+			return i18n::text(lang, n.name);
+	for (const auto &n : kProper)
+		if (key == n.key)
 			return n.name;
-	std::string out;
-	for (size_t i = 0; i < tag.size(); ++i) {
-		const unsigned char c = static_cast<unsigned char>(tag[i]);
-		if (c == '-' || c == '_') {
-			out.push_back(' ');
-		} else if (i > 0 && std::isupper(c) && std::islower(static_cast<unsigned char>(tag[i - 1]))) {
-			out.push_back(' ');
-			out.push_back(static_cast<char>(std::tolower(c)));
-		} else {
-			out.push_back(static_cast<char>(c));
-		}
-	}
-	if (!out.empty())
-		out[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[0])));
-	return out;
+	static const struct { const char *prefix; S name; } kOpenings[] = {
+		{ "jitter", S::rec_jitter }, { "interop", S::src_bridge }, { "nativedlss", S::hn_game_dlss },
+		{ "ngxlayer", S::hn_other_program }, { "ngx", S::hn_upscaler }, { "depth", S::hn_depth },
+		{ "interface", S::src_interface }, { "game", S::src_game }, { "framegen", S::fg_enable },
+		{ "pacing", S::fg_enable }, { "swapchain", S::fg_enable }, { "flight", S::sub_report },
+		{ "neural", S::hn_neural }, { "flow", S::hn_motion },
+	};
+	for (const auto &n : kOpenings)
+		if (key.rfind(n.prefix, 0) == 0)
+			return i18n::text(lang, n.name);
+	return "Aeon SR";
 }
 
 std::vector<DiagEntry> recent_problems(const PanelState &state, const Settings &settings)
@@ -1148,7 +1146,7 @@ std::vector<DiagEntry> recent_problems(const PanelState &state, const Settings &
 
 std::string log_count(const PanelState &state, const Settings &settings)
 {
-	for (const DiagCheck &c : diag_checks(state, settings))
+	for (const DiagCheck &c : diag_checks(state, settings, i18n::current()))
 		if (std::string(c.name) == "Log")
 			return c.detail;
 	return std::string();
@@ -1158,7 +1156,7 @@ void draw_recent_problems(const std::vector<DiagEntry> &problems, const std::str
 {
 	if (problems.empty())
 		return;
-	ui::subsection("Recent problems", count.c_str());
+	ui::subsection(TR(sub_recent_problems), count.c_str());
 	const ui::Palette &pal = ui::palette();
 	const char *warn_icon = ui::glyph(ui::icon::kWarn);
 	const char *fail_icon = ui::glyph(ui::icon::kFail);
@@ -1166,7 +1164,7 @@ void draw_recent_problems(const std::vector<DiagEntry> &problems, const std::str
 	const float icon_w = std::max(ImGui::CalcTextSize(warn_icon).x, ImGui::CalcTextSize(fail_icon).x);
 	float tag_w = 0.0f;
 	for (const DiagEntry &e : problems)
-		tag_w = std::max(tag_w, ImGui::CalcTextSize(problem_source(e.tag).c_str()).x);
+		tag_w = std::max(tag_w, ImGui::CalcTextSize(problem_source(e.tag, i18n::current()).c_str()).x);
 	if (icon_w > 0.0f)
 		tag_w += icon_w + gap;
 	ui::tray_begin("##problems_tray");
@@ -1188,13 +1186,13 @@ void draw_recent_problems(const std::vector<DiagEntry> &problems, const std::str
 			ui::icon_text(error ? pal.fail : pal.warn, g);
 			ImGui::SameLine(0.0f, gap);
 		}
-		ImGui::TextUnformatted(problem_source(e.tag).c_str());
+		ImGui::TextUnformatted(problem_source(e.tag, i18n::current()).c_str());
 	};
 	for (auto it = problems.rbegin(); it != problems.rend(); ++it) {
 		ImGui::TableNextRow();
 		ImGui::TableNextColumn();
 		ImGui::TextDisabled("%.1fs", static_cast<double>(it->time_s));
-		hint("Seconds since the game started.");
+		hint(TR(diag_seconds_tip));
 		ImGui::TableNextColumn();
 		if (beside) {
 			source(*it);
@@ -1202,9 +1200,11 @@ void draw_recent_problems(const std::vector<DiagEntry> &problems, const std::str
 		}
 		if (!beside)
 			source(*it);
-		std::string tech;
-		line("%s", diag_player_text(narrow_lossy(it->text), &tech).c_str());
-		technical_hint(tech);
+		std::string tech, cut;
+		const std::string said = diag_said(narrow_lossy(it->text), i18n::current(),
+			it->level == DiagLevel::Error ? i18n::S::rp_error : i18n::S::rp_warning, &tech);
+		line("%s", diag_player_text(said, &cut).c_str());
+		technical_hint(tech.empty() ? cut : tech);
 	}
 	ImGui::EndTable();
 	ui::tray_end();
@@ -1214,100 +1214,101 @@ void draw_neural_details(const PanelState &state, const Settings &settings)
 {
 	if (!settings.neural_render)
 		return;
-	ui::subsection("Neural rendering");
-	if (!state.upscalers_remote && state.neural_dll_found && !state.neural_runtime_file.empty()) {
+	ui::subsection(TR(hn_neural));
+	if (state.neural_dll_found && !state.neural_runtime_file.empty()) {
 		const size_t cut = state.neural_runtime_file.find_last_of(L"\\/");
 		const std::string name = narrow_lossy(cut == std::wstring::npos
 			? state.neural_runtime_file : state.neural_runtime_file.substr(cut + 1));
 		if (state.neural_runtime_serves_card)
-			note("Runtime: %s, built for %s", name.c_str(),
-				state.neural_runtime_cards.empty() ? "unknown cards" : state.neural_runtime_cards.c_str());
+			note(TR(nd_runtime_built_for), name.c_str(),
+				state.neural_runtime_cards.empty() ? TR(nd_unknown_cards)
+					: diag_cards_text(state.neural_runtime_cards, i18n::current()).c_str());
 		else
-			note("Runtime: %s", name.c_str());
-		hint("A build in runtime\\dlss5-allgpu\\ is tried first.");
+			note(TR(nd_runtime), name.c_str());
+		hint(TR(nd_runtime_tip));
 	}
 	if (state.neural_last == 1 && state.neural_model_width != 0) {
 		if (state.neural_eval_rows != 0 && state.neural_eval_rows < state.neural_model_height)
-			note("Working at %ux%u, up to %.0f%% of it per frame", state.neural_model_width,
+			note(TR(nd_working_at_share), state.neural_model_width,
 				state.neural_model_height, 100.0 * state.neural_eval_rows / state.neural_model_height);
 		else
-			note("Working at %ux%u", state.neural_model_width, state.neural_model_height);
+			note(TR(nd_working_at), state.neural_model_width, state.neural_model_height);
 	}
 	if (!state.neural_driver_too_old && !state.neural_adapter_unsupported) {
 		const bool arch = state.neural_requirement_known && state.neural_min_architecture != 0;
 		const bool driver = state.neural_required_driver_major != 0;
 		if (arch && driver)
-			note("Runtime needs %s or newer, and driver %u.%02u or newer",
-				neural_arch_name(state.neural_min_architecture),
+			note(TR(nd_needs_arch_driver),
+				diag_arch_text(state.neural_min_architecture, i18n::current()),
 				state.neural_required_driver_major, state.neural_required_driver_minor);
 		else if (arch)
-			note("Runtime needs %s or newer", neural_arch_name(state.neural_min_architecture));
+			note(TR(nd_needs_arch), diag_arch_text(state.neural_min_architecture, i18n::current()));
 		else if (driver)
-			note("Runtime needs driver %u.%02u or newer",
+			note(TR(nd_needs_driver),
 				state.neural_required_driver_major, state.neural_required_driver_minor);
 	}
-	note("Frame colour space: %s",
+	note(TR(nd_colour_space),
 		state.neural_color_space == NeuralColorSpace::Pq ? "HDR10 (PQ)"
 		: state.neural_color_space == NeuralColorSpace::ScrgbLinear ? "scRGB (linear)"
 		: "SDR / sRGB");
-	note("Passes run: %llu", static_cast<unsigned long long>(state.neural_eval_count));
+	note(TR(nd_passes_run), static_cast<unsigned long long>(state.neural_eval_count));
 }
 
 void draw_diagnostics_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	const std::vector<DiagEntry> problems = recent_problems(state, settings);
-	ui::subsection("Health");
+	ui::subsection(TR(sub_health));
 	draw_health(state, settings, !problems.empty());
 
-	if (ui::toggle("Show on-screen status", &settings.show_osd))
+	if (ui::toggle(TR(diag_show_osd), &settings.show_osd))
 		actions.persist = true;
-	hint("Shows the upscaler and neural rendering status in a small window over the game.");
+	hint(TR(diag_show_osd_tip));
 
-	ui::subsection("Report");
+	ui::subsection(TR(sub_report));
 	draw_report_tools(state, settings, actions);
 
 	draw_recent_problems(problems, log_count(state, settings));
 
-	if (!ui::disclosure("Details", "Details"))
+	if (!ui::disclosure("Details", TR(sub_details)))
 		return;
 
-	note("Build: %s", state.build_stamp);
-	note("Camera motion: %.2f px", state.last_motion_px);
+	note(TR(diag_build), build_date(state.build_stamp).c_str());
+	note(TR(diag_camera_motion), state.last_motion_px);
 	if (state.jitter_in_frame && state.jitter_still) {
-		note("Jitter: on - nothing drawn took it this frame, so the frame is left still");
+		note("%s", TR(diag_jitter_still));
 	} else if (state.jitter_in_frame && state.jitter_mixed) {
-		note("Jitter: drawn into the game - mixed this frame, the upscaler was told none");
+		note("%s", TR(diag_jitter_mixed));
 	} else if (state.jitter_in_frame && state.jitter_aliased_draws != 0) {
-		note("Jitter: drawn into the game, %u of %u draws moved, %u with another depth buffer",
+		note(TR(diag_jitter_aliased),
 			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws,
 			state.jitter_aliased_draws);
 	} else if (state.jitter_in_frame) {
-		note("Jitter: drawn into the game, %u of %u draws moved",
+		note(TR(diag_jitter_drawn),
 			state.jitter_moved_draws, state.jitter_moved_draws + state.jitter_plain_draws);
 	} else if (settings.spatial_jitter && state.jitter_withheld) {
-		note(state.jitter_active ? "Jitter: on, not drawn - the game jitters its own frame, resampled as it is scaled down"
-			: "Jitter: on, not drawn - the game jitters its own frame");
+		note("%s", state.jitter_active ? TR(diag_jitter_withheld_scaled) : TR(diag_jitter_withheld));
 	} else if (settings.spatial_jitter && !state.jitter_refused && !state.jitter_active) {
-		note("Jitter: on, idle this frame");
+		note("%s", TR(diag_jitter_idle));
 	} else if (settings.spatial_jitter && !state.jitter_refused && state.jitter_note[0] != '\0') {
-		note("Jitter: resampled - %s", state.jitter_note);
+		std::string tech;
+		note(TR(diag_jitter_resampled), diag_said(state.jitter_note, i18n::current(), i18n::S::diag_jitter_generic, &tech).c_str());
+		technical_hint(tech);
 	} else if (settings.spatial_jitter && !state.jitter_refused) {
-		note("Jitter: on, waiting for the game to draw a frame");
+		note("%s", TR(diag_jitter_waiting));
 	}
 	if (state.scope_capture_enabled && state.scope_have && ImGui::TreeNode("Jitter numbers")) {
 		draw_jitter_numbers(state, actions);
 		ImGui::TreePop();
 	}
-	if (ui::toggle("Probe the motion vectors", &settings.mv_probe)) {
+	if (ui::toggle(TR(diag_probe), &settings.mv_probe)) {
 		if (!settings.mv_probe)
 			actions.probe_reset = true;
 		actions.persist = true;
 	}
-	hint("Checks now and then that motion detection is working; the result is\n"
-		"the Motion vectors row in Health.");
+	hint(TR(diag_probe_tip));
 	if (settings.mv_probe && state.probe_unsupported)
 		ui::callout(ui::palette().fail, ui::icon::kAlert,
-			"Probe: format cannot be read back (expected RG16F or RG32F).");
+			TR(diag_probe_unsupported));
 
 	if (state.active_is_fsr) {
 		const std::wstring &running = state.fsr_provider_version;
@@ -1317,49 +1318,47 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 			offers_4 = offers_4 || (p.size() > 1 && p[0] == '4' && p[1] == '.');
 
 		if (running.empty())
-			note("The runtime did not say which FSR version it used");
+			note("%s", TR(diag_fsr_unnamed));
 		if (offers_4 && !running_4) {
 			ui::calloutf(ui::palette().warn, ui::icon::kWarn,
-				"This runtime offers FSR 4, and fell back to %s on this GPU.",
-				running.empty() ? "an older version" : narrow_lossy(running).c_str());
-			hint("FSR 4 runs on RDNA 4, and on RDNA 3 desktop cards with a recent\n"
-				"Adrenalin driver. Everything else gets FSR 3.1.");
+				TR(diag_fsr_fell_back),
+				running.empty() ? TR(diag_fsr_older) : narrow_lossy(running).c_str());
+			hint(TR(diag_fsr_fell_back_tip));
 		}
 	} else if (state.active_is_vsr) {
-		note("RTX VSR: %s, driver enhancement %s, %s, level %u",
-			state.vsr_capable ? "capable" : "not capable",
-			state.vsr_enabled ? "on" : "off",
-			state.vsr_in_use ? "in use" : "not in use", state.vsr_level);
+		note(TR(diag_vsr_line),
+			state.vsr_capable ? TR(diag_vsr_capable) : TR(diag_vsr_not_capable),
+			state.vsr_enabled ? TR(diag_vsr_on) : TR(diag_vsr_off),
+			state.vsr_in_use ? TR(diag_vsr_in_use) : TR(diag_vsr_not_in_use), state.vsr_level);
 	}
 
 	draw_neural_details(state, settings);
 
-	ui::subsection("Motion and depth view");
-	static const RowOption kDebugViewOptions[] = {
-		{ "Off" },
-		{ "Flow", "Motion as colour: hue is direction, brightness is speed" },
-		{ "Arrows", "Motion as arrows over the game - the readable one" },
-		{ "Confidence", "How sure the motion is: red unsure, green certain" },
-		{ "Depth", "The depth the upscalers are given" },
+	ui::subsection(TR(sub_motion_depth_view));
+	const RowOption kDebugViewOptions[] = {
+		{ TR(opt_off) },
+		{ TR(mdv_flow), TR(mdv_flow_tip) },
+		{ TR(mdv_arrows), TR(mdv_arrows_tip) },
+		{ TR(mdv_confidence), TR(mdv_confidence_tip) },
+		{ TR(mdv_depth), TR(mdv_depth_tip) },
 	};
 	if (button_row_index<kDebugViewCount>("##Motion and depth view", &settings.debug_view, kDebugViewOptions,
-			"Shows the motion or depth Aeon SR reads, instead of the game.\n"
-			"Nothing else changes."))
+			TR(mdv_tip)))
 		actions.persist = true;
-	note("Drawn on screen, over the game.");
+	note("%s", TR(mdv_drawn_note));
 	if (settings.debug_view != 0) {
-		const char *stage = "starting...";
+		const char *stage = TR(mdv_starting);
 		switch (state.debug_view_stage) {
-		case 1: stage = "drawing"; break;
-		case -1: stage = "FAILED: invalid arguments"; break;
-		case -2: stage = "FAILED: the shader would not compile"; break;
-		case -3: stage = "FAILED: unsupported source format"; break;
-		case -4: stage = "FAILED: no render target"; break;
-		case -5: stage = "FAILED: no graphics context"; break;
-		case -6: stage = "waiting"; break;
-		case -7: stage = "FAILED: the draw was rejected"; break;
-		case -8: stage = "FAILED: frame copy view"; break;
-		case -9: stage = "FAILED: out of memory for the copies"; break;
+		case 1: stage = TR(mdv_drawing); break;
+		case -1: stage = TR(mdv_failed_args); break;
+		case -2: stage = TR(mdv_failed_compile); break;
+		case -3: stage = TR(mdv_failed_format); break;
+		case -4: stage = TR(mdv_failed_target); break;
+		case -5: stage = TR(mdv_failed_context); break;
+		case -6: stage = TR(mdv_waiting); break;
+		case -7: stage = TR(mdv_failed_rejected); break;
+		case -8: stage = TR(mdv_failed_copy_view); break;
+		case -9: stage = TR(mdv_failed_memory); break;
 		default: break;
 		}
 		const bool ok = state.debug_view_stage == 1;
@@ -1367,36 +1366,42 @@ void draw_diagnostics_section(const PanelState &state, Settings &settings, Panel
 		const ui::Palette &pal = ui::palette();
 		status_line(ok ? pal.ok : waiting ? pal.warn : pal.fail, stage, false);
 		if (state.debug_view_note != nullptr && state.debug_view_note[0] != 0)
-			note("%s", state.debug_view_note);
+			technical_hint(state.debug_view_note);
 	}
 
-	ui::subsection("About");
+	ui::subsection(TR(sub_about));
 	note("Powered by NVIDIA DLSS and the NVIDIA NGX SDK.");
 	note("NVIDIA, NVIDIA RTX and GeForce RTX are trademarks of NVIDIA Corporation.");
 	note("AMD FidelityFX Super Resolution (c) Advanced Micro Devices, Inc. - MIT.");
 	note("Intel XeSS (c) Intel Corporation - Intel Simplified Software License.");
-	note("Full terms in THIRD-PARTY-NOTICES.md beside the add-on.");
+	note("%s", TR(about_terms));
 	ui::disclosure_end();
 }
 
-const RowOption kBackendOptions[] = {
-	{ "DLSS", "NVIDIA's. Needs a GeForce RTX", ui::Brand::Nvidia },
-	{ "FSR", "AMD's. Runs on any graphics card", ui::Brand::Amd },
-	{ "XeSS", "Intel's. Runs on any graphics card", ui::Brand::Intel },
-	{ "None", "No upscaler. Neural rendering still runs if it is on.", ui::Brand::None },
-	{ "RTX VSR", "NVIDIA only, DirectX 11 and SDR. Needs RTX video enhancement\n"
-		"switched on in the NVIDIA Control Panel.", ui::Brand::Nvidia },
+struct BackendOptions {
+	RowOption o[5];
 };
+
+BackendOptions backend_options()
+{
+	return { { { "DLSS", TR(taa_dlss_tip), ui::Brand::Nvidia },
+		{ "FSR", TR(taa_fsr_tip), ui::Brand::Amd },
+		{ "XeSS", TR(taa_xess_tip), ui::Brand::Intel },
+		{ TR(opt_none), TR(taa_none_tip), ui::Brand::None },
+		{ "RTX VSR", TR(taa_vsr_tip), ui::Brand::Nvidia } } };
+}
 
 ui::Brand chosen_brand(const Settings &settings)
 {
-	if (!settings.enabled || settings.backend >= static_cast<unsigned>(IM_ARRAYSIZE(kBackendOptions)))
+	if (!settings.enabled || settings.backend >= static_cast<unsigned>(IM_ARRAYSIZE(backend_options().o)))
 		return ui::Brand::Neutral;
-	return kBackendOptions[settings.backend].brand;
+	return backend_options().o[settings.backend].brand;
 }
 
 ui::Brand active_brand(const PanelState &state, const Settings &settings)
 {
+	if (state.optiscaler_upscales)
+		return ui::Brand::None;
 	if (state.active_is_fsr)
 		return ui::Brand::Amd;
 	if (state.active_is_xess)
@@ -1410,6 +1415,8 @@ const char *active_short_name(const PanelState &state, const Settings &settings)
 {
 	if (upscaler_off(settings))
 		return nullptr;
+	if (state.optiscaler_upscales)
+		return "OptiScaler";
 	if (state.active_is_fsr)
 		return "FSR";
 	if (state.active_is_xess)
@@ -1418,8 +1425,8 @@ const char *active_short_name(const PanelState &state, const Settings &settings)
 		return "RTX VSR";
 	if (state.active_is_dlss)
 		return "DLSS";
-	return settings.backend < static_cast<unsigned>(IM_ARRAYSIZE(kBackendOptions))
-		? kBackendOptions[settings.backend].label : nullptr;
+	return settings.backend < static_cast<unsigned>(IM_ARRAYSIZE(backend_options().o))
+		? backend_options().o[settings.backend].label : nullptr;
 }
 
 }
@@ -1428,28 +1435,48 @@ void draw_taa_section(const PanelState &state, Settings &settings, PanelActions 
 {
 	ui::band_begin("##taa_band");
 	bool enabled = settings.enabled;
-	if (ui::toggle("Enable upscaler", &enabled)) {
+	if (ui::toggle(TR(taa_enable), &enabled)) {
 		settings.enabled = enabled;
 		actions.reset = true;
 		actions.persist = true;
 	}
-	hint("Turns the upscaler on. Neural rendering has its own switch.");
+	hint(TR(taa_enable_tip));
 
-	if (button_row_index<kBackendChoiceCount>("##upscaler", &settings.backend, kBackendOptions,
-			"Which upscaler to use.", true, upscaler_lit(state, settings))) {
+	if (button_row_index<kBackendChoiceCount>("##upscaler", &settings.backend, backend_options().o,
+			TR(taa_which_tip), true, upscaler_lit(state, settings))) {
 		actions.persist = true;
 		actions.reset = true;
 	}
 
 	if (upscaler_off(settings))
-		status_line(ui::palette().off, "off", false);
+		status_line(ui::palette().off, TR(st_off), false);
 	else if (!state.upscaler_label.empty() || state.active_name != nullptr)
-		status_line(status_colour(state.active_status), status_label(state.active_status),
+		status_line(status_colour(state.active_status), diag_status_text(state.active_status, i18n::current()),
 			!state.active_error.empty());
+
+	if (state.optiscaler_offered) {
+		bool to_opti = settings.optiscaler_upscale;
+		if (ui::toggle(TR(taa_optiscaler), &to_opti)) {
+			settings.optiscaler_upscale = to_opti;
+			if (to_opti) {
+				settings.enabled = true;
+				settings.backend = static_cast<unsigned>(BackendChoice::Dlss);
+			} else if (settings.backend == static_cast<unsigned>(BackendChoice::Dlss) && !state.dlss_without_layer) {
+				settings.backend = static_cast<unsigned>(BackendChoice::Fsr);
+			}
+			actions.persist = true;
+			actions.reset = true;
+		}
+		hint(TR(taa_optiscaler_tip));
+		if (state.optiscaler_held == PanelState::OptiscalerHeld::PickDlss)
+			note("%s", TR(taa_optiscaler_pick_dlss));
+		else if (state.optiscaler_held == PanelState::OptiscalerHeld::GameDlss)
+			note("%s", TR(taa_optiscaler_game_dlss));
+	}
 
 	if (state.active_is_fsr && state.fsr_providers.size() > 1) {
 		std::vector<RowOption> opts;
-		opts.push_back(RowOption{ "Auto", "Picks the best version this GPU can run", ui::Brand::Amd });
+		opts.push_back(RowOption{ TR(opt_auto), TR(taa_fsr_auto_tip), ui::Brand::Amd });
 		for (const std::string &pv : state.fsr_providers)
 			opts.push_back(RowOption{ pv.c_str(), nullptr, ui::Brand::Amd });
 		int idx = 0;
@@ -1457,8 +1484,8 @@ void draw_taa_section(const PanelState &state, Settings &settings, PanelActions 
 			if (state.fsr_providers[i] == settings.fsr_provider)
 				idx = static_cast<int>(i) + 1;
 		}
-		if (button_row_n("FSR version", &idx, opts.data(), static_cast<int>(opts.size()),
-				"Locks FSR to one version instead of letting it choose.", false, upscaler_lit(state, settings))) {
+		if (button_row_n(TR(taa_fsr_version), &idx, opts.data(), static_cast<int>(opts.size()),
+				TR(taa_fsr_version_tip), false, upscaler_lit(state, settings))) {
 			settings.fsr_provider = idx == 0 ? std::string() : state.fsr_providers[static_cast<size_t>(idx) - 1];
 			actions.persist = true;
 			actions.reset = true;
@@ -1476,13 +1503,13 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 	std::snprintf(subtitle, sizeof(subtitle), "v%s - Barbatos AWLS", state.version != nullptr ? state.version : "");
 	const bool upscaler_running = upscaler_lit(state, settings);
 	ui::banner("AEON SR", subtitle);
-	if (ui::section("Temporal Anti-Aliasing", ui::icon::kTaa, "Temporal Anti-Aliasing", true, nullptr, nullptr,
+	if (ui::section("Temporal Anti-Aliasing", ui::icon::kTaa, TR(sec_taa), true, nullptr, nullptr,
 			active_short_name(state, settings), active_brand(state, settings), upscaler_running, true)) {
 		draw_taa_section(state, settings, actions);
 		ui::section_end();
 	}
 	const bool neural_running = settings.neural_render && state.neural_last == 1;
-	if (ui::section("Neural Rendering", ui::icon::kNeural, "Neural Rendering", false, nullptr, nullptr,
+	if (ui::section("Neural Rendering", ui::icon::kNeural, TR(sec_neural), false, nullptr, nullptr,
 			"DLSS 5", ui::Brand::Nvidia, neural_running)) {
 		draw_neural_section(state, settings, actions);
 		ui::section_end();
@@ -1494,7 +1521,7 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 	const ui::Brand fg_brand = fg_maker == FrameGenerator::Dlss ? ui::Brand::Nvidia
 		: fg_maker == FrameGenerator::Fsr ? ui::Brand::Amd
 		: fg_maker == FrameGenerator::Xess ? ui::Brand::Intel : ui::Brand::Neutral;
-	if (ui::section("Frame generation (experimental)", ui::icon::kFrames, "Frame generation (experimental)", false,
+	if (ui::section("Frame generation (experimental)", ui::icon::kFrames, TR(sec_framegen), false,
 			nullptr, nullptr, settings.frame_generation ? kFgShort[static_cast<unsigned int>(fg_maker) % kFrameGeneratorCount]
 				: nullptr, fg_brand,
 			settings.frame_generation && state.framegen.generating, true)) {
@@ -1502,17 +1529,17 @@ void draw_overlay(const PanelState &state, Settings &settings, PanelActions &act
 		ui::section_end();
 	}
 #endif
-	if (ui::section("Experiments", ui::icon::kExperiments, "Experiments", false)) {
+	if (ui::section("Experiments", ui::icon::kExperiments, TR(sec_experiments), false)) {
 		draw_experiments_section(state, settings, actions);
 		ui::section_end();
 	}
 	{
 		const CheckState worst = diag_worst(diag_checks(state, settings));
 		const ImVec4 badge_colour = check_colour(worst);
-		const char *badge = worst == CheckState::Fail ? "something failed"
-			: worst == CheckState::Warn ? "check this" : nullptr;
-		const char *badge_short = worst == CheckState::Fail ? "Failed" : "Check";
-		if (ui::section("Diagnostics", ui::icon::kDiagnostics, "Diagnostics", false, &badge_colour, badge, nullptr,
+		const char *badge = worst == CheckState::Fail ? TR(badge_something_failed)
+			: worst == CheckState::Warn ? TR(badge_check_this) : nullptr;
+		const char *badge_short = worst == CheckState::Fail ? TR(badge_failed_short) : TR(badge_check_short);
+		if (ui::section("Diagnostics", ui::icon::kDiagnostics, TR(sec_diagnostics), false, &badge_colour, badge, nullptr,
 				ui::Brand::Neutral, false, false, badge_short)) {
 			draw_diagnostics_section(state, settings, actions);
 			ui::section_end();
@@ -1540,18 +1567,19 @@ void draw_osd(const PanelState &state, const Settings &settings)
 	ImGui::SameLine(0.0f, ImGui::CalcTextSize("  ").x);
 	if (no_upscaler) {
 		ImGui::AlignTextToFramePadding();
-		ImGui::TextDisabled("No upscaler");
+		ImGui::TextDisabled("%s", TR(osd_no_upscaler));
 	} else {
 		ui::brand_chip(active_brand(state, settings),
-			!state.upscaler_label.empty() ? state.upscaler_label.c_str()
+			state.optiscaler_upscales ? TR(hd_upscaler_optiscaler)
+			: !state.upscaler_label.empty() ? state.upscaler_label.c_str()
 			: (state.active_name != nullptr ? state.active_name : "-"), lit);
 	}
 	const float gap = ImGui::CalcTextSize("  ").x;
 	float names = 0.0f;
 	if (!no_upscaler)
-		names = std::max(names, ImGui::CalcTextSize("Upscaler").x);
+		names = std::max(names, ImGui::CalcTextSize(TR(osd_upscaler)).x);
 	if (settings.neural_render)
-		names = std::max(names, ImGui::CalcTextSize("Neural (DLSS 5)").x);
+		names = std::max(names, ImGui::CalcTextSize(TR(osd_neural)).x);
 	const float column = ImGui::GetCursorScreenPos().x + names + gap;
 	const auto name = [&](const char *text) {
 		ImGui::AlignTextToFramePadding();
@@ -1560,14 +1588,15 @@ void draw_osd(const PanelState &state, const Settings &settings)
 		ImGui::SetCursorScreenPos(ImVec2(column, ImGui::GetCursorScreenPos().y));
 	};
 	if (!no_upscaler) {
-		name("Upscaler");
-		ui::pill(status_colour(state.active_status), status_label(state.active_status), false);
+		name(TR(osd_upscaler));
+		ui::pill(status_colour(state.active_status), diag_status_text(state.active_status, i18n::current()), false);
 	}
 	if (settings.enabled && !state.active_error.empty()) {
-		std::string tech;
-		const std::string said = diag_player_text(narrow_lossy(state.active_error), &tech);
-		if (tech.empty()) {
-			ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::max(names + gap + ui::pill_width("Could not start"),
+		std::string tech, cut;
+		const std::string said = diag_player_text(diag_said(narrow_lossy(state.active_error), i18n::current(),
+			i18n::S::Count, &tech), &cut);
+		if (!said.empty() && cut.empty()) {
+			ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::max(names + gap + ui::pill_width(TR(st_could_not_start)),
 				ImGui::CalcTextSize("0").x * 30.0f));
 			ImGui::TextColored(pal.muted, "%s", said.c_str());
 			ImGui::PopTextWrapPos();
@@ -1575,17 +1604,17 @@ void draw_osd(const PanelState &state, const Settings &settings)
 	}
 	if (settings.neural_render) {
 		const bool nvidia = vendor_may_be_nvidia(state.gpu_vendor);
-		const char *word = !nvidia ? "needs NVIDIA"
-			: state.neural_crashed ? "failed"
-			: !state.neural_shim_present ? "file missing"
-			: state.neural_last == 1 ? "running"
-			: state.neural_last == -1 ? "failed"
-			: state.neural_dll_present ? "waiting" : "file missing";
+		const char *word = !nvidia ? TR(osd_needs_nvidia)
+			: state.neural_crashed ? TR(osd_failed)
+			: !state.neural_shim_present ? TR(osd_file_missing)
+			: state.neural_last == 1 ? TR(osd_running)
+			: state.neural_last == -1 ? TR(osd_failed)
+			: state.neural_dll_present ? TR(osd_waiting) : TR(osd_file_missing);
 		const ImVec4 colour = !nvidia || !state.neural_shim_present ? pal.warn
 			: state.neural_crashed || state.neural_last == -1 ? pal.fail
 			: state.neural_last == 1 ? pal.ok
 			: state.neural_dll_present ? pal.off : pal.warn;
-		name("Neural (DLSS 5)");
+		name(TR(osd_neural));
 		ui::pill(colour, word, false);
 	}
 	ui::osd_end();

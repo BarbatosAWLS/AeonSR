@@ -1,6 +1,7 @@
 #include "aeon_sr/ngx/ngx_runtime_d3d12.hpp"
 #include "aeon_sr/ngx/ngx_api12.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
+#include "aeon_sr/ngx/ngx_dlssg_files.hpp"
 #include "aeon_sr/ngx/ngx_session_ngx.hpp"
 #include "aeon_sr/ngx/ngx_shared_d3d12.hpp"
 
@@ -34,10 +35,11 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 
 	if (!ensure_dll_present())
 		return false;
-	api = &ngx12_api(addon_dir);
+	api = layer_path.empty() ? &ngx12_api(addon_dir) : &ngx12_layer_api(layer_path);
 	if (!api->usable()) {
 		status = UpscalerStatus::InitFailed;
-		last_error = L"DLSS was to run through " + api->path + L", but " + api->error;
+		last_error = (layer_path.empty() ? L"DLSS was to run through " : L"DLSS input was to go to ") +
+			api->path + L", but " + api->error;
 		return false;
 	}
 	if (device == nullptr) {
@@ -69,11 +71,28 @@ bool NgxRuntimeD3D12::init_device(ID3D12Device *dev, uint32_t w, uint32_t h)
 			: (L"pre-init NGX modules in process: " + found));
 	}
 
-	const std::wstring search_dir = ngx12_feature_dir(*api, !dll_dir.empty() ? dll_dir : addon_dir);
-	const wchar_t *path_list[] = { search_dir.c_str() };
+	const std::wstring own_dir = !dll_dir.empty() ? dll_dir : addon_dir;
+	std::wstring search_dir = layer_path.empty() ? ngx12_feature_dir(*api, own_dir) : own_dir;
+	if (!layer_path.empty()) {
+		const std::wstring d4r = ngx_override_dlss_dir(ngx_override_path(addon_dir));
+		if (!d4r.empty())
+			search_dir = d4r;
+	}
+	std::vector<std::wstring> dirs{ search_dir };
+	if (layer_path.empty() && !api->external()) {
+		const NgxPathList list = ngx_path_list_for(search_dir, find_dlssg(addon_dir));
+		if (!list.dirs.empty())
+			dirs = list.dirs;
+		if (dirs.size() > 1 || !list.note.empty())
+			diag_info("dlss", L"NGX folders: " + dirs[0] + (dirs.size() > 1 ? L", then " + dirs[1] : L"") +
+				(list.note.empty() ? L"" : L" (nvngx_dlssg.dll's " + list.note + L")"));
+	}
+	std::vector<const wchar_t *> path_list;
+	for (const std::wstring &d : dirs)
+		path_list.push_back(d.c_str());
 	NVSDK_NGX_FeatureCommonInfo feature_info{};
-	feature_info.PathListInfo.Path = path_list;
-	feature_info.PathListInfo.Length = 1;
+	feature_info.PathListInfo.Path = path_list.data();
+	feature_info.PathListInfo.Length = static_cast<unsigned int>(path_list.size());
 	feature_info.LoggingInfo.LoggingCallback = ngx_log_callback;
 	feature_info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
 	feature_info.LoggingInfo.DisableOtherLoggingSinks = false;

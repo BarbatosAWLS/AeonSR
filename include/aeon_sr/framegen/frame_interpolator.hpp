@@ -42,7 +42,6 @@ public:
 	uint32_t width() const noexcept { return w_; }
 	uint32_t height() const noexcept { return h_; }
 	DXGI_FORMAT family() const noexcept { return family_; }
-	DXGI_FORMAT input_family() const noexcept { return input_family_; }
 	bool copies_into(DXGI_FORMAT f) const noexcept;
 
 	void release() noexcept;

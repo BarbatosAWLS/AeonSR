@@ -194,6 +194,7 @@ void FrameGeneration::note_blocked(const std::wstring &why)
 
 void FrameGeneration::off()
 {
+	stage_.forget_refusal();
 	if (sync_watched_)
 		present_sync::forget();
 	sync_watched_ = sync_watch_failed_ = false;
@@ -244,6 +245,7 @@ void FrameGeneration::device_gone(device *dev)
 {
 	if (runtime_ == nullptr || dev == nullptr || runtime_->get_device() != dev)
 		return;
+	stage_.forget_refusal();
 	for (resource &r : dump_rb_)
 		r = { 0 };
 	prev_round_ = ~0ull;
@@ -342,6 +344,7 @@ bool FrameGeneration::round(effect_runtime *runtime, FrameBridge &bridge, Engine
 	const Settings &settings)
 {
 	const double t0 = now_ms();
+	stage_.settings_changed(frame_gen_settings_key(settings));
 	part_begin_ = part_record_ = part_end_ = 0.0;
 	if (!presenter_.ensure(runtime, &note_))
 		return false;
@@ -477,6 +480,7 @@ bool FrameGeneration::round_own_window(effect_runtime *runtime, FrameBridge &bri
 	double presented_ms, const Settings &settings)
 {
 	const double t0 = now_ms();
+	stage_.settings_changed(frame_gen_settings_key(settings));
 	part_begin_ = part_record_ = part_end_ = 0.0;
 	++rounds_;
 	presenter_.copy_back_buffer(runtime);
@@ -659,21 +663,25 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 			L"apart, %u handed over; made by %hs at %ls; on the screen %.1f real and %.1f made frames a second at %.1f Hz "
 			L"(%ls), %llu real frames left out, %llu refreshes held, %llu repeated by the multiplier, %.1f ms behind the "
 			L"game (%.1f of it until a frame is usable); on the screen %.1f ms after the game's own time (real frames "
-			L"%.1f, p90 %.1f, %u seen; held %.1f ms after ready), decided %.1f ms before its refresh, %llu missed, %llu late, shown %.1f ms after the blank planned (earliest %.1f); on the game's thread, median ms: round %.2f (begin %.2f, "
+			L"%.1f, p90 %.1f, %u seen; held %.1f ms after ready, ready to decided p90 %.1f), decided %.1f ms before its refresh, %llu missed (%llu with the GPU work late), %llu late, shown %.1f ms after the blank planned (earliest %.1f); on the game's thread, median ms: round %.2f (begin %.2f, "
 			L"estimator %.2f, end %.2f), wait %.2f; window's thread p90/most ms: swap chain wait %.1f/%.1f, late "
-			L"%.1f/%.1f, picture %.1f/%.1f, present %.1f/%.1f, GPU done p90 d3d12 %.1f d3d11 %.1f; window %ls", (ret - window_start_) / 1000.0, w.frames, med(w.real),
+			L"%.1f/%.1f, picture %.1f/%.1f, present %.1f/%.1f, GPU done p90 d3d12 %.1f d3d11 %.1f, decision to done, longest of 6 s, %.1f (%llu seen done, %llu found done, %llu not timed); window %ls", (ret - window_start_) / 1000.0, w.frames, med(w.real),
 			w.generated, by.c_str(), steps, s.real_per_s, s.generated_per_s, s.period_ms > 0.0 ? 1000.0 / s.period_ms : 0.0,
 			s.paced_by == OverlayStats::kPacedByMonitor ? L"the monitor's vertical blanks"
 				: s.paced_by == OverlayStats::kPacedByCompositor ? L"the compositor's clock" : L"the swap chain's releases",
 			static_cast<unsigned long long>(s.skipped - std::min(s.skipped, own_logged_.skipped)),
 			static_cast<unsigned long long>(s.held - std::min(s.held, own_logged_.held)),
 			static_cast<unsigned long long>(s.repeated - std::min(s.repeated, own_logged_.repeated)), s.latency_ms,
-			s.usable_lag_ms, s.screen_ms_p50, s.screen_real_ms_p50, s.screen_real_ms_p90, s.screen_samples, s.held_real_ms_p50, s.lead_ms,
+			s.usable_lag_ms, s.screen_ms_p50, s.screen_real_ms_p50, s.screen_real_ms_p90, s.screen_samples, s.held_real_ms_p50, s.ready_wait_p90, s.lead_ms,
 			static_cast<unsigned long long>(s.missed - std::min(s.missed, own_logged_.missed)),
+			static_cast<unsigned long long>(s.missed_late_work - std::min(s.missed_late_work, own_logged_.missed_late_work)),
 			static_cast<unsigned long long>(s.late - std::min(s.late, own_logged_.late)), s.offset_p50_ms, s.offset_min_ms,
 			med(w.round), med(w.begin), med(w.record), med(w.end), med(w.waits),
 			s.thread_waitable_p90, s.thread_waitable_max, s.thread_late_p90, s.thread_late_max, s.thread_render_p90,
-			s.thread_render_max, s.thread_present_p90, s.thread_present_max, s.gpu_d3d12_p90, s.gpu_d3d11_p90,
+			s.thread_render_max, s.thread_present_p90, s.thread_present_max, s.gpu_d3d12_p90, s.gpu_d3d11_p90, s.work_ms,
+			static_cast<unsigned long long>(s.work_seen - std::min(s.work_seen, own_logged_.work_seen)),
+			static_cast<unsigned long long>(s.work_found - std::min(s.work_found, own_logged_.work_found)),
+			static_cast<unsigned long long>(s.work_untimed - std::min(s.work_untimed, own_logged_.work_untimed)),
 			!s.visible ? L"hidden (the game is not in front)"
 				: s.in_host ? L"shown, from AeonSRHost.exe" : L"shown, from the game's process");
 		own_logged_ = s;
@@ -770,7 +778,6 @@ void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, E
 			++window_.generated;
 		} else {
 			++window_.failed;
-			++present_failures_;
 			note_ = why;
 			if (presenter_.failures_in_a_row() >= kPresentGiveUp) {
 				route_given_up_ = true;
@@ -890,7 +897,6 @@ FrameGenReadout FrameGeneration::readout() const
 	r.generating = r.on && !route_given_up_ && !route_too_slow_;
 	r.state = pacer_.state();
 	r.generated = generated_;
-	r.present_failures = present_failures_;
 	r.route = presenter_.route();
 	r.gpu_ms = gpu_ms_;
 	r.generator = stage_.active_generator();

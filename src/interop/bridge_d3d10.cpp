@@ -1,4 +1,5 @@
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/interop/interop_bridges.hpp"
 #include "aeon_sr/interop/native_d3d.hpp"
 
@@ -11,15 +12,6 @@
 
 namespace aeon_sr {
 namespace {
-
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 constexpr uint64_t kKeyIdle = 0;
 constexpr uint64_t kKeyHelperPull = 1;

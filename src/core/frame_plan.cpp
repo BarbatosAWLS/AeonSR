@@ -51,7 +51,7 @@ void plan_vsr_params(const Settings &s, const FrameSignals &sig, UpscalerParams 
 	p.render_width = 0;
 	p.render_height = 0;
 	p.quality_mode = s.upscale_mode;
-	p.sharpness = s.sharpness;
+	p.sharpness = clamp_sharpness(s.sharpness);
 
 	p.jitter_x = 0.0f;
 	p.jitter_y = 0.0f;
@@ -140,7 +140,7 @@ FramePlan plan_frame(const Settings &s, const FrameSignals &sig, const BackendSl
 
 	p.quality_mode = s.upscale_mode;
 	p.render_preset = s.render_preset;
-	p.sharpness = s.sharpness;
+	p.sharpness = clamp_sharpness(s.sharpness);
 	p.frame_time_ms = frame_time_ms;
 	p.color_space = static_cast<uint32_t>(sig.color_space);
 

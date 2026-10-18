@@ -14,11 +14,36 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace aeon_sr {
 
 class RemoteEngine {
 public:
+	struct Extras {
+		std::string fsr_provider;
+		uint32_t neural_restart_epoch = 0;
+		uint32_t accum_epoch = 0, accum_target = 0;
+		uint32_t capture_epoch = 0, capture_frames = 0;
+		std::wstring capture_dir;
+	};
+	struct Info {
+		bool valid = false;
+		uint32_t neural_flags = 0;
+		bool accum_running = false, accum_holding = false;
+		uint32_t accum_done = 0, accum_target = 0;
+		float neural_area_share = 0.0f;
+		uint32_t neural_driver_major = 0, neural_driver_minor = 0;
+		uint32_t neural_required_major = 0, neural_required_minor = 0;
+		uint32_t neural_min_architecture = 0, neural_card_architecture = 0;
+		uint32_t neural_runtime_minimum = 0, neural_reported_architecture = 0;
+		uint64_t neural_eval_count = 0;
+		uint32_t vsr_status = 0;
+		std::vector<std::string> fsr_providers;
+		std::wstring fsr_provider_version;
+		std::string neural_runtime_version, neural_runtime_sha256, neural_runtime_kernels, neural_runtime_cards;
+		std::wstring neural_runtime_file, neural_capture_status;
+	};
 	struct Request {
 		const FrameInputs *inputs = nullptr;
 		BackendChoice backend = BackendChoice::None;
@@ -29,7 +54,9 @@ public:
 		ID3D12Resource *guide = nullptr;
 		D3D12_RESOURCE_STATES guide_state = GuideBuilder::kMaskState;
 		float depth_jitter_u = 0.0f, depth_jitter_v = 0.0f;
+		bool upscaled_here = false;
 		reshade::api::command_queue *game_queue = nullptr;
+		Extras extras;
 	};
 
 	struct Reply {
@@ -46,6 +73,7 @@ public:
 		bool list_recording = true;
 		float wait_ms = std::numeric_limits<float>::quiet_NaN();
 		bool host_busy = false;
+		Info info;
 	};
 
 	bool start(EngineDevice &engine, HMODULE module, reshade::api::device_api game_api);
@@ -64,7 +92,6 @@ public:
 
 	std::wstring last_error;
 
-	const std::wstring &host_path() const noexcept { return host_path_; }
 	uint32_t host_pid() const noexcept { return host_pid_; }
 	std::wstring describe() const;
 
@@ -90,9 +117,12 @@ private:
 
 	bool ensure_plane(EngineDevice &engine, uint32_t role, ID3D12Resource *src,
 		remote::PlaneDesc &desc);
+	bool ensure_texture(EngineDevice &engine, SharedTexture &t, const wchar_t *tag, bool written_there,
+		ID3D12Resource *src, remote::PlaneDesc &desc);
 	bool exchange(EngineDevice &engine, const Request &req,
 		const remote::PlaneDesc *descs, Reply &reply);
 	void release_plane(uint32_t role);
+	void release_texture(SharedTexture &t);
 	bool host_still_owns_planes() const noexcept;
 
 	HANDLE map_ = nullptr;
@@ -109,6 +139,7 @@ private:
 	uint64_t frame_index_ = 0;
 
 	SharedTexture planes_[kPlanes];
+	SharedTexture output_;
 
 	remote::SessionNames names_{};
 	std::wstring host_path_;

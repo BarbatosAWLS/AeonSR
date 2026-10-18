@@ -1,4 +1,5 @@
 #include "aeon_sr/framegen/xess_fake_swapchain.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/framegen/vendor_frame_gen_impl.hpp"
 
 #include "aeon_sr/interop/blit_d3d12.hpp"
@@ -9,15 +10,6 @@
 namespace aeon_sr {
 
 namespace {
-
-template <typename T>
-void release(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 bool is_factory_iid(REFIID riid)
 {
@@ -55,12 +47,12 @@ public:
 	{
 		lists_.release();
 		for (ID3D12Resource *&b : buffers_)
-			release(b);
+			safe_release(b);
 		for (ID3D12CommandQueue *&q : buffer_queues_)
-			release(q);
-		release(device_);
-		release(queue_);
-		release(real_factory_);
+			safe_release(q);
+		safe_release(device_);
+		safe_release(queue_);
+		safe_release(real_factory_);
 		if (latency_ != nullptr)
 			CloseHandle(latency_);
 	}
@@ -68,7 +60,7 @@ public:
 	bool make_buffers()
 	{
 		for (ID3D12Resource *&b : buffers_)
-			release(b);
+			safe_release(b);
 		buffers_.assign(desc_.BufferCount, nullptr);
 		D3D12_HEAP_PROPERTIES hp{};
 		hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -327,7 +319,7 @@ public:
 			desc_.Format = fmt;
 		desc_.Flags = flags;
 		for (ID3D12CommandQueue *&q : buffer_queues_)
-			release(q);
+			safe_release(q);
 		buffer_queues_.clear();
 		if (queues != nullptr)
 			for (UINT i = 0; i < desc_.BufferCount; ++i) {
@@ -417,7 +409,7 @@ public:
 	{
 		real_->AddRef();
 	}
-	~CaptureFactory() { release(real_); }
+	~CaptureFactory() { safe_release(real_); }
 
 	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **out) override
 	{
@@ -600,9 +592,9 @@ private:
 XefgCaptures::~XefgCaptures()
 {
 	for (ID3D12Resource *&s : slot)
-		release(s);
-	release(captured);
-	release(consumed);
+		safe_release(s);
+	safe_release(captured);
+	safe_release(consumed);
 	if (event != nullptr)
 		CloseHandle(event);
 }

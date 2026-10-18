@@ -7,9 +7,14 @@
 #include <dx12/ffx_api_dx12.h>
 #include <ffx_framegeneration.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace aeon_sr {
 namespace {
@@ -25,6 +30,24 @@ ffxReturnCode_t create_guarded(PfnFfxCreateContext fn, ffxContext *ctx, ffxCreat
 		*crashed = true;
 		return FFX_API_RETURN_ERROR;
 	}
+}
+
+bool ffx_version_newer(const std::string &a, const std::string &b)
+{
+	const auto parts = [](const std::string &s) {
+		std::vector<unsigned long> v;
+		size_t i = s.find_first_of("0123456789");
+		while (i != std::string::npos && i < s.size()) {
+			char *end = nullptr;
+			v.push_back(std::strtoul(s.c_str() + i, &end, 10));
+			i = static_cast<size_t>(end - s.c_str());
+			if (i >= s.size() || s[i] != '.')
+				break;
+			++i;
+		}
+		return v;
+	};
+	return parts(a) > parts(b);
 }
 
 std::wstring ffx_error(const wchar_t *what, ffxReturnCode_t r)
@@ -212,13 +235,61 @@ private:
 		desc.displaySize = { w_, h_ };
 		desc.maxRenderSize = { w_, h_ };
 		desc.backBufferFormat = ffxApiGetSurfaceFormatDX12(format_);
-		ffxContext ctx = nullptr;
-		bool crashed = false;
-		const ffxReturnCode_t r = create_guarded(api_.CreateContext, &ctx, &desc.header, &crashed);
-		if (crashed) {
-			error_ = L"FSR frame generation: the runtime crashed creating its context";
-			return false;
+
+		std::vector<std::pair<uint64_t, std::string>> offered;
+		{
+			uint64_t count = 0;
+			ffxQueryDescGetVersions q{};
+			q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+			q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+			q.device = device_;
+			q.outputCount = &count;
+			if (api_.Query(nullptr, &q.header) == FFX_API_RETURN_OK && count > 0 && count <= 32) {
+				std::vector<uint64_t> ids(static_cast<size_t>(count));
+				std::vector<const char *> names(static_cast<size_t>(count));
+				q.versionIds = ids.data();
+				q.versionNames = names.data();
+				if (api_.Query(nullptr, &q.header) == FFX_API_RETURN_OK)
+					for (uint64_t i = 0; i < count; ++i)
+						offered.emplace_back(ids[static_cast<size_t>(i)],
+							names[static_cast<size_t>(i)] != nullptr ? names[static_cast<size_t>(i)] : "");
+			}
 		}
+		std::stable_sort(offered.begin(), offered.end(), [](const auto &a, const auto &b) {
+			return ffx_version_newer(a.second, b.second);
+		});
+		std::wstring list;
+		for (const auto &o : offered)
+			list += (list.empty() ? L"" : L", ") + std::wstring(o.second.begin(), o.second.end());
+		diag_logf(DiagLevel::Info, "framegen", L"FSR frame generation versions offered on this card: %ls",
+			list.empty() ? L"none named" : list.c_str());
+
+		ffxContext ctx = nullptr;
+		ffxReturnCode_t r = FFX_API_RETURN_ERROR;
+		std::wstring refused;
+		for (size_t i = 0; i <= offered.size() && ctx == nullptr; ++i) {
+			ffxOverrideVersion pin{};
+			backend.header.pNext = nullptr;
+			if (i < offered.size()) {
+				pin.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+				pin.versionId = offered[i].first;
+				backend.header.pNext = &pin.header;
+			}
+			bool crashed = false;
+			r = create_guarded(api_.CreateContext, &ctx, &desc.header, &crashed);
+			if (crashed) {
+				error_ = L"FSR frame generation: the runtime crashed creating its context";
+				return false;
+			}
+			if ((r != FFX_API_RETURN_OK || ctx == nullptr) && i < offered.size()) {
+				ctx = nullptr;
+				refused += (refused.empty() ? L"" : L", ") +
+					std::wstring(offered[i].second.begin(), offered[i].second.end());
+			}
+		}
+		backend.header.pNext = nullptr;
+		if (!refused.empty())
+			diag_logf(DiagLevel::Info, "framegen", L"FSR frame generation: this card refused %ls", refused.c_str());
 		if (r != FFX_API_RETURN_OK || ctx == nullptr) {
 			error_ = ffx_error(L"FSR frame generation: CreateContext", r);
 			return false;

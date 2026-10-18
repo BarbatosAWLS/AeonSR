@@ -281,7 +281,6 @@ public:
 	void note_composite_size(uint64_t from, uint32_t w, uint32_t h) noexcept;
 	uint64_t composite_size() const noexcept { return composite_size_.load(std::memory_order_acquire); }
 	void forget_target(uint64_t resource) noexcept;
-	void note_frame_depth() noexcept { saw_frame_depth_.store(true, std::memory_order_relaxed); }
 	void note_scene_tested(uint64_t serial, bool window = false) noexcept
 	{
 		if (serial == 0)
@@ -325,7 +324,6 @@ public:
 	{
 		return serial != 0 && scene_perspective_.load(std::memory_order_relaxed) == serial;
 	}
-	bool saw_frame_depth() const noexcept { return saw_frame_depth_.load(std::memory_order_relaxed); }
 	void forget_scene_targets() noexcept;
 	bool swapchain_image(uint64_t resource) const noexcept;
 	bool swapchain_watched() const noexcept;
@@ -388,7 +386,6 @@ private:
 	uint64_t presentations_[kPresentedHistory]{};
 	uint32_t presentation_next_ = 0;
 	std::atomic<uint32_t> presented_next_{ 0 };
-	std::atomic<bool> saw_frame_depth_{ false };
 	std::atomic<uint64_t> scene_tested_{ 0 };
 	std::atomic<uint64_t> scene_tested_boundary_{ 0 };
 	std::atomic<bool> promoted_forced_{ false };

@@ -3,22 +3,6 @@
 #include "aeon_sr/interop/native_d3d.hpp"
 
 namespace aeon_sr {
-namespace {
-
-void sync_status(UpscalerBackend &backend, const NgxSession &rt)
-{
-	backend.status = backend.crashed ? UpscalerStatus::Crashed : rt.status;
-	backend.last_error = rt.last_error;
-	backend.crashed = rt.crashed || backend.crashed;
-}
-
-template <class T>
-T *native_handle(uint64_t handle) noexcept
-{
-	return reinterpret_cast<T *>(static_cast<uintptr_t>(handle));
-}
-
-}
 
 const char *DlssD3D11Backend::name() const { return "DLSS"; }
 reshade::api::device_api DlssD3D11Backend::api() const { return reshade::api::device_api::d3d11; }

@@ -1,4 +1,5 @@
 #include "aeon_sr/core/report_bundle.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/core/half_float.hpp"
 
@@ -28,15 +29,6 @@ void put32(std::vector<uint8_t> &o, uint32_t v)
 
 uint32_t get16(const uint8_t *p) noexcept { return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8); }
 uint32_t get32(const uint8_t *p) noexcept { return get16(p) | (get16(p + 2) << 16); }
-
-template <typename T>
-void release(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 struct ComScope {
 	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -318,11 +310,11 @@ bool encode_png(const uint8_t *rows, uint32_t width, uint32_t height, uint32_t r
 				*error = L"the PNG could not be read back from memory";
 		}
 	}
-	release(props);
-	release(frame);
-	release(encoder);
-	release(stream);
-	release(factory);
+	safe_release(props);
+	safe_release(frame);
+	safe_release(encoder);
+	safe_release(stream);
+	safe_release(factory);
 	*lossless = ok && !half;
 	return ok;
 }
@@ -359,11 +351,11 @@ bool decode_png(const std::vector<uint8_t> &png, uint32_t *width, uint32_t *heig
 			*bits = deep ? 16u : 8u;
 		}
 	}
-	release(conv);
-	release(frame);
-	release(decoder);
-	release(stream);
-	release(factory);
+	safe_release(conv);
+	safe_release(frame);
+	safe_release(decoder);
+	safe_release(stream);
+	safe_release(factory);
 	return ok;
 }
 

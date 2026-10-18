@@ -1,7 +1,11 @@
 #include "host_session.hpp"
 #include "window_host.hpp"
+#if AEONSR_FRAME_GENERATION
+#include "framegen_host.hpp"
+#endif
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/framegen/fg_gpu_priority.hpp"
 #include "aeon_sr/interop/remote_protocol.hpp"
 #include "aeon_sr/core/settings.hpp"
 #include "aeon_sr/upscalers/native_dlss.hpp"
@@ -96,19 +100,32 @@ struct Args {
 	bool verbose = false;
 	bool gpu_priority_high = false;
 	uint64_t present_block = 0;
+	uint64_t framegen_block = 0;
 };
 
 void raise_gpu_priority(HostSession &session)
 {
 	session.set_queue_priority(D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
-	using SetClass = LONG(APIENTRY *)(HANDLE, int);
-	const HMODULE gdi = GetModuleHandleW(L"gdi32.dll") != nullptr ? GetModuleHandleW(L"gdi32.dll")
-		: LoadLibraryW(L"gdi32.dll");
-	const auto set_class = gdi != nullptr
-		? reinterpret_cast<SetClass>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass")) : nullptr;
-	const LONG status = set_class != nullptr ? set_class(GetCurrentProcess(), 4) : -1;
-	diag_logf(DiagLevel::Info, "host", L"GPU priority raised: queue HIGH, scheduling class HIGH %ls (0x%08X)",
-		status == 0 ? L"set" : L"refused", static_cast<unsigned>(status));
+	GpuClass now = GpuClass::Normal;
+	bool known = false;
+	const LONG status = set_own_gpu_class(GpuClass::High, &now, &known);
+	diag_logf(DiagLevel::Info, "host", L"GPU priority raised: queue HIGH, scheduling class %ls (0x%08X)",
+		known ? gpu_class_name(now) : L"not known", static_cast<unsigned>(status));
+}
+
+void put_window_first()
+{
+	const GpuClass wanted = window_gpu_class_wanted();
+	if (wanted == GpuClass::Normal) {
+		diag_info("host", L"GPU scheduling class left as it was (AEONSR_FG_GPU_PRIORITY=normal)");
+		return;
+	}
+	GpuClass now = GpuClass::Normal;
+	bool known = false;
+	const LONG status = set_own_gpu_class(wanted, &now, &known);
+	diag_logf(known && now == wanted ? DiagLevel::Info : DiagLevel::Warn, "host",
+		L"GPU scheduling class %ls asked for frame generation's window, %ls now (0x%08X)", gpu_class_name(wanted),
+		known ? gpu_class_name(now) : L"not known", static_cast<unsigned>(status));
 }
 
 Args parse_args()
@@ -127,6 +144,8 @@ Args parse_args()
 			args.verbose = true;
 		else if (wcscmp(argv[i], L"--present") == 0 && i + 1 < argc)
 			args.present_block = _wcstoui64(argv[++i], nullptr, 10);
+		else if (wcscmp(argv[i], L"--framegen") == 0 && i + 1 < argc)
+			args.framegen_block = _wcstoui64(argv[++i], nullptr, 10);
 		else if (wcscmp(argv[i], L"--gpu-priority") == 0 && i + 1 < argc)
 			args.gpu_priority_high = wcscmp(argv[++i], L"high") == 0;
 	}
@@ -311,8 +330,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 	diag_set_verbose(args.verbose);
 
 	int code = ExitNoPid;
-	if (args.present_block != 0)
+	if (args.present_block != 0) {
+		put_window_first();
 		code = aeon_sr::host::run_window_host(args.present_block);
+	}
+#if AEONSR_FRAME_GENERATION
+	else if (args.framegen_block != 0)
+		code = aeon_sr::host::run_framegen_host(args.framegen_block);
+#endif
 	else if (args.pid == 0)
 		diag_error("host", L"AeonSRHost needs --pid <game process id> and was given none.");
 	else

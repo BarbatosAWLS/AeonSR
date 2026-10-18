@@ -1,26 +1,21 @@
 #include "host_session.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/core/settings.hpp"
+#include "aeon_sr/ngx/neural_hardware.hpp"
 
 #include <Windows.h>
 
+#include <algorithm>
+#include <cstring>
 #include <cwchar>
 
 namespace aeon_sr::host {
 namespace {
 
 constexpr uint32_t kMaxPlaneExtent = 16384;
-
-template <class T>
-void release(T *&obj) noexcept
-{
-	if (obj != nullptr) {
-		obj->Release();
-		obj = nullptr;
-	}
-}
 
 void copy_name(wchar_t (&dst)[remote::kNameChars], const wchar_t *src) noexcept
 {
@@ -89,6 +84,7 @@ bool HostSession::start(uint32_t game_pid, remote::Block *block, const std::wstr
 	ngx12_.addon_dir = host_dir;
 	ngx12_.data_dir = data_dir;
 	dlss_.rt = &ngx12_;
+	vsr_.engine = &engine_;
 	fsr_.addon_dir = host_dir;
 	xess_.addon_dir = host_dir;
 	neural_.addon_dir = host_dir;
@@ -112,6 +108,8 @@ HostCapabilities HostSession::capabilities()
 		caps.backends_present |= 1u << static_cast<uint32_t>(BackendChoice::Fsr);
 	if (xess_.runtime_present())
 		caps.backends_present |= 1u << static_cast<uint32_t>(BackendChoice::Xess);
+	if (engine_.device11() != nullptr)
+		caps.backends_present |= 1u << static_cast<uint32_t>(BackendChoice::Vsr);
 	caps.neural_present = neural_.ensure_dll_present() ? 1u : 0u;
 
 	GpuInfo gpu;
@@ -136,8 +134,9 @@ void HostSession::shutdown()
 	dlss_.shutdown();
 	fsr_.shutdown();
 	xess_.shutdown();
+	vsr_.shutdown();
 	release_planes();
-	release(fence_);
+	safe_release(fence_);
 	fence_name_[0] = L'\0';
 	gpu_timer_.release();
 	engine_.shutdown();
@@ -148,7 +147,7 @@ void HostSession::release_plane(Plane &plane) noexcept
 {
 	if (plane.res != nullptr)
 		engine_.wait_cpu(engine_.last_submitted());
-	release(plane.res);
+	safe_release(plane.res);
 	plane.generation = 0;
 	plane.name[0] = L'\0';
 }
@@ -157,6 +156,7 @@ void HostSession::release_planes() noexcept
 {
 	for (Plane &plane : planes_)
 		release_plane(plane);
+	release_plane(output_);
 }
 
 void HostSession::fail(remote::RemoteStep step, const char *key, std::wstring text,
@@ -186,7 +186,7 @@ ID3D12Resource *HostSession::open_shared_texture(const wchar_t *name, HRESULT *o
 	hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&res));
 	CloseHandle(handle);
 	if (FAILED(hr) || res == nullptr) {
-		release(res);
+		safe_release(res);
 		*out_hr = FAILED(hr) ? hr : E_HANDLE;
 		return nullptr;
 	}
@@ -206,7 +206,7 @@ bool HostSession::ensure_fence()
 	if (fence_ != nullptr && wcscmp(fence_name_, name) == 0)
 		return true;
 
-	release(fence_);
+	safe_release(fence_);
 	fence_name_[0] = L'\0';
 
 	ID3D12Device *const device = engine_.device();
@@ -222,7 +222,7 @@ bool HostSession::ensure_fence()
 	hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&fence_));
 	CloseHandle(handle);
 	if (FAILED(hr) || fence_ == nullptr) {
-		release(fence_);
+		safe_release(fence_);
 		fail(remote::RemoteStep::Engine, "host.fence",
 			L"the engine host could not reach the fence the game published, so it cannot "
 			L"order its work against the game's.",
@@ -238,58 +238,60 @@ bool HostSession::open_planes()
 {
 	constexpr uint32_t kCount = static_cast<uint32_t>(remote::PlaneRole::Count);
 
-	for (uint32_t i = 0; i < kCount; ++i) {
-		Plane &cached = planes_[i];
-		const remote::PlaneDesc &desc = block_->planes[i];
-		const uint32_t share = desc.share;
-		const uint32_t format = desc.dxgi_format;
-		const uint64_t generation = desc.generation;
-		wchar_t name[remote::kNameChars]{};
-		copy_name(name, desc.name);
-
-		const auto role = static_cast<remote::PlaneRole>(i);
-		const std::wstring role_text = diag_widen(remote::plane_role_label(role));
-
-		if (share == static_cast<uint32_t>(remote::ShareKind::None) || format == 0 ||
-			name[0] == L'\0') {
-			release_plane(cached);
-			continue;
-		}
-		if (share == static_cast<uint32_t>(remote::ShareKind::KmtValue)) {
-			release_plane(cached);
-			fail(remote::RemoteStep::OpenPlanes, "host.planes",
-				L"the game offered its " + role_text + L" texture in a form only its own "
-				L"process can open. Run the game in a window on the same graphics card, "
-				L"or turn the upscaler off.");
+	for (uint32_t i = 0; i < kCount; ++i)
+		if (!open_plane(planes_[i], block_->planes[i],
+				diag_widen(remote::plane_role_label(static_cast<remote::PlaneRole>(i)))))
 			return false;
-		}
-		if (share != static_cast<uint32_t>(remote::ShareKind::Name)) {
-			release_plane(cached);
-			fail(remote::RemoteStep::OpenPlanes, "host.planes",
-				L"the game offered its " + role_text + L" texture in a way this engine host "
-				L"does not know how to open.");
-			return false;
-		}
+	return open_plane(output_, block_->output_plane, L"display-size output");
+}
 
-		if (cached.res != nullptr && cached.generation == generation &&
-			wcscmp(cached.name, name) == 0)
-			continue;
+bool HostSession::open_plane(Plane &cached, const remote::PlaneDesc &desc, const std::wstring &role_text)
+{
+	const uint32_t share = desc.share;
+	const uint32_t format = desc.dxgi_format;
+	const uint64_t generation = desc.generation;
+	wchar_t name[remote::kNameChars]{};
+	copy_name(name, desc.name);
 
+	if (share == static_cast<uint32_t>(remote::ShareKind::None) || format == 0 ||
+		name[0] == L'\0') {
 		release_plane(cached);
-		HRESULT hr = E_FAIL;
-		ID3D12Resource *const res = open_shared_texture(name, &hr);
-		if (res == nullptr) {
-			fail(remote::RemoteStep::OpenPlanes, "host.planes",
-				L"the engine host could not open the game's " + role_text + L" texture. "
-				L"The game and the host must be on the same graphics card.",
-				hresult_text(L"open", hr).c_str());
-			return false;
-		}
-		cached.res = res;
-		cached.generation = generation;
-		copy_name(cached.name, name);
-		diag_info("host", L"opened the " + role_text + L" texture as " + name);
+		return true;
 	}
+	if (share == static_cast<uint32_t>(remote::ShareKind::KmtValue)) {
+		release_plane(cached);
+		fail(remote::RemoteStep::OpenPlanes, "host.planes",
+			L"the game offered its " + role_text + L" texture in a form only its own "
+			L"process can open. Run the game in a window on the same graphics card, "
+			L"or turn the upscaler off.");
+		return false;
+	}
+	if (share != static_cast<uint32_t>(remote::ShareKind::Name)) {
+		release_plane(cached);
+		fail(remote::RemoteStep::OpenPlanes, "host.planes",
+			L"the game offered its " + role_text + L" texture in a way this engine host "
+			L"does not know how to open.");
+		return false;
+	}
+
+	if (cached.res != nullptr && cached.generation == generation &&
+		wcscmp(cached.name, name) == 0)
+		return true;
+
+	release_plane(cached);
+	HRESULT hr = E_FAIL;
+	ID3D12Resource *const res = open_shared_texture(name, &hr);
+	if (res == nullptr) {
+		fail(remote::RemoteStep::OpenPlanes, "host.planes",
+			L"the engine host could not open the game's " + role_text + L" texture. "
+			L"The game and the host must be on the same graphics card.",
+			hresult_text(L"open", hr).c_str());
+		return false;
+	}
+	cached.res = res;
+	cached.generation = generation;
+	copy_name(cached.name, name);
+	diag_info("host", L"opened the " + role_text + L" texture as " + name);
 	return true;
 }
 
@@ -367,8 +369,113 @@ void HostSession::note_stats(double serve_ms, double stall_ms) noexcept
 	s.since = now;
 }
 
+void HostSession::take_extras()
+{
+	char provider[remote::kFsrProviderChars] = {};
+	std::memcpy(provider, block_->fsr_provider, sizeof(provider));
+	provider[remote::kFsrProviderChars - 1] = '\0';
+	fsr_.want_provider = provider;
+
+	const uint32_t restart = block_->neural_restart_epoch;
+	const uint32_t accum = block_->accum_epoch;
+	const uint32_t target = block_->accum_target;
+	const uint32_t capture = block_->capture_epoch;
+	const uint32_t frames = block_->capture_frames;
+	if (!extras_seen_) {
+		extras_seen_ = true;
+		restart_epoch_ = restart;
+		capture_epoch_ = capture;
+		accum_epoch_ = accum;
+	}
+	if (restart != restart_epoch_) {
+		restart_epoch_ = restart;
+		neural_.destroy_feature();
+		neural_init_failed_ = false;
+		diag_info("host.neural", L"the game asked for DLSS neural rendering to start again");
+	}
+	if (accum != accum_epoch_) {
+		accum_epoch_ = accum;
+		if (target != 0)
+			neural_.accum.start(target);
+		else
+			neural_.accum.stop();
+	}
+	if (capture != capture_epoch_) {
+		capture_epoch_ = capture;
+		wchar_t dir[remote::kPathChars] = {};
+		std::memcpy(dir, block_->capture_dir, sizeof(dir));
+		dir[remote::kPathChars - 1] = L'\0';
+		if (dir[0] != L'\0')
+			neural_.request_capture(dir, frames);
+	}
+}
+
+void HostSession::write_info() noexcept
+{
+	const NeuralRenderCommon::Text nt = neural_.text();
+	uint32_t f = remote::kNeuralInfoValid;
+	const auto set = [&](bool on, uint32_t bit) { f |= on ? bit : 0u; };
+	set(neural_.dll_present, remote::kNeuralDllPresent);
+	set(neural_.shim_present, remote::kNeuralShimPresent);
+	set(neural_.initialized, remote::kNeuralInitialized);
+	set(neural_.crashed, remote::kNeuralCrashed);
+	set(neural_.driver_too_old(), remote::kNeuralDriverTooOld);
+	set(neural_.adapter_unsupported(), remote::kNeuralAdapterUnsupported);
+	set(neural_.feature_unsupported, remote::kNeuralFeatureUnsupported);
+	set(neural_.serves_card(nt), remote::kNeuralServesCard);
+	set(neural_.requirement_known, remote::kNeuralRequirementKnown);
+	set(nt.targets_known, remote::kNeuralTargetsKnown);
+	set(nt.identity.has_certificate, remote::kNeuralCertificate);
+	set(neural_init_failed_, remote::kNeuralInitFailed);
+	block_->accum_running = neural_.accum.running ? 1u : 0u;
+	block_->accum_done = neural_.accum.done;
+	block_->accum_target_now = neural_.accum.target;
+	block_->accum_holding = neural_.accum.step() == AccumStep::Hold ? 1u : 0u;
+	block_->neural_area_share = neural_.last_area_share;
+	block_->neural_driver_major = neural_.driver_major;
+	block_->neural_driver_minor = neural_.driver_minor;
+	block_->neural_required_major = neural_.required_driver_major;
+	block_->neural_required_minor = neural_.required_driver_minor;
+	block_->neural_min_architecture = neural_.min_architecture;
+	block_->neural_card_architecture = neural_.card_architecture;
+	block_->neural_runtime_minimum = neural_.runtime_minimum_architecture;
+	block_->neural_reported_architecture = neural_.reported_architecture;
+	block_->neural_eval_count = neural_.eval_count;
+	const auto ascii = [](char *dst, size_t chars, const std::string &text) {
+		const size_t n = std::min(text.size(), chars - 1);
+		std::memcpy(dst, text.data(), n);
+		dst[n] = '\0';
+	};
+	uint32_t providers = 0;
+	if (!fsr_.fsr_loading()) {
+		for (const auto &pv : fsr_.providers) {
+			if (providers == remote::kFsrProviders)
+				break;
+			ascii(block_->fsr_providers[providers++], remote::kFsrProviderChars, pv.name);
+		}
+		copy_text(block_->fsr_provider_version, 64, fsr_.provider_version);
+	}
+	block_->fsr_provider_count = providers;
+	{
+		const VsrProcessorStatus &v = vsr_.vsr_status();
+		block_->vsr_status = backend_ran_ != static_cast<uint32_t>(BackendChoice::Vsr) ? 0u : (v.queried ? remote::kVsrQueried : 0u) | (v.capable ? remote::kVsrCapable : 0u) |
+			(v.enabled ? remote::kVsrEnabled : 0u) | (v.in_use ? remote::kVsrInUse : 0u) | ((v.level & 0xFFu) << 8);
+	}
+	ascii(block_->neural_runtime_version, sizeof(block_->neural_runtime_version), nt.identity.file_version);
+	ascii(block_->neural_runtime_sha256, sizeof(block_->neural_runtime_sha256), nt.sha256);
+	ascii(block_->neural_runtime_kernels, sizeof(block_->neural_runtime_kernels),
+		nt.targets_known ? neural_kernels_label(nt.kernels) : std::string());
+	ascii(block_->neural_runtime_cards, sizeof(block_->neural_runtime_cards),
+		nt.targets_known ? neural_kernels_cards(nt.kernels) : std::string());
+	copy_text(block_->neural_runtime_file, remote::kPathChars, nt.dll_path);
+	copy_text(block_->neural_capture_status, 128, neural_.capture.last);
+	MemoryBarrier();
+	block_->neural_flags = f;
+}
+
 void HostSession::run_frame()
 {
+	take_extras();
 	if (!engine_.ready()) {
 		fail(remote::RemoteStep::Engine, "host.engine",
 			L"the engine host lost its Direct3D 12 device.");
@@ -435,14 +542,27 @@ void HostSession::run_frame()
 	inputs.engine.depth_state = SharedPlane::kState;
 	inputs.engine.motion_state = SharedPlane::kState;
 	inputs.engine.native = false;
+	if (output_.res != nullptr) {
+		inputs.engine.output = output_.res;
+		inputs.engine.output_state = SharedPlane::kState;
+	}
 
+	vsr_.list_lost = false;
 	run_upscaler(inputs);
+	if (vsr_.list_lost) {
+		fail(remote::RemoteStep::Engine, "host.vsr",
+			vsr_.last_error.empty() ? std::wstring(L"the engine host's list could not be reopened after RTX VSR.")
+				: vsr_.last_error);
+		return;
+	}
 
-	run_neural(inputs, colour, inputs.engine.motion, inputs.engine.depth);
+	run_neural(inputs, output_.res != nullptr ? output_.res : colour, inputs.engine.motion, inputs.engine.depth);
 
 	if (timing)
 		gpu_timer_.end(cmd);
-	if (!engine_.submit_list()) {
+	const bool submitted = engine_.submit_list();
+	engine_.use_ring(EngineDevice::Ring::Frame);
+	if (!submitted) {
 		fail(remote::RemoteStep::Engine, "host.submit",
 			engine_.last_error.empty()
 				? std::wstring(L"the engine host could not submit this frame's work.")
@@ -461,13 +581,6 @@ bool HostSession::run_upscaler(const FrameInputs &inputs)
 	const auto choice = static_cast<BackendChoice>(raw);
 	if (choice == BackendChoice::None)
 		return true;
-	if (choice == BackendChoice::Vsr) {
-		fail(remote::RemoteStep::Upscaler, "host.choice",
-			L"RTX VSR runs inside the game's own Direct3D 11 device and cannot be run from "
-			L"the engine host. Pick DLSS, FSR or XeSS.");
-		upscaler_status_ = static_cast<uint32_t>(UpscalerStatus::UnsupportedApi);
-		return false;
-	}
 
 	UpscalerParams params = block_->upscaler;
 	ID3D12Resource *const guide = block_->have_guide != 0
@@ -495,6 +608,16 @@ bool HostSession::run_upscaler(const FrameInputs &inputs)
 			out_height_ = fsr_.out_height();
 			in_width_ = fsr_.fsr_render_width();
 			in_height_ = fsr_.fsr_render_height();
+		}
+		break;
+	case BackendChoice::Vsr:
+		backend = &vsr_;
+		ok = vsr_.run(nullptr, inputs, params);
+		if (ok) {
+			out_width_ = vsr_.out_width();
+			out_height_ = vsr_.out_height();
+			in_width_ = vsr_.vsr_render_width();
+			in_height_ = vsr_.vsr_render_height();
 		}
 		break;
 	case BackendChoice::Xess:
@@ -608,6 +731,7 @@ void HostSession::finish_frame(uint64_t frame_index)
 	block_->neural_gpu_us = neural_.timer.last_ms > 0.0
 		? static_cast<uint32_t>(neural_.timer.last_ms * 1000.0 + 0.5) : 0u;
 	copy_text(block_->message, remote::kTextChars, message_);
+	write_info();
 	MemoryBarrier();
 	block_->response_index = frame_index;
 }

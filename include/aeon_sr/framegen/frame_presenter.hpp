@@ -22,7 +22,6 @@ public:
 	bool present_generated(reshade::api::effect_runtime *runtime, std::wstring *why);
 
 	const std::string &route() const noexcept { return route_; }
-	int64_t last_code() const noexcept { return last_code_; }
 	uint32_t failures_in_a_row() const noexcept { return failures_; }
 	void set_sync_interval(uint32_t s) noexcept { sync_interval_ = s; }
 

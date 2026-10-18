@@ -25,7 +25,6 @@ ID3D12Resource *DepthOnGridD3D12::read(ID3D12Device *device, ID3D12CommandQueue 
 		format_ = want;
 		w_ = w;
 		h_ = h;
-		++creations_;
 		failed_ = !create_tex12(device, w, h, want, false, kState, &tex_);
 		if (failed_)
 			return nullptr;

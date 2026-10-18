@@ -1,4 +1,5 @@
 #include "aeon_sr/jitter/depth_regrid.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
 
@@ -64,15 +65,6 @@ void CSRegrid(uint3 id : SV_DispatchThreadID)
 
 namespace {
 
-template <typename T>
-void rel(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
-
 }
 
 bool depth_regrid_reads_depth(DXGI_FORMAT f) noexcept
@@ -90,11 +82,11 @@ bool depth_regrid_reads_depth(DXGI_FORMAT f) noexcept
 
 void DepthRegridD3D11::release() noexcept
 {
-	rel(srv_);
-	rel(uav_);
-	rel(tex_);
-	rel(cb_);
-	rel(cs_);
+	safe_release(srv_);
+	safe_release(uav_);
+	safe_release(tex_);
+	safe_release(cb_);
+	safe_release(cs_);
 	device_ = nullptr;
 	w_ = h_ = 0;
 	failed_ = false;
@@ -120,13 +112,13 @@ bool DepthRegridD3D11::ensure(ID3D11Device *device, uint32_t w, uint32_t h)
 				what += L": " + std::wstring(t, t + std::strlen(t));
 			}
 			diag_error("jitter", what);
-			rel(blob);
-			rel(err);
+			safe_release(blob);
+			safe_release(err);
 			failed_ = true;
 			return false;
 		}
-		rel(blob);
-		rel(err);
+		safe_release(blob);
+		safe_release(err);
 		D3D11_BUFFER_DESC bd{};
 		bd.ByteWidth = 16;
 		bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -141,9 +133,9 @@ bool DepthRegridD3D11::ensure(ID3D11Device *device, uint32_t w, uint32_t h)
 		return true;
 	if (failed_w_ == w && failed_h_ == h)
 		return false;
-	rel(srv_);
-	rel(uav_);
-	rel(tex_);
+	safe_release(srv_);
+	safe_release(uav_);
+	safe_release(tex_);
 	D3D11_TEXTURE2D_DESC td{};
 	td.Width = w;
 	td.Height = h;
@@ -156,9 +148,9 @@ bool DepthRegridD3D11::ensure(ID3D11Device *device, uint32_t w, uint32_t h)
 	if (FAILED(device->CreateTexture2D(&td, nullptr, &tex_)) ||
 		FAILED(device->CreateShaderResourceView(tex_, nullptr, &srv_)) ||
 		FAILED(device->CreateUnorderedAccessView(tex_, nullptr, &uav_))) {
-		rel(srv_);
-		rel(uav_);
-		rel(tex_);
+		safe_release(srv_);
+		safe_release(uav_);
+		safe_release(tex_);
 		w_ = h_ = 0;
 		failed_w_ = w;
 		failed_h_ = h;
@@ -183,18 +175,18 @@ ID3D11ShaderResourceView *DepthRegridD3D11::regrid(ID3D11DeviceContext *ctx, ID3
 	depth->GetResource(&res);
 	ID3D11Texture2D *tex = nullptr;
 	const bool is_tex = res != nullptr && SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&tex)));
-	rel(res);
+	safe_release(res);
 	if (!is_tex)
 		return nullptr;
 	D3D11_TEXTURE2D_DESC td{};
 	tex->GetDesc(&td);
-	rel(tex);
+	safe_release(tex);
 	if (td.SampleDesc.Count != 1)
 		return nullptr;
 	ID3D11Device *device = nullptr;
 	ctx->GetDevice(&device);
 	const bool ready = device != nullptr && ensure(device, td.Width, td.Height);
-	rel(device);
+	safe_release(device);
 	if (!ready)
 		return nullptr;
 
@@ -230,12 +222,12 @@ ID3D11ShaderResourceView *DepthRegridD3D11::regrid(ID3D11DeviceContext *ctx, ID3
 	ctx->CSSetUnorderedAccessViews(0, 1, &old_uav, &keep);
 	ctx->CSSetConstantBuffers(0, 1, &old_cb);
 	ctx->CSSetShader(old_cs, old_ci, old_ci_count);
-	rel(old_cs);
+	safe_release(old_cs);
 	for (UINT i = 0; i < old_ci_count; ++i)
-		rel(old_ci[i]);
-	rel(old_srv);
-	rel(old_uav);
-	rel(old_cb);
+		safe_release(old_ci[i]);
+	safe_release(old_srv);
+	safe_release(old_uav);
+	safe_release(old_cb);
 	return srv_;
 }
 

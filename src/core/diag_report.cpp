@@ -3,6 +3,7 @@
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/core/gpu_vendor.hpp"
+#include "aeon_sr/core/i18n.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
 #include "aeon_sr/upscalers/upscaler_backend.hpp"
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 
 namespace aeon_sr {
 namespace {
@@ -28,7 +30,7 @@ std::wstring wformat(const wchar_t *fmt, ...)
 
 std::string format(const char *fmt, ...)
 {
-	char buf[512]{};
+	char buf[2048]{};
 	va_list args;
 	va_start(args, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, args);
@@ -37,6 +39,20 @@ std::string format(const char *fmt, ...)
 }
 
 const char *bool_label(bool v) noexcept { return v ? "yes" : "no"; }
+
+const char *motion_text(MotionProvider p, i18n::Lang lang) noexcept
+{
+	return i18n::text(lang, p == MotionProvider::Internal ? i18n::S::hd_motion_builtin : i18n::S::hd_none);
+}
+
+const char *depth_text(DepthProvider p, i18n::Lang lang) noexcept
+{
+	switch (p) {
+	case DepthProvider::Generic: return i18n::text(lang, i18n::S::hd_depth_raw);
+	case DepthProvider::Normalized: return i18n::text(lang, i18n::S::hd_depth_normalised);
+	default: return i18n::text(lang, i18n::S::hd_none);
+	}
+}
 
 void append_settings(std::wstring &out, const Settings &s)
 {
@@ -49,8 +65,8 @@ void append_settings(std::wstring &out, const Settings &s)
 		static_cast<double>(s.sharpness));
 	out += wformat(L"  upscale_effects=%hs  jitter=%hs  mv_probe=%hs\n",
 		bool_label(s.upscale_effects), bool_label(s.spatial_jitter), bool_label(s.mv_probe));
-	out += wformat(L"  vsr_input_format=%u  fsr_provider=%hs\n", s.vsr_input_format,
-		s.fsr_provider.empty() ? "auto" : s.fsr_provider.c_str());
+	out += wformat(L"  vsr_input_format=%u  fsr_provider=%hs  optiscaler_upscale=%hs\n", s.vsr_input_format,
+		s.fsr_provider.empty() ? "auto" : s.fsr_provider.c_str(), bool_label(s.optiscaler_upscale));
 	static const wchar_t *const kModeNames[kNeuralModeCount] = {
 		L"quality", L"balanced", L"performance", L"ultra performance" };
 	const std::wstring mode = kModeNames[clamp_neural_mode(s.neural_mode)];
@@ -91,6 +107,26 @@ const char *check_state_label(CheckState s) noexcept
 	return "    ";
 }
 
+const char *diag_status_text(UpscalerStatus status, i18n::Lang lang) noexcept
+{
+	using i18n::S;
+	S id = S::up_unknown;
+	switch (status) {
+	case UpscalerStatus::Idle: id = S::up_idle; break;
+	case UpscalerStatus::MissingRuntime: id = S::up_missing_runtime; break;
+	case UpscalerStatus::UnsupportedApi: id = S::up_unsupported_api; break;
+	case UpscalerStatus::UnsupportedGpu: id = S::up_unsupported_gpu; break;
+	case UpscalerStatus::InitFailed: id = S::up_init_failed; break;
+	case UpscalerStatus::NeedMotionVectors: id = S::up_need_motion; break;
+	case UpscalerStatus::NeedDepth: id = S::up_need_depth; break;
+	case UpscalerStatus::Ready: id = S::up_running; break;
+	case UpscalerStatus::EvaluateFailed: id = S::up_evaluate_failed; break;
+	case UpscalerStatus::Crashed: id = S::up_crashed; break;
+	case UpscalerStatus::Loading: id = S::up_loading; break;
+	}
+	return i18n::text(lang, id);
+}
+
 CheckState diag_worst(const std::vector<DiagCheck> &checks) noexcept
 {
 	CheckState worst = CheckState::Off;
@@ -100,113 +136,122 @@ CheckState diag_worst(const std::vector<DiagCheck> &checks) noexcept
 	return worst;
 }
 
-std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &settings)
+std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &settings, i18n::Lang lang)
 {
+	using i18n::S;
 	const DiagEnvironment &e = diag_environment();
 	std::vector<DiagCheck> out;
-	auto add = [&out](const char *name, CheckState s, std::string detail, std::string action = {}) {
+	const auto T = [lang](S id) { return i18n::text(lang, id); };
+	std::string said_tech;
+	const auto said = [lang, &said_tech](const std::wstring &english, S fallback) {
+		std::string tech;
+		std::string out_text = diag_said(diag_narrow(english), lang, fallback, &tech);
+		if (!tech.empty())
+			said_tech += (said_tech.empty() ? "" : "\n") + tech;
+		return out_text;
+	};
+	auto add = [&out, &said_tech, lang](S name, CheckState s, std::string detail, std::string action = {}) {
 		DiagCheck c;
-		c.name = name;
+		c.name = i18n::english(name);
+		c.title = i18n::text(lang, name);
 		c.state = s;
 		c.detail = std::move(detail);
 		c.action = std::move(action);
+		c.tech = std::move(said_tech);
+		said_tech.clear();
 		out.push_back(std::move(c));
 	};
 
-	add("Graphics API", CheckState::Ok, state.api_name != nullptr ? state.api_name : "unknown");
+	add(S::hn_api, CheckState::Ok, state.api_name != nullptr ? state.api_name : T(S::hd_unknown));
 	if (state.bridge_name != nullptr) {
-		std::string bridge = state.bridge_name;
-		const std::string api = state.api_name != nullptr ? state.api_name : "";
-		if (!api.empty() && bridge.size() > api.size() + 1 && bridge.compare(0, api.size(), api) == 0 &&
-			bridge[api.size()] == ' ')
-			bridge.erase(0, api.size() + 1);
-		if (!state.bridge_any_ready && state.bridge_sync != nullptr)
-			bridge += std::string(", ") + state.bridge_sync;
-		add("Bridge to Direct3D 12", state.bridge_any_ready ? CheckState::Ok : CheckState::Warn, std::move(bridge),
-			state.bridge_any_ready ? "" : "The add-on could not reach a Direct3D 12 device yet.");
+		said_tech = state.bridge_name;
+		if (state.bridge_sync != nullptr)
+			said_tech += std::string(", ") + state.bridge_sync;
+		add(S::hn_bridge, state.bridge_any_ready ? CheckState::Ok : CheckState::Warn,
+			T(state.bridge_any_ready ? S::hd_bridge_ready : S::hd_bridge_waiting),
+			state.bridge_any_ready ? "" : T(S::ha_bridge_not_yet));
 	}
 	else if (!state.bridge_error.empty())
-		add("Bridge to Direct3D 12", CheckState::Fail, "none",
-			"Every upscaler here is Direct3D 12 work and this game's API could not be bridged.");
+		add(S::hn_bridge, CheckState::Fail, T(S::hd_none),
+			T(S::ha_bridge_failed));
 
 	if (state.upscalers_remote && state.host_ready)
-		add("Where the upscalers run", CheckState::Ok,
-			format("AeonSRHost.exe, process %u", state.host_pid),
-			"This game is a 32-bit program and the upscalers are 64-bit, so they run beside it.");
+		add(S::hn_where, CheckState::Ok,
+			format(T(S::hd_host_process), state.host_pid),
+			T(S::ha_host_32bit));
 	else if (state.upscalers_remote)
-		add("Where the upscalers run", CheckState::Off,
-			"AeonSRHost.exe, not started yet",
-			"It starts with the first upscaled frame. Until then nothing here knows which "
-			"upscalers you have, so nothing is claimed about them.");
+		add(S::hn_where, CheckState::Off,
+			T(S::hd_host_not_started),
+			T(S::ha_host_not_started));
 
 	if (state.gpu_name.empty()) {
-		add("GPU", CheckState::Warn, "not identified yet",
-			"Open the overlay once a frame has rendered.");
+		add(S::hn_gpu, CheckState::Warn, T(S::hd_gpu_unknown),
+			T(S::ha_gpu_unknown));
 	} else {
 		std::string gpu = diag_narrow(state.gpu_name);
 		if (e.nv_driver_major != 0)
-			gpu += format(", driver %u.%02u", e.nv_driver_major, e.nv_driver_minor);
-		add("GPU", CheckState::Ok, std::move(gpu));
+			gpu += format(T(S::hd_gpu_driver), e.nv_driver_major, e.nv_driver_minor);
+		add(S::hn_gpu, CheckState::Ok, std::move(gpu));
 	}
 
 	if (!e.reshade_version.empty())
-		add("ReShade", CheckState::Ok, diag_narrow(e.reshade_version));
+		add(S::hn_reshade, CheckState::Ok, diag_narrow(e.reshade_version));
 
 	if (!state.motion_wanted) {
-		add("Motion vectors", CheckState::Off,
-			"not needed - nothing is running that consumes motion");
+		add(S::hn_motion, CheckState::Off,
+			T(S::hd_motion_not_needed));
 	} else if (state.motion_provider == MotionProvider::None && state.flow_note_benign) {
-		add("Motion vectors", CheckState::Warn, diag_narrow(state.flow_note),
-			"Normal for the first frames after a resolution change.");
+		add(S::hn_motion, CheckState::Warn, said(state.flow_note, S::hd_motion_stopped),
+			T(S::ha_motion_benign));
 	} else if (state.motion_provider == MotionProvider::None) {
-		add("Motion vectors", CheckState::Fail,
-			state.flow_note.empty() ? "none this frame" : diag_narrow(state.flow_note),
-			"Every upscaler here needs motion. Without it they stay idle.");
+		add(S::hn_motion, CheckState::Fail,
+			state.flow_note.empty() ? T(S::hd_motion_none) : said(state.flow_note, S::hd_motion_stopped),
+			T(S::ha_motion_none));
 	} else if (state.probe_valid && state.probe_nonzero_pct <= 0.0f && state.probe_moving) {
-		add("Motion vectors", CheckState::Fail, "every sampled vector was zero while the camera moved",
-			"The estimator is running but writing nothing.");
+		add(S::hn_motion, CheckState::Fail, T(S::hd_motion_zero),
+			T(S::ha_motion_zero));
 	} else if (state.probe_valid) {
-		add("Motion vectors", CheckState::Ok,
-			format("%s, %.0f%% non-zero, mean %.2f px",
-				motion_provider_label(state.motion_provider),
+		add(S::hn_motion, CheckState::Ok,
+			format(T(S::hd_motion_probe),
+				motion_text(state.motion_provider, lang),
 				static_cast<double>(state.probe_nonzero_pct),
 				static_cast<double>(state.probe_mean_px)));
 	} else {
-		add("Motion vectors", CheckState::Ok, motion_provider_label(state.motion_provider));
+		add(S::hn_motion, CheckState::Ok, motion_text(state.motion_provider, lang));
 	}
 
 	if (state.depth_provider == DepthProvider::None) {
-		add("Depth buffer", CheckState::Warn, "none found",
-			"Pick the game's depth buffer in ReShade's own depth settings. "
-			"The add-on works without it, with slightly worse edges.");
+		add(S::hn_depth, CheckState::Warn, T(S::hd_depth_none),
+			T(S::ha_depth_none));
 	} else {
-		std::string depth_line = depth_provider_label(state.depth_provider);
+		std::string depth_line = depth_text(state.depth_provider, lang);
 		if (state.depth_reversed)
-			depth_line += ", reversed";
+			depth_line += std::string(T(S::list_sep)) + T(S::hd_depth_reversed);
 		if (state.depth_upside_down)
-			depth_line += ", upside down";
+			depth_line += std::string(T(S::list_sep)) + T(S::hd_depth_upside_down);
 		if (state.depth_mirrored)
-			depth_line += ", mirrored";
+			depth_line += std::string(T(S::list_sep)) + T(S::hd_depth_mirrored);
 		if (state.depth_far_plane > 0.0f)
-			depth_line += format(", far plane %.0f", static_cast<double>(state.depth_far_plane));
+			depth_line += std::string(T(S::list_sep)) + format(T(S::hd_depth_far), static_cast<double>(state.depth_far_plane));
 		if (state.depth_logarithmic)
-			depth_line += ", logarithmic";
+			depth_line += std::string(T(S::list_sep)) + T(S::hd_depth_log);
 		if (state.depth_overridden.empty())
-			add("Depth buffer", CheckState::Ok, depth_line);
+			add(S::hn_depth, CheckState::Ok, depth_line);
 		else
-			add("Depth buffer", CheckState::Warn, depth_line,
-				"These effects carry their own depth definitions in the preset and see a different depth: " +
-				state.depth_overridden + ". Remove them from the preset file.");
+			add(S::hn_depth, CheckState::Warn, depth_line,
+				format(T(S::ha_depth_overridden), state.depth_overridden.c_str()));
 	}
 
 	const bool no_upscaler = !settings.enabled ||
 		settings.backend == static_cast<unsigned>(BackendChoice::None);
 	if (no_upscaler) {
-		add("Upscaler", CheckState::Off, "turned off - the frame is left as the game rendered it");
+		add(S::hn_upscaler, CheckState::Off, T(S::hd_upscaler_off));
 	} else {
-		const std::string name = !state.upscaler_label.empty() ? state.upscaler_label
-			: std::string(state.active_name != nullptr ? state.active_name : "unknown");
-		std::string detail = format("%s: %s", name.c_str(), status_label(state.active_status));
+		const std::string name = state.optiscaler_upscales && state.active_is_dlss
+			? std::string(T(S::hd_upscaler_optiscaler))
+			: !state.upscaler_label.empty() ? state.upscaler_label
+			: std::string(state.active_name != nullptr ? state.active_name : T(S::hd_unknown));
+		std::string detail = format(T(S::hd_upscaler_status), name.c_str(), diag_status_text(state.active_status, lang));
 		std::string action;
 		CheckState s = CheckState::Ok;
 		switch (state.active_status) {
@@ -216,71 +261,81 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 			const uint32_t rh = vendor ? state.upscaler_render_height : state.ngx_render_height;
 			const uint32_t ow = vendor ? state.upscaler_out_width : state.ngx_width;
 			const uint32_t oh = vendor ? state.upscaler_out_height : state.ngx_height;
-			detail += rw == ow && rh == oh ? format(" at %ux%u", ow, oh)
-				: format(", %ux%u -> %ux%u", rw, rh, ow, oh);
+			detail += rw == ow && rh == oh ? format(T(S::hd_upscaler_at), ow, oh)
+				: format(T(S::hd_upscaler_sizes), rw, rh, ow, oh);
+			if (state.optiscaler_upscales)
+				action = T(S::ha_optiscaler_upscales);
 			break;
 		}
 		case UpscalerStatus::MissingRuntime:
 			s = CheckState::Fail;
-			action = std::string("Its runtime DLL is not beside ") + kAddonFileName +
-				". Reinstall the release folder whole.";
+			action = format(T(S::ha_missing_runtime), kAddonFileName);
 			break;
 		case UpscalerStatus::UnsupportedApi:
 			s = CheckState::Fail;
 			if (state.active_error.empty())
-				action = "This upscaler does not run on this graphics API. Pick another one.";
+				action = T(S::ha_unsupported_api);
 			break;
 		case UpscalerStatus::UnsupportedGpu:
 			s = CheckState::Fail;
-			action = "This upscaler needs a different GPU vendor. Pick another one.";
+			action = T(S::ha_unsupported_gpu);
 			break;
 		case UpscalerStatus::NeedMotionVectors:
 			s = CheckState::Warn;
 			break;
 		case UpscalerStatus::NeedDepth:
 			s = CheckState::Warn;
-			action = "Only DLSS needs depth. Menus have none, so this clears itself once the "
-				"game draws a scene. If it never clears, pick FSR or XeSS.";
+			action = T(S::ha_need_depth);
 			break;
 		case UpscalerStatus::Crashed:
 			s = CheckState::Fail;
-			action = "The runtime faulted and was switched off for this session. Restart the game.";
+			action = T(S::ha_crashed);
 			break;
 		case UpscalerStatus::InitFailed:
 			s = CheckState::Fail;
-			action = "Pick another upscaler. If none of them starts, save the report and send it.";
+			action = T(S::ha_init_failed);
 			break;
 		case UpscalerStatus::EvaluateFailed:
 			s = CheckState::Fail;
-			action = "If this does not clear in a few seconds, save the report and send it.";
+			action = T(S::ha_evaluate_failed);
 			break;
 		case UpscalerStatus::Loading:
 			s = CheckState::Warn;
-			action = "Still coming up on a thread of its own. The frame goes through "
-				"unupscaled until it lands, which takes a few seconds the first time.";
+			action = T(S::ha_loading);
 			break;
 		case UpscalerStatus::Idle:
 			s = CheckState::Warn;
-			action = "Waiting for a frame to work on.";
+			action = T(S::ha_idle);
 			break;
 		}
-		if (!state.active_error.empty())
-			detail += " - " + diag_narrow(state.active_error);
-		add("Upscaler", s, std::move(detail), std::move(action));
+		if (!state.active_error.empty()) {
+			const std::string why = said(state.active_error, S::Count);
+			if (!why.empty())
+				detail += " - " + why;
+		}
+		add(S::hn_upscaler, s, std::move(detail), std::move(action));
 	}
 
 	if (!state.ngx_layer.empty()) {
 		if (state.ngx_layer_relevant && !state.host_error.empty())
-			add("Other upscaler program", CheckState::Fail, "loaded in the game: " + diag_narrow(state.ngx_layer),
-				"Aeon SR's upscaler and DLSS neural rendering run in AeonSRHost.exe, apart from it, and it did not "
-				"start: " + diag_narrow(state.host_error));
+		{
+			const std::string why = said(state.host_error, S::Count);
+			add(S::hn_other_program, CheckState::Fail, format(T(S::hd_loaded_in_game), diag_narrow(state.ngx_layer).c_str()),
+				why.empty() ? std::string(T(S::ha_other_failed_short)) : format(T(S::ha_other_failed), why.c_str()));
+		}
 		else {
 			std::string action;
-			if (!state.upscalers_remote)
+			if (state.optiscaler_upscales)
+				action = T(S::ha_other_takes_upscale);
+			else if (state.optiscaler_held == PanelState::OptiscalerHeld::PickDlss)
+				action = T(S::ha_other_pick_dlss);
+			else if (state.optiscaler_held == PanelState::OptiscalerHeld::GameDlss)
+				action = T(S::ha_other_game_dlss);
+			else if (!state.upscalers_remote)
 				action = state.ngx_layer_relevant
-					? "Aeon SR's upscaler and DLSS neural rendering run in AeonSRHost.exe, apart from it."
-					: "Aeon SR's upscaler and DLSS neural rendering would run in AeonSRHost.exe, apart from it.";
-			add("Other upscaler program", CheckState::Ok, "loaded in the game: " + diag_narrow(state.ngx_layer),
+					? T(S::ha_other_runs)
+					: T(S::ha_other_would_run);
+			add(S::hn_other_program, CheckState::Ok, format(T(S::hd_loaded_in_game), diag_narrow(state.ngx_layer).c_str()),
 				std::move(action));
 		}
 	}
@@ -288,97 +343,92 @@ std::vector<DiagCheck> diag_checks(const PanelState &state, const Settings &sett
 	if (state.native_dlss) {
 		const bool dlss_on = settings.enabled && settings.backend == static_cast<unsigned>(BackendChoice::Dlss);
 		if (dlss_on && !state.host_ready && !state.host_error.empty())
-			add("Game's own DLSS", CheckState::Fail, "loaded by the game: " + diag_narrow(state.native_dlss_modules),
-				"Aeon SR's DLSS runs in AeonSRHost.exe, apart from it, and it did not start: " +
-				diag_narrow(state.host_error));
+		{
+			const std::string why = said(state.host_error, S::Count);
+			add(S::hn_game_dlss, CheckState::Fail, format(T(S::hd_loaded_by_game), diag_narrow(state.native_dlss_modules).c_str()),
+				why.empty() ? std::string(T(S::ha_game_dlss_failed_short)) : format(T(S::ha_game_dlss_failed), why.c_str()));
+		}
 		else {
 			std::string action;
 			if (state.ngx_layer.empty() && !state.upscalers_remote)
-				action = dlss_on ? "Aeon SR's DLSS runs in AeonSRHost.exe, apart from it."
-					: "Aeon SR's DLSS would run in AeonSRHost.exe, apart from it.";
-			add("Game's own DLSS", CheckState::Ok, "loaded by the game: " + diag_narrow(state.native_dlss_modules),
+				action = dlss_on ? T(S::ha_game_dlss_runs)
+					: T(S::ha_game_dlss_would_run);
+			add(S::hn_game_dlss, CheckState::Ok, format(T(S::hd_loaded_by_game), diag_narrow(state.native_dlss_modules).c_str()),
 				std::move(action));
 		}
 	}
 
 	if (!settings.neural_render) {
-		add("Neural rendering", CheckState::Off, "turned off");
+		add(S::hn_neural, CheckState::Off, T(S::hd_turned_off));
 	} else if (state.neural_last == 1) {
 		const unsigned int asked = clamp_neural_passes(settings.neural_passes);
 		const bool short_chain = state.neural_passes_built != 0 && state.neural_passes_built < asked;
 		std::string detail = short_chain
-			? format("running %u of %u passes", state.neural_passes_built, asked)
-			: std::string("running");
+			? format(T(S::hd_running_passes), state.neural_passes_built, asked)
+			: std::string(T(S::hd_running));
 		if (state.neural_reported_architecture != 0u)
-			detail += " (its own card check bypassed)";
-		add("Neural rendering", short_chain ? CheckState::Warn : CheckState::Ok, std::move(detail),
-			short_chain ? "The runtime would not build every pass; the chain is shorter than asked for." : "");
+			detail += T(S::hd_card_check_bypassed);
+		add(S::hn_neural, short_chain ? CheckState::Warn : CheckState::Ok, std::move(detail),
+			short_chain ? T(S::ha_short_chain) : "");
 	} else if (!vendor_may_be_nvidia(state.gpu_vendor)) {
-		add("Neural rendering", CheckState::Fail,
-			format("needs an NVIDIA GPU (%s detected)", vendor_label(state.gpu_vendor)),
-			"Everything else in Aeon SR works on this card.");
+		add(S::hn_neural, CheckState::Fail,
+			format(T(S::hd_needs_nvidia), state.gpu_vendor == GpuVendor::Unknown ? T(S::hd_unknown) : vendor_label(state.gpu_vendor)),
+			T(S::ha_everything_else_works));
 	} else if (state.neural_host_refused) {
-		add("Neural rendering", CheckState::Fail, "AeonSRHost.exe could not prepare it",
-			"nvngx_dlssnr.dll and ngxshim\\nvngx.dll are both in place; AeonSRHost.log beside the "
-			"add-on says why.");
+		add(S::hn_neural, CheckState::Fail, T(S::hd_host_refused),
+			T(S::ha_host_refused));
 	} else if (!state.neural_dll_present) {
-		add("Neural rendering", CheckState::Fail, "nvngx_dlssnr.dll not found",
-			"It is not shipped with Aeon SR and the driver does not install it. "
-			"Copy it from a game that ships DLSS neural rendering into the add-on folder.");
+		add(S::hn_neural, CheckState::Fail, T(S::hd_dlssnr_missing),
+			T(S::ha_dlssnr_missing));
 	} else if (!state.neural_shim_present) {
-		add("Neural rendering", CheckState::Fail, "ngxshim\\nvngx.dll is missing",
-			std::string("Copy the ngxshim folder from the release beside ") + kAddonFileName + ".");
+		add(S::hn_neural, CheckState::Fail, T(S::hd_shim_missing),
+			format(T(S::ha_shim_missing), kAddonFileName));
 	} else if (!state.neural_runtime_serves_card) {
-		add("Neural rendering", CheckState::Fail,
+		add(S::hn_neural, CheckState::Fail,
 			state.neural_runtime_cards.empty()
-				? std::string("this nvngx_dlssnr.dll carries no code for this GPU")
-				: "this nvngx_dlssnr.dll is built for " + state.neural_runtime_cards,
+				? std::string(T(S::hd_runtime_no_code))
+				: format(T(S::hd_runtime_built_for), diag_cards_text(state.neural_runtime_cards, lang).c_str()),
 			state.neural_allgpu_build_targets
-				? format("This GPU is %s. A build of nvngx_dlssnr.dll for all GPUs runs here: put it in "
-					"runtime\\dlss5-allgpu\\ beside the add-on, then turn neural rendering off and on. "
-					"Everything else works.", neural_arch_name(state.neural_gpu_architecture))
-				: format("This GPU is %s, which no nvngx_dlssnr.dll build is known to run on. "
-					"Everything else in Aeon SR works on this card.",
-					neural_arch_name(state.neural_gpu_architecture)));
+				? format(T(S::ha_allgpu_build), diag_arch_text(state.neural_gpu_architecture, lang))
+				: format(T(S::ha_no_build), diag_arch_text(state.neural_gpu_architecture, lang)));
 	} else if (state.neural_adapter_unsupported) {
-		add("Neural rendering", CheckState::Fail,
-			format("NVIDIA's runtime needs %s or newer", neural_arch_name(state.neural_min_architecture)),
-			"Everything else in Aeon SR works on this card.");
+		add(S::hn_neural, CheckState::Fail,
+			format(T(S::hd_needs_arch), diag_arch_text(state.neural_min_architecture, lang)),
+			T(S::ha_everything_else_works));
 	} else if (state.neural_driver_too_old) {
-		add("Neural rendering", CheckState::Fail,
-			format("driver %u.%02u, the runtime needs %u.%02u",
+		add(S::hn_neural, CheckState::Fail,
+			format(T(S::hd_driver_old),
 				state.neural_driver_major, state.neural_driver_minor,
 				state.neural_required_driver_major, state.neural_required_driver_minor),
-			"Update the NVIDIA driver.");
+			T(S::ha_update_driver));
 	} else if (state.neural_feature_unsupported) {
-		add("Neural rendering", CheckState::Fail, "the runtime refused to create the pass on this GPU",
-			"Not retryable. Everything else in Aeon SR works on this card.");
+		add(S::hn_neural, CheckState::Fail, T(S::hd_feature_refused),
+			T(S::ha_not_retryable));
 	} else if (state.neural_crashed) {
-		add("Neural rendering", CheckState::Fail, "the runtime faulted and was switched off",
-			"Restart the game. If it repeats, the log names the call that faulted.");
+		add(S::hn_neural, CheckState::Fail, T(S::hd_neural_faulted),
+			T(S::ha_neural_faulted));
 	} else if (state.neural_last == -1) {
-		add("Neural rendering", CheckState::Fail,
-			state.neural_error.empty() ? std::string("the pass failed this frame")
-				: diag_narrow(state.neural_error));
+		add(S::hn_neural, CheckState::Fail,
+			state.neural_error.empty() ? std::string(T(S::hd_pass_failed))
+				: said(state.neural_error, S::hd_pass_failed));
 	} else {
-		add("Neural rendering", CheckState::Warn, "idle - waiting for a frame to work on");
+		add(S::hn_neural, CheckState::Warn, T(S::hd_neural_idle));
 	}
 
 	if (settings.debug_view != 0 || settings.neural_debug_view != 0)
-		add("Inspection view", CheckState::Warn, "the frame is being replaced by a debug picture",
-			"Set Motion and depth view (Diagnostics) and Neural debug view (Neural Rendering) to Off "
-			"to see the game again.");
+		add(S::hn_inspection, CheckState::Warn, T(S::hd_inspection),
+			T(S::ha_inspection));
 
 	const uint32_t errors = diag_count(DiagLevel::Error);
 	const uint32_t warnings = diag_count(DiagLevel::Warn);
 	if (errors != 0)
-		add("Log", CheckState::Warn,
-			format("%u error%s and %u warning%s so far", errors, errors == 1 ? "" : "s",
-				warnings, warnings == 1 ? "" : "s"));
+		add(S::hn_log, CheckState::Warn,
+			format(T(errors == 1 ? (warnings == 1 ? S::hd_log_error_warning : S::hd_log_error_warnings)
+				: (warnings == 1 ? S::hd_log_errors_warning : S::hd_log_errors_warnings)), errors, warnings));
 	else if (warnings != 0)
-		add("Log", CheckState::Warn, format("%u warning%s so far", warnings, warnings == 1 ? "" : "s"));
+		add(S::hn_log, CheckState::Warn, format(T(warnings == 1 ? S::hd_log_warning : S::hd_log_warnings), warnings));
 	else
-		add("Log", CheckState::Ok, "nothing has failed");
+		add(S::hn_log, CheckState::Ok, T(S::hd_log_clean));
 
 	return out;
 }
@@ -414,6 +464,8 @@ std::wstring diag_report_text(const PanelState &state, const Settings &settings)
 	out += L"CHECKS\n";
 	for (const DiagCheck &c : checks) {
 		out += wformat(L"  [%hs] %-18hs %hs\n", check_state_label(c.state), c.name, c.detail.c_str());
+		if (!c.tech.empty())
+			out += wformat(L"         %-18hs %hs\n", "", c.tech.c_str());
 		if (!c.action.empty())
 			out += wformat(L"                            -> %hs\n", c.action.c_str());
 	}
@@ -647,6 +699,92 @@ bool technical(const std::string &s)
 	return false;
 }
 
+}
+
+bool diag_is_technical(const std::string &s)
+{
+	if (technical(s) || s.find("::") != std::string::npos)
+		return true;
+	static const char *const kNames[] = { "OptiScaler", "ReShade", "XeSS", "AeonSR", "AeonSRHost", "GeForce", "DirectX",
+		"FidelityFX", "OpenGL", "NVIDIA", "Direct3D", "HDR10", "scRGB", "sRGB", "DLSS", "RTX", "VSR", "GPU", "API", "DLL" };
+	size_t i = 0;
+	while (i < s.size()) {
+		while (i < s.size() && !std::isalnum(static_cast<unsigned char>(s[i])))
+			++i;
+		size_t j = i;
+		while (j < s.size() && (std::isalnum(static_cast<unsigned char>(s[j])) || s[j] == '_'))
+			++j;
+		const std::string w = s.substr(i, j - i);
+		i = j;
+		if (w.empty())
+			continue;
+		bool named = false;
+		for (const char *n : kNames)
+			named = named || w.rfind(n, 0) == 0;
+		if (named)
+			continue;
+		if (w.find('_') != std::string::npos || w == "d3d12" || w == "D3D12" || w == "d3d11" || w == "D3D11" ||
+			w == "hook" || w == "hooked")
+			return true;
+		for (size_t k = 1; k < w.size(); ++k)
+			if (std::islower(static_cast<unsigned char>(w[k - 1])) && std::isupper(static_cast<unsigned char>(w[k])))
+				return true;
+	}
+	return false;
+}
+
+std::string diag_said(const std::string &english, i18n::Lang lang, i18n::S fallback, std::string *tech)
+{
+	tech->clear();
+	if (english.empty())
+		return std::string();
+	std::string said, rest;
+	if (i18n::lookup(lang, english, &said, &rest)) {
+		if (rest.empty())
+			return said;
+		if (lang == i18n::Lang::en_US && !diag_is_technical(rest))
+			return english;
+		*tech = english;
+		while (!said.empty() && (said.back() == ' ' || said.back() == ':'))
+			said.pop_back();
+		const size_t wide_colon = said.size() >= 3 ? said.size() - 3 : std::string::npos;
+		if (wide_colon != std::string::npos && said.compare(wide_colon, 3, "\xEF\xBC\x9A") == 0)
+			said.erase(wide_colon);
+		return said;
+	}
+	if (lang == i18n::Lang::en_US && !diag_is_technical(english))
+		return english;
+	*tech = english;
+	return fallback == i18n::S::Count ? std::string() : std::string(i18n::text(lang, fallback));
+}
+
+std::string diag_cards_text(const std::string &english_cards, i18n::Lang lang)
+{
+	if (english_cards.rfind("no RTX", 0) == 0)
+		return i18n::text(lang, i18n::S::hd_cards_none);
+	std::string out;
+	std::string num;
+	const auto flush = [&]() {
+		if (num.empty())
+			return;
+		out += out.empty() ? "RTX " : std::string(i18n::text(lang, i18n::S::list_sep));
+		out += num;
+		num.clear();
+	};
+	for (char c : english_cards) {
+		if (std::isdigit(static_cast<unsigned char>(c)))
+			num.push_back(c);
+		else
+			flush();
+	}
+	flush();
+	return out.empty() ? english_cards : out;
+}
+
+const char *diag_arch_text(uint32_t architecture, i18n::Lang lang)
+{
+	const char *name = neural_arch_name(architecture);
+	return std::strncmp(name, "an architecture", 15) == 0 ? i18n::text(lang, i18n::S::hd_unknown_arch) : name;
 }
 
 std::string diag_player_text(const std::string &raw, std::string *tech)

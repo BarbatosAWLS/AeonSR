@@ -1,4 +1,5 @@
 #include "aeon_sr/interop/interop.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/interop/interop_bridges.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
@@ -35,15 +36,6 @@ bool d3d9_adapter_luid(reshade::api::device *game, LUID *out)
 	return ok;
 }
 
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
-
 bool engine_adapter_is_intel(IDXGIAdapter1 *adapter)
 {
 	DXGI_ADAPTER_DESC1 d{};
@@ -65,6 +57,23 @@ D3D_FEATURE_LEVEL engine_device_max_level(ID3D12Device *device)
 	if (device == nullptr || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &data, sizeof(data))))
 		return D3D_FEATURE_LEVEL_1_0_CORE;
 	return data.MaxSupportedFeatureLevel;
+}
+
+bool engine_device_has_sm66(ID3D12Device *device)
+{
+	D3D12_FEATURE_DATA_SHADER_MODEL sm{ D3D_SHADER_MODEL_6_6 };
+	return device != nullptr &&
+		SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
+		sm.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
+}
+
+int agility_core_forced()
+{
+	wchar_t v[8]{};
+	const DWORD n = GetEnvironmentVariableW(L"AEONSR_AGILITY_CORE", v, 8);
+	if (n == 0 || n >= 8)
+		return -1;
+	return v[0] == L'1' ? 1 : v[0] == L'0' ? 0 : -1;
 }
 
 }
@@ -134,21 +143,6 @@ size_t PendingDevices::size()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return devices_.size();
-}
-
-const char *bridge_kind_label(BridgeKind kind) noexcept
-{
-	switch (kind) {
-	case BridgeKind::None: return "none";
-	case BridgeKind::Native12: return "native";
-	case BridgeKind::Shared11: return "shared texture";
-	case BridgeKind::Legacy10: return "two-hop shared texture";
-	case BridgeKind::Legacy9: return "two-hop shared texture";
-	case BridgeKind::OpenGl: return "OpenGL interop";
-	case BridgeKind::Vulkan: return "Vulkan external memory";
-	case BridgeKind::Staging: return "system memory";
-	}
-	return "unknown";
 }
 
 const char *bridge_step_label(BridgeStep step) noexcept
@@ -324,6 +318,30 @@ bool EngineDevice::finish_device()
 				L"a driver without it cannot be bridged.";
 			shutdown();
 			return false;
+		}
+
+		const int forced = agility_core_forced();
+		const bool system_sm66 = engine_device_has_sm66(device12_);
+		if (forced != 0 && (forced == 1 || !system_sm66)) {
+			std::wstring say;
+			ID3D12Device *agility = nullptr;
+			const bool made = agility_core_ready(&say) &&
+				SUCCEEDED(create_device_on_agility_core(adapter_, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&agility),
+					&say)) &&
+				agility != nullptr && engine_device_max_level(agility) >= D3D_FEATURE_LEVEL_11_0;
+			if (made && (forced == 1 || engine_device_has_sm66(agility))) {
+				safe_release(device12_);
+				device12_ = agility;
+				diag_logf(DiagLevel::Info, "gpu",
+					L"engine device on the Direct3D 12 Agility SDK core %u from %s; this Windows' own core %ls",
+					kAgilitySdkVersion, say.c_str(),
+					system_sm66 ? L"has Shader Model 6.6 too (AEONSR_AGILITY_CORE=1)" : L"has no Shader Model 6.6");
+			} else {
+				safe_release(agility);
+				diag_logf(DiagLevel::Warn, "gpu",
+					L"this Windows' Direct3D 12 core has no Shader Model 6.6, which FSR 4 needs, and the "
+					L"bundled core was not used: %s", made ? L"it has no 6.6 either" : say.c_str());
+			}
 		}
 	}
 

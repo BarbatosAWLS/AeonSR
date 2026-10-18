@@ -1,4 +1,6 @@
 #include "aeon_sr/motion/optical_flow.hpp"
+#include "aeon_sr/core/com_release.hpp"
+#include "aeon_sr/core/dxgi_format_util.hpp"
 #include "aeon_sr/motion/optical_flow_entries.hpp"
 #include "aeon_sr/motion/flow_baked.h"
 
@@ -13,15 +15,6 @@
 
 namespace aeon_sr {
 namespace {
-
-template <class T>
-void safe_release(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 constexpr uint32_t kMaxLumaMips = 6;
 constexpr uint32_t kRingSize = 8192;
@@ -997,32 +990,6 @@ void barrier_mip(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res, uint32_t m
 	cmd->ResourceBarrier(1, &b);
 }
 
-DXGI_FORMAT readable_depth(DXGI_FORMAT f)
-{
-	switch (f) {
-	case DXGI_FORMAT_R32_TYPELESS:
-	case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
-	case DXGI_FORMAT_R24G8_TYPELESS:
-	case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-	case DXGI_FORMAT_R16_TYPELESS:
-	case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
-	case DXGI_FORMAT_R32G8X24_TYPELESS:
-	case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-	default: return f;
-	}
-}
-
-DXGI_FORMAT readable_color(DXGI_FORMAT f)
-{
-	switch (f) {
-	case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
-	case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
-	case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
-	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-	default: return f;
-	}
-}
-
 }
 
 bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
@@ -1042,7 +1009,7 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 
 	const D3D12_RESOURCE_DESC cdesc = color->GetDesc();
 	D3D12_SHADER_RESOURCE_VIEW_DESC csrv{};
-	csrv.Format = readable_color(cdesc.Format);
+	csrv.Format = color_read_format(cdesc.Format);
 	csrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	csrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	csrv.Texture2D.MipLevels = 1;
@@ -1053,7 +1020,7 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 		const D3D12_RESOURCE_DESC ddesc = depth->GetDesc();
 		if ((ddesc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0) {
 			D3D12_SHADER_RESOURCE_VIEW_DESC dsrv{};
-			dsrv.Format = readable_depth(ddesc.Format);
+			dsrv.Format = depth_read_format(ddesc.Format);
 			dsrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 			dsrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			dsrv.Texture2D.MipLevels = 1;

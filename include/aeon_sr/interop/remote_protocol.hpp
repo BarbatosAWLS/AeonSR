@@ -8,7 +8,7 @@
 
 namespace aeon_sr::remote {
 
-constexpr uint32_t kProtocolVersion = 8;
+constexpr uint32_t kProtocolVersion = 10;
 constexpr uint32_t kMagic = 0x52535241u;
 
 constexpr uint32_t kNameChars = 96;
@@ -54,6 +54,33 @@ enum class RemoteStep : uint32_t {
 
 const char *remote_step_label(RemoteStep step) noexcept;
 
+enum NeuralInfoFlag : uint32_t {
+	kNeuralDllPresent = 1u << 0,
+	kNeuralShimPresent = 1u << 1,
+	kNeuralInitialized = 1u << 2,
+	kNeuralCrashed = 1u << 3,
+	kNeuralDriverTooOld = 1u << 4,
+	kNeuralAdapterUnsupported = 1u << 5,
+	kNeuralFeatureUnsupported = 1u << 6,
+	kNeuralServesCard = 1u << 7,
+	kNeuralRequirementKnown = 1u << 8,
+	kNeuralTargetsKnown = 1u << 9,
+	kNeuralCertificate = 1u << 10,
+	kNeuralInitFailed = 1u << 11,
+	kNeuralInfoValid = 1u << 31,
+};
+
+enum VsrStatusBit : uint32_t {
+	kVsrQueried = 1u << 0,
+	kVsrCapable = 1u << 1,
+	kVsrEnabled = 1u << 2,
+	kVsrInUse = 1u << 3,
+};
+
+constexpr uint32_t kFsrProviders = 8;
+constexpr uint32_t kFsrProviderChars = 32;
+constexpr uint32_t kPathChars = 260;
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4324)
@@ -97,7 +124,8 @@ struct alignas(16) Block {
 	uint32_t guide_state;
 	float depth_jitter_u;
 	float depth_jitter_v;
-	uint32_t reserved_request[2];
+	uint32_t upscaled_in_game;
+	uint32_t reserved_request;
 
 	UpscalerParams upscaler;
 	NeuralRenderParams neural;
@@ -119,12 +147,44 @@ struct alignas(16) Block {
 	uint32_t neural_gpu_us;
 	uint32_t upscaler_in_size;
 	wchar_t message[kTextChars];
+
+	char fsr_provider[kFsrProviderChars];
+	uint32_t neural_restart_epoch;
+	uint32_t accum_epoch;
+	uint32_t accum_target;
+	uint32_t capture_epoch;
+	uint32_t capture_frames;
+	uint32_t reserved_extension;
+	wchar_t capture_dir[kPathChars];
+	PlaneDesc output_plane;
+
+	uint32_t accum_running;
+	uint32_t accum_done;
+	uint32_t accum_target_now;
+	uint32_t accum_holding;
+	float neural_area_share;
+	uint32_t neural_flags;
+	uint32_t neural_driver_major, neural_driver_minor;
+	uint32_t neural_required_major, neural_required_minor;
+	uint32_t neural_min_architecture, neural_card_architecture;
+	uint32_t neural_runtime_minimum, neural_reported_architecture;
+	uint64_t neural_eval_count;
+	uint32_t fsr_provider_count;
+	uint32_t vsr_status;
+	char fsr_providers[kFsrProviders][kFsrProviderChars];
+	char neural_runtime_version[64];
+	char neural_runtime_sha256[72];
+	char neural_runtime_kernels[128];
+	char neural_runtime_cards[128];
+	wchar_t fsr_provider_version[64];
+	wchar_t neural_runtime_file[kPathChars];
+	wchar_t neural_capture_status[128];
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
 
-constexpr uint32_t kBlockSize = 2464;
+constexpr uint32_t kBlockSize = 4896;
 static_assert(sizeof(PlaneDesc) == 224, "PlaneDesc changed shape; bump kProtocolVersion");
 static_assert(sizeof(UpscalerParams) == 64, "UpscalerParams crosses the wire; bump kProtocolVersion");
 static_assert(sizeof(NeuralRenderParams) == 84, "NeuralRenderParams crosses the wire; bump kProtocolVersion");
@@ -135,6 +195,13 @@ static_assert(offsetof(Block, neural_model_width) == offsetof(Block, upscaler_ou
 	"the host's status moved; bump kProtocolVersion");
 static_assert(offsetof(Block, message) == offsetof(Block, neural_model_width) + 24,
 	"the host's status moved; bump kProtocolVersion");
+static_assert(offsetof(Block, fsr_provider) == 2464, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, capture_dir) == 2520, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, output_plane) == 3040, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, accum_running) == 3264, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, neural_eval_count) == 3320, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, fsr_providers) == 3336, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, neural_capture_status) == 4632, "the extension moved; bump kProtocolVersion");
 static_assert(sizeof(Block) == kBlockSize, "Block changed shape; bump kProtocolVersion and kBlockSize");
 static_assert(sizeof(wchar_t) == 2, "the name fields assume UTF-16 on both sides");
 
@@ -142,7 +209,8 @@ inline void depth_jitter_to_read(const Block &block, uint32_t backend_ran, float
 {
 	const bool upscaled = backend_ran == static_cast<uint32_t>(BackendChoice::Dlss) ||
 		backend_ran == static_cast<uint32_t>(BackendChoice::Fsr) ||
-		backend_ran == static_cast<uint32_t>(BackendChoice::Xess);
+		backend_ran == static_cast<uint32_t>(BackendChoice::Xess) ||
+		(block.upscaled_in_game != 0 && backend_ran == static_cast<uint32_t>(BackendChoice::None));
 	*u = upscaled ? block.depth_jitter_u : 0.0f;
 	*v = upscaled ? block.depth_jitter_v : 0.0f;
 }

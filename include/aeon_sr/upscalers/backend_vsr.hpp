@@ -1,10 +1,12 @@
 #pragma once
 
 #include "aeon_sr/interop/blit_d3d11.hpp"
+#include "aeon_sr/interop/interop.hpp"
 #include "aeon_sr/upscalers/upscaler_backend.hpp"
 
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_3.h>
 #include <dxgi.h>
 
 #include <cstdint>
@@ -24,6 +26,9 @@ struct VsrProcessorStatus {
 };
 
 struct VsrD3D11Backend final : UpscalerBackend {
+	EngineDevice *engine = nullptr;
+	bool list_lost = false;
+
 	const char *name() const override;
 	reshade::api::device_api api() const override;
 	bool runtime_present() override;
@@ -62,10 +67,17 @@ private:
 	uint32_t created_render_width_ = 0, created_render_height_ = 0;
 	DXGI_FORMAT created_format_ = DXGI_FORMAT_UNKNOWN;
 
+	SharedPlane in_{}, out_{};
+	ID3D11DeviceContext4 *context4_ = nullptr;
+	ID3D11Fence *fence11_ = nullptr;
+	ID3D12Fence *fence12_ = nullptr;
+	uint64_t value_ = 0;
+	ID3D12Resource *flush_trigger_ = nullptr;
+
 	VsrProcessorStatus vsr_status_;
 	bool logged_once_ = false;
 
-	bool ensure_device(reshade::api::device *device, ID3D11DeviceContext *ctx);
+	bool ensure_device();
 	bool ensure_processor(uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h, DXGI_FORMAT fmt);
 	void release_processor();
 	void release_scratch();

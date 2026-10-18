@@ -33,9 +33,10 @@ bool parse_captured_frame(const std::string &text, CapturedFrameInfo *out);
 
 std::wstring captured_frame_dir(const std::wstring &root, uint32_t index);
 
-enum class ScopePlane : uint32_t { Drawn, UpscalerIn, Upscaled, Final, Mask, Neural, Motion, Count };
+enum class ScopePlane : uint32_t { Drawn, UpscalerIn, Upscaled, Final, Mask, Neural, Motion, Depth, Count };
 inline constexpr uint32_t kScopeStagePlanes = static_cast<uint32_t>(ScopePlane::Count);
 const char *scope_plane_name(ScopePlane p) noexcept;
+uint32_t scope_planes_from_names(const std::string &names, bool *unknown = nullptr);
 
 enum class ScopeColumn : uint32_t {
 	N, Frame, Seq, PointX, PointY, ComputedDrawX, ComputedDrawY, DrawnX, DrawnY, DrawnValid, ArmedSerial,
@@ -61,7 +62,8 @@ std::string format_scope_trace_header();
 std::string format_scope_trace_row(const ScopeTraceRow &r);
 std::string format_scope_fmt(uint32_t width, uint32_t height, uint32_t dxgi_format, uint32_t row_bytes);
 std::wstring scope_plane_path(const std::wstring &dir, uint32_t n, ScopePlane p);
-std::string format_scope_txt(const std::string &header, uint32_t frames);
+std::string format_scope_txt(const std::string &header, uint32_t frames,
+	uint32_t planes = (1u << kScopeStagePlanes) - 1u);
 void count_scope_mask(const uint8_t *bytes, size_t count, uint32_t *members, uint32_t *held) noexcept;
 
 }

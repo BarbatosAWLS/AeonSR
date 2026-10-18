@@ -34,7 +34,6 @@ public:
 	virtual std::wstring note() const = 0;
 
 	virtual void set_render_scale(float scale) noexcept = 0;
-	virtual float requested_render_scale() const noexcept = 0;
 	virtual float applied_render_scale() const noexcept = 0;
 	virtual bool replaces_stretch() const noexcept = 0;
 	virtual bool routes_full_size() const noexcept { return false; }

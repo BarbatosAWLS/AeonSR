@@ -19,7 +19,7 @@ DXGI_FORMAT vendor_frame_format(DXGI_FORMAT f) noexcept
 	}
 }
 
-std::unique_ptr<VendorFrameGenerator> make_vendor_frame_generator(FrameGenerator g)
+std::unique_ptr<VendorFrameGenerator> make_inprocess_vendor_frame_generator(FrameGenerator g)
 {
 #if defined(AEONSR_NO_VENDOR)
 	(void)g;

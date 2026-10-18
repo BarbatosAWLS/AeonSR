@@ -1,6 +1,7 @@
 #include "window_host.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/framegen/window_host_protocol.hpp"
 
 #include <Windows.h>
@@ -24,14 +25,6 @@ enum Exit : int {
 	ExitSetup = 21,
 	ExitWaitFailed = 22,
 };
-
-template <typename T>
-void release(T *&p) noexcept
-{
-	if (p != nullptr)
-		p->Release();
-	p = nullptr;
-}
 
 HANDLE as_handle(uint64_t v) noexcept
 {
@@ -167,7 +160,7 @@ bool WindowHost::start(Block *block, std::wstring *why)
 	luid.LowPart = setup_.adapter_luid_low;
 	luid.HighPart = setup_.adapter_luid_high;
 	if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) || FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
-		release(factory);
+		safe_release(factory);
 		*why = L"the game's graphics card was not found";
 		close_given();
 		return false;
@@ -182,10 +175,10 @@ bool WindowHost::start(Block *block, std::wstring *why)
 		dev->QueryInterface(IID_PPV_ARGS(&device_));
 		ctx->QueryInterface(IID_PPV_ARGS(&ctx_));
 	}
-	release(ctx);
-	release(dev);
+	safe_release(ctx);
+	safe_release(dev);
 	if (device_ == nullptr || ctx_ == nullptr) {
-		release(factory);
+		safe_release(factory);
 		*why = L"no Direct3D 11.4 device";
 		close_given();
 		return false;
@@ -197,7 +190,7 @@ bool WindowHost::start(Block *block, std::wstring *why)
 		SUCCEEDED(device_->OpenSharedFence(done, IID_PPV_ARGS(&done_)));
 	close_given();
 	if (!opened) {
-		release(factory);
+		safe_release(factory);
 		*why = L"the game's shared textures and fences could not be opened";
 		return false;
 	}
@@ -219,13 +212,13 @@ bool WindowHost::start(Block *block, std::wstring *why)
 		factory->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
 	factory->Release();
 	if (FAILED(hr_sc) || FAILED(sc1->QueryInterface(IID_PPV_ARGS(&swap_)))) {
-		release(sc1);
+		safe_release(sc1);
 		wchar_t buf[96];
 		swprintf(buf, 96, L"its swap chain could not be made (0x%08X)", static_cast<unsigned>(hr_sc));
 		*why = buf;
 		return false;
 	}
-	release(sc1);
+	safe_release(sc1);
 	swap_->SetMaximumFrameLatency(1);
 	waitable_ = swap_->GetFrameLatencyWaitableObject();
 	IDXGISwapChain3 *sc3 = nullptr;
@@ -373,13 +366,13 @@ void WindowHost::shutdown() noexcept
 	if (waitable_ != nullptr)
 		CloseHandle(waitable_);
 	waitable_ = nullptr;
-	release(swap_);
+	safe_release(swap_);
 	for (ID3D11Texture2D *&t : shared_)
-		release(t);
-	release(ready_);
-	release(done_);
-	release(ctx_);
-	release(device_);
+		safe_release(t);
+	safe_release(ready_);
+	safe_release(done_);
+	safe_release(ctx_);
+	safe_release(device_);
 	if (window_ != nullptr)
 		DestroyWindow(window_);
 	window_ = nullptr;

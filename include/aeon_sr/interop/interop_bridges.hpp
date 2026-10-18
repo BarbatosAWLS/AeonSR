@@ -26,6 +26,8 @@ bool make_nt_pair(EngineDevice &engine, ID3D11Device *device11,
 
 void release_plane(SharedPlane &plane);
 
+bool make_engine_plane(EngineDevice &engine, uint32_t w, uint32_t h, DXGI_FORMAT fmt, SharedPlane &plane);
+
 void short_wait() noexcept;
 
 bool make_kmt_texture(ID3D11Device *device11, uint32_t w, uint32_t h, DXGI_FORMAT fmt,

@@ -74,16 +74,6 @@ ffxReturnCode_t create_context_guarded(PfnFfxCreateContext fn, ffxContext *ctx,
 	}
 }
 
-ffxReturnCode_t dispatch_guarded(PfnFfxDispatch fn, ffxContext *ctx,
-	const ffxDispatchDescHeader *desc, unsigned long *seh_code)
-{
-	__try {
-		return fn(ctx, desc);
-	} __except ((*seh_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER) {
-		return FFX_API_RETURN_ERROR;
-	}
-}
-
 std::wstring widen_utf8(const char *text)
 {
 	if (text == nullptr || *text == '\0')
@@ -105,7 +95,7 @@ reshade::api::device_api Fsr4D3D12Backend::api() const
 	return reshade::api::device_api::d3d12;
 }
 
-bool Fsr4D3D12Backend::ensure_dll_present()
+bool Fsr4D3D12Backend::ensure_dll_present(bool may_keep)
 {
 	if (fsr_loading())
 		return true;
@@ -113,15 +103,20 @@ bool Fsr4D3D12Backend::ensure_dll_present()
 		dll_present_ = true;
 		return true;
 	}
-
-	dll_present_ = false;
-	dll_dir.clear();
-	for (const std::wstring &dir : fsr_search_dirs(addon_dir, exe_directory_w())) {
-		if (!file_exists_w(fsr_dll_path(dir)))
-			continue;
-		dll_present_ = true;
-		dll_dir = dir;
-		break;
+	const uint64_t now = GetTickCount64();
+	if (may_keep && looked_.fresh(now)) {
+		dll_present_ = looked_.found();
+	} else {
+		dll_present_ = false;
+		dll_dir.clear();
+		for (const std::wstring &dir : fsr_search_dirs(addon_dir, exe_directory_w())) {
+			if (!file_exists_w(fsr_dll_path(dir)))
+				continue;
+			dll_present_ = true;
+			dll_dir = dir;
+			break;
+		}
+		looked_.note(dll_present_, now);
 	}
 	if (!dll_present_) {
 		status = UpscalerStatus::MissingRuntime;
@@ -138,7 +133,7 @@ void Fsr4D3D12Backend::set_color_space(uint32_t color_space)
 
 bool Fsr4D3D12Backend::runtime_present()
 {
-	return ensure_dll_present();
+	return ensure_dll_present(true);
 }
 
 void Fsr4D3D12Backend::wait_gpu()
@@ -715,7 +710,6 @@ bool Fsr4D3D12Backend::run_native(
 	explicit_height_ = params.render_height;
 	if (explicit_width_ != 0 && explicit_height_ != 0)
 		render_scale_ = 1.0f;
-	sharpness_ = params.sharpness;
 	frame_time_ms_ = params.frame_time_ms;
 	set_color_space(params.color_space);
 

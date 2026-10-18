@@ -1,24 +1,18 @@
 #include "aeon_sr/interop/remote_engine.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
 #include "aeon_sr/core/settings.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace aeon_sr {
 namespace {
-
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 void safe_close(HANDLE &h)
 {
@@ -53,6 +47,30 @@ std::wstring bounded_text(const wchar_t *text, uint32_t chars)
 	while (n < chars && text[n] != L'\0')
 		++n;
 	return std::wstring(text, text + n);
+}
+
+std::string bounded_ascii(const char *text, uint32_t chars)
+{
+	uint32_t n = 0;
+	while (n < chars && text[n] != '\0')
+		++n;
+	return std::string(text, text + n);
+}
+
+template <size_t N>
+std::wstring copied_text(const wchar_t (&field)[N])
+{
+	wchar_t local[N];
+	std::memcpy(local, field, sizeof(local));
+	return bounded_text(local, static_cast<uint32_t>(N));
+}
+
+template <size_t N>
+std::string copied_ascii(const char (&field)[N])
+{
+	char local[N];
+	std::memcpy(local, field, sizeof(local));
+	return bounded_ascii(local, static_cast<uint32_t>(N));
 }
 
 void log_hr(const wchar_t *what, HRESULT hr)
@@ -388,6 +406,7 @@ void RemoteEngine::stop()
 
 	for (uint32_t i = 0; i < kPlanes; ++i)
 		release_plane(i);
+	release_texture(output_);
 
 	safe_release(fence_);
 	safe_close(fence_handle_);
@@ -421,7 +440,11 @@ RemoteEngine::~RemoteEngine()
 
 void RemoteEngine::release_plane(uint32_t role)
 {
-	SharedTexture &t = planes_[role];
+	release_texture(planes_[role]);
+}
+
+void RemoteEngine::release_texture(SharedTexture &t)
+{
 	safe_release(t.res);
 	safe_close(t.handle);
 	t.width = t.height = 0;
@@ -433,6 +456,12 @@ void RemoteEngine::release_plane(uint32_t role)
 bool RemoteEngine::ensure_plane(EngineDevice &engine, uint32_t role, ID3D12Resource *src,
 	remote::PlaneDesc &desc)
 {
+	return ensure_texture(engine, planes_[role], role_tag(role), role == kColour, src, desc);
+}
+
+bool RemoteEngine::ensure_texture(EngineDevice &engine, SharedTexture &t, const wchar_t *tag, bool written_there,
+	ID3D12Resource *src, remote::PlaneDesc &desc)
+{
 	memset(&desc, 0, sizeof(desc));
 	desc.share = static_cast<uint32_t>(remote::ShareKind::None);
 	if (src == nullptr)
@@ -441,11 +470,10 @@ bool RemoteEngine::ensure_plane(EngineDevice &engine, uint32_t role, ID3D12Resou
 	const D3D12_RESOURCE_DESC sd = src->GetDesc();
 	const uint32_t w = static_cast<uint32_t>(sd.Width);
 	const uint32_t h = sd.Height;
-	SharedTexture &t = planes_[role];
 
 	if (t.res == nullptr || t.width != w || t.height != h || t.format != sd.Format) {
 		engine.drain();
-		release_plane(role);
+		release_texture(t);
 
 		D3D12_HEAP_PROPERTIES heap{};
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -458,7 +486,7 @@ bool RemoteEngine::ensure_plane(EngineDevice &engine, uint32_t role, ID3D12Resou
 		d.Format = sd.Format;
 		d.SampleDesc = sd.SampleDesc;
 		d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		d.Flags = (role == kColour)
+		d.Flags = written_there
 			? (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
 			: D3D12_RESOURCE_FLAG_NONE;
 
@@ -466,16 +494,16 @@ bool RemoteEngine::ensure_plane(EngineDevice &engine, uint32_t role, ID3D12Resou
 			kSharedState, nullptr, IID_PPV_ARGS(&t.res));
 		if (FAILED(hr) || t.res == nullptr) {
 			log_hr(L"CreateCommittedResource(HEAP_FLAG_SHARED)", hr);
-			release_plane(role);
+			release_texture(t);
 			return false;
 		}
 
 		const uint64_t generation = g_name_generation.fetch_add(1);
-		remote::object_name(game_pid_, role_tag(role), generation, t.name, remote::kNameChars);
+		remote::object_name(game_pid_, tag, generation, t.name, remote::kNameChars);
 		hr = engine.device()->CreateSharedHandle(t.res, nullptr, GENERIC_ALL, t.name, &t.handle);
 		if (FAILED(hr) || t.handle == nullptr) {
 			log_hr(L"CreateSharedHandle for a plane", hr);
-			release_plane(role);
+			release_texture(t);
 			return false;
 		}
 		t.width = w;
@@ -530,9 +558,25 @@ bool RemoteEngine::exchange(EngineDevice &engine, const Request &req,
 	block_->guide_state = static_cast<uint32_t>(kSharedState);
 	block_->depth_jitter_u = req.depth_jitter_u;
 	block_->depth_jitter_v = req.depth_jitter_v;
+	block_->upscaled_in_game = req.upscaled_here && req.backend == BackendChoice::None ? 1u : 0u;
 	block_->upscaler = req.upscaler;
 	block_->upscaler.bias_mask = 0;
 	block_->neural = req.neural;
+	{
+		const RemoteEngine::Extras &x = req.extras;
+		std::memset(block_->fsr_provider, 0, sizeof(block_->fsr_provider));
+		std::memcpy(block_->fsr_provider, x.fsr_provider.data(),
+			std::min<size_t>(x.fsr_provider.size(), remote::kFsrProviderChars - 1));
+		block_->neural_restart_epoch = x.neural_restart_epoch;
+		block_->accum_epoch = x.accum_epoch;
+		block_->accum_target = x.accum_target;
+		block_->capture_epoch = x.capture_epoch;
+		block_->capture_frames = x.capture_frames;
+		const size_t n = std::min<size_t>(x.capture_dir.size(), remote::kPathChars - 1);
+		std::memcpy(block_->capture_dir, x.capture_dir.data(), n * sizeof(wchar_t));
+		block_->capture_dir[n] = L'\0';
+	}
+	block_->neural_flags = 0;
 
 	block_->step = static_cast<uint32_t>(remote::RemoteStep::Timeout);
 	block_->backend_ran = static_cast<uint32_t>(BackendChoice::None);
@@ -625,6 +669,38 @@ bool RemoteEngine::exchange(EngineDevice &engine, const Request &req,
 	reply.neural_passes_built = load32(block_->neural_passes_built);
 	reply.neural_gpu_ms = static_cast<float>(load32(block_->neural_gpu_us)) / 1000.0f;
 	reply.message = bounded_text(block_->message, remote::kTextChars);
+	{
+		Info &i = reply.info;
+		i.neural_flags = load32(block_->neural_flags);
+		i.valid = (i.neural_flags & remote::kNeuralInfoValid) != 0;
+		if (i.valid) {
+			i.accum_running = load32(block_->accum_running) != 0;
+			i.accum_holding = load32(block_->accum_holding) != 0;
+			i.accum_done = load32(block_->accum_done);
+			i.accum_target = load32(block_->accum_target_now);
+			std::memcpy(&i.neural_area_share, &block_->neural_area_share, sizeof(i.neural_area_share));
+			i.neural_driver_major = load32(block_->neural_driver_major);
+			i.neural_driver_minor = load32(block_->neural_driver_minor);
+			i.neural_required_major = load32(block_->neural_required_major);
+			i.neural_required_minor = load32(block_->neural_required_minor);
+			i.neural_min_architecture = load32(block_->neural_min_architecture);
+			i.neural_card_architecture = load32(block_->neural_card_architecture);
+			i.neural_runtime_minimum = load32(block_->neural_runtime_minimum);
+			i.neural_reported_architecture = load32(block_->neural_reported_architecture);
+			i.neural_eval_count = load64(block_->neural_eval_count);
+			i.vsr_status = load32(block_->vsr_status);
+			const uint32_t count = std::min(load32(block_->fsr_provider_count), remote::kFsrProviders);
+			for (uint32_t k = 0; k < count; ++k)
+				i.fsr_providers.push_back(copied_ascii(block_->fsr_providers[k]));
+			i.fsr_provider_version = copied_text(block_->fsr_provider_version);
+			i.neural_runtime_version = copied_ascii(block_->neural_runtime_version);
+			i.neural_runtime_sha256 = copied_ascii(block_->neural_runtime_sha256);
+			i.neural_runtime_kernels = copied_ascii(block_->neural_runtime_kernels);
+			i.neural_runtime_cards = copied_ascii(block_->neural_runtime_cards);
+			i.neural_runtime_file = copied_text(block_->neural_runtime_file);
+			i.neural_capture_status = copied_text(block_->neural_capture_status);
+		}
+	}
 
 	if (reply.step != remote::RemoteStep::Ok) {
 		if (fence_wait(fence_, signal_value, 50))
@@ -779,6 +855,15 @@ bool RemoteEngine::run(EngineDevice &engine, const Request &req, Reply &reply)
 		memset(&descs[i], 0, sizeof(descs[i]));
 	}
 
+	remote::PlaneDesc output_desc{};
+	if (ef.output != nullptr && !ensure_texture(engine, output_, L"output", true, ef.output, output_desc)) {
+		reply.step = remote::RemoteStep::Share;
+		reply.message = L"this graphics driver would not make the display-size frame shareable with the "
+			L"engine host.";
+		return false;
+	}
+	block_->output_plane = output_desc;
+
 	for (uint32_t i = 0; i < kPlanes; ++i) {
 		if (descs[i].share == static_cast<uint32_t>(remote::ShareKind::None))
 			continue;
@@ -832,7 +917,10 @@ bool RemoteEngine::run(EngineDevice &engine, const Request &req, Reply &reply)
 	if (!copy_back || planes_[kColour].res == nullptr)
 		return false;
 
-	record_copy(back, ef.color, ef.color_state, planes_[kColour].res, kSharedState);
+	if (ef.output != nullptr && output_.res != nullptr)
+		record_copy(back, ef.output, ef.output_state, output_.res, kSharedState);
+	else
+		record_copy(back, ef.color, ef.color_state, planes_[kColour].res, kSharedState);
 	return true;
 }
 

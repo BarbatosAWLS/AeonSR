@@ -1,4 +1,6 @@
 #include "aeon_sr/framegen/overlay_presenter.hpp"
+#include "aeon_sr/core/com_release.hpp"
+#include "aeon_sr/framegen/host_launch.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/dxgi_format_util.hpp"
@@ -101,14 +103,6 @@ void give_overlays_their_event()
 		DestroyWindow(w);
 }
 
-template <typename T>
-void release(T *&p) noexcept
-{
-	if (p != nullptr)
-		p->Release();
-	p = nullptr;
-}
-
 }
 
 namespace {
@@ -151,15 +145,7 @@ bool overlay_forget_own_device(uint64_t native) noexcept
 
 std::wstring overlay_window_host_beside_addon()
 {
-	wchar_t v[MAX_PATH] = {};
-	const DWORD n = GetEnvironmentVariableW(L"AEONSR_FG_WINDOW_HOST", v, MAX_PATH);
-	if (n > 0 && n < MAX_PATH)
-		return wcscmp(v, L"0") == 0 ? std::wstring() : std::wstring(v);
-#if defined(_WIN64)
-	return join_path(module_directory(self_module()), L"AeonSRHost.exe");
-#else
-	return std::wstring();
-#endif
+	return host_beside_addon(L"AEONSR_FG_WINDOW_HOST");
 }
 
 double monitor_refresh_hz(HMONITOR m) noexcept
@@ -227,11 +213,11 @@ bool OverlayPresenter::make_ring(ID3D12Device *device, uint32_t w, uint32_t h, D
 void OverlayPresenter::release_ring() noexcept
 {
 	for (Slot &s : slots_) {
-		release(s.color);
-		release(s.motion);
-		release(s.global);
+		safe_release(s.color);
+		safe_release(s.motion);
+		safe_release(s.global);
 		for (ID3D12Resource *&m : s.made)
-			release(m);
+			safe_release(m);
 		s.made_format = DXGI_FORMAT_UNKNOWN;
 		s.id = 0;
 		s.read_until = 0;
@@ -244,7 +230,7 @@ void OverlayPresenter::free_retired(bool all) noexcept
 	const uint64_t fed = feed_fence_ != nullptr ? feed_fence_->GetCompletedValue() : 0;
 	for (Retired &r : retired_)
 		if (all || (r.read_until <= read && r.feed_until <= fed))
-			release(r.res);
+			safe_release(r.res);
 	retired_.erase(std::remove_if(retired_.begin(), retired_.end(), [](const Retired &r) { return r.res == nullptr; }),
 		retired_.end());
 }
@@ -290,8 +276,8 @@ bool OverlayPresenter::ensure(ID3D12Device *device, HWND game_window, uint32_t w
 	if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&feed_fence_))) ||
 		FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&read_fence_)))) {
 		release_ring();
-		release(feed_fence_);
-		release(read_fence_);
+		safe_release(feed_fence_);
+		safe_release(read_fence_);
 		if (why != nullptr)
 			*why = L"frame generation: the fences of its own window could not be made";
 		return false;
@@ -461,9 +447,9 @@ void OverlayPresenter::stop() noexcept
 	}
 	release_ring();
 	free_retired(true);
-	release(feed_fence_);
-	release(read_fence_);
-	release(device_);
+	safe_release(feed_fence_);
+	safe_release(read_fence_);
+	safe_release(device_);
 	game_window_ = nullptr;
 	feed_open_ = false;
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -657,12 +643,12 @@ bool OverlayPresenter::init_local(std::wstring *why)
 	IDXGIAdapter1 *adapter = nullptr;
 	if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory4))) ||
 		FAILED(factory4->EnumAdapterByLuid(native_->GetAdapterLuid(), IID_PPV_ARGS(&adapter)))) {
-		release(factory4);
+		safe_release(factory4);
 		factory->Release();
 		*why = L"frame generation: the graphics card of its own window was not found";
 		return false;
 	}
-	release(factory4);
+	safe_release(factory4);
 	wchar_t sys11[MAX_PATH + 16] = {};
 	const UINT n11 = GetSystemDirectoryW(sys11, MAX_PATH);
 	if (n11 != 0 && n11 < MAX_PATH)
@@ -698,8 +684,8 @@ bool OverlayPresenter::init_local(std::wstring *why)
 		if (ctx != nullptr)
 			ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
 	}
-	release(ctx);
-	release(native11);
+	safe_release(ctx);
+	safe_release(native11);
 	d3d11_wrapper_ = wrapper;
 	d3d11_ = dev5;
 	ctx11_ = ctx4;
@@ -764,7 +750,7 @@ bool OverlayPresenter::init_local(std::wstring *why)
 	const HRESULT hr = factory->CreateSwapChainForComposition(dev5, &sd, nullptr, &sc1);
 	factory->Release();
 	if (FAILED(hr) || FAILED(sc1->QueryInterface(IID_PPV_ARGS(&swap_)))) {
-		release(sc1);
+		safe_release(sc1);
 		*why = L"frame generation: its swap chain could not be made";
 		return false;
 	}
@@ -784,14 +770,14 @@ bool OverlayPresenter::init_local(std::wstring *why)
 	if (create == nullptr || FAILED(create(nullptr, IID_PPV_ARGS(&dev))) ||
 		FAILED(dev->CreateTargetForHwnd(window_, TRUE, &target)) || FAILED(dev->CreateVisual(&visual)) ||
 		FAILED(visual->SetContent(sc1)) || FAILED(target->SetRoot(visual)) || FAILED(dev->Commit())) {
-		release(visual);
-		release(target);
-		release(dev);
-		release(sc1);
+		safe_release(visual);
+		safe_release(target);
+		safe_release(dev);
+		safe_release(sc1);
 		*why = L"frame generation: DirectComposition would not show its swap chain";
 		return false;
 	}
-	release(sc1);
+	safe_release(sc1);
 	dcomp_device_ = dev;
 	dcomp_target_ = target;
 	dcomp_visual_ = visual;
@@ -844,17 +830,17 @@ void OverlayPresenter::release_sink(bool gpu_idle) noexcept
 	if (waitable_ != nullptr)
 		CloseHandle(waitable_);
 	waitable_ = nullptr;
-	release(swap_);
+	safe_release(swap_);
 	for (uint32_t i = 0; i < kShared; ++i) {
-		release(shared12_[i]);
+		safe_release(shared12_[i]);
 		if (shared11_[i] != nullptr)
 			static_cast<ID3D11Texture2D *>(shared11_[i])->Release();
 		shared11_[i] = nullptr;
 		shared_free_[i] = 0;
 	}
 	shared_at_ = 0;
-	release(ready12_);
-	release(done12_);
+	safe_release(ready12_);
+	safe_release(done12_);
 	if (ready11_ != nullptr)
 		static_cast<ID3D11Fence *>(ready11_)->Release();
 	if (done11_ != nullptr)
@@ -948,9 +934,20 @@ void OverlayPresenter::thread_shutdown() noexcept
 			}
 			trace_pending_.clear();
 		}
+		if (trace_quit_event_ != nullptr)
+			SetEvent(trace_quit_event_);
 		trace_cv_.notify_one();
 		trace_thread_.join();
 	}
+	if (trace_quit_event_ != nullptr)
+		CloseHandle(trace_quit_event_);
+	trace_quit_event_ = nullptr;
+	trace_done_.clear();
+	trace_d3d12_.clear();
+	trace_d3d11_.clear();
+	if (pace_csv_ != nullptr)
+		std::fclose(pace_csv_);
+	pace_csv_ = nullptr;
 	if (queue_ != nullptr && read_fence_ != nullptr && read_value_ != 0 &&
 		read_fence_->GetCompletedValue() < read_value_ && fence_event_ != nullptr &&
 		SUCCEEDED(read_fence_->SetEventOnCompletion(read_value_, fence_event_)))
@@ -960,17 +957,17 @@ void OverlayPresenter::thread_shutdown() noexcept
 	wait_sink_done();
 	release_sink();
 	host_lost_ = false;
-	release(list_);
+	safe_release(list_);
 	for (ID3D12CommandAllocator *&a : alloc_)
-		release(a);
+		safe_release(a);
 	for (uint64_t &d : alloc_done_)
 		d = 0;
 	alloc_at_ = 0;
-	release(queue_);
+	safe_release(queue_);
 	if (fence_event_ != nullptr)
 		CloseHandle(fence_event_);
 	fence_event_ = nullptr;
-	release(native_);
+	safe_release(native_);
 	scheduler_.reset();
 	waiting_.clear();
 	last_ = Last::None;
@@ -1034,9 +1031,43 @@ void OverlayPresenter::read_frame_statistics()
 	}
 }
 
+FenceReached fence_reached(ID3D12Fence *fence, uint64_t value, HANDLE event, HANDLE quit, double timeout_ms,
+	double since) noexcept
+{
+	FenceReached r;
+	if (fence->GetCompletedValue() >= value) {
+		r.at = qpc_ms();
+		r.exact = r.at - since <= kFenceSlackMs;
+		return r;
+	}
+	if (FAILED(fence->SetEventOnCompletion(value, event)))
+		return r;
+	const double until = qpc_ms() + timeout_ms;
+	const HANDLE waits[2] = { event, quit };
+	for (;;) {
+		const double left = until - qpc_ms();
+		if (left <= 0.0)
+			return r;
+		const DWORD hit = WaitForMultipleObjects(quit != nullptr ? 2u : 1u, waits, FALSE,
+			static_cast<DWORD>(std::ceil(left)));
+		if (hit != WAIT_OBJECT_0)
+			return r;
+		if (fence->GetCompletedValue() >= value) {
+			r.at = qpc_ms();
+			r.waited = r.exact = true;
+			return r;
+		}
+	}
+}
+
 void OverlayPresenter::trace_run()
 {
 	HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	if (ev == nullptr)
+		return;
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	ID3D12Fence *last_fence = nullptr;
+	double last_done = -1.0;
 	for (;;) {
 		GpuTrace t{};
 		{
@@ -1047,21 +1078,41 @@ void OverlayPresenter::trace_run()
 			t = trace_pending_.front();
 			trace_pending_.erase(trace_pending_.begin());
 		}
-		const auto at = [&](ID3D12Fence *f, uint64_t v) {
-			if (ev != nullptr && f->GetCompletedValue() < v && SUCCEEDED(f->SetEventOnCompletion(v, ev)))
-				WaitForSingleObject(ev, 500);
-			return qpc_ms() - t.submitted;
-		};
-		const double d12 = at(t.ready_fence, t.ready);
-		const double d11 = at(t.done_fence, t.done);
+		const FenceReached ready = fence_reached(t.ready_fence, t.ready, ev, trace_quit_event_, 1000.0, t.submitted);
+		double since = ready.exact ? std::max(ready.at, t.submitted) : t.submitted;
+		if (t.done_fence == last_fence && last_done > since)
+			since = last_done;
+		const FenceReached done = ready.at >= 0.0
+			? fence_reached(t.done_fence, t.done, ev, trace_quit_event_, 1000.0, since) : FenceReached{};
+		if (last_fence != nullptr)
+			last_fence->Release();
+		last_fence = t.done_fence;
+		last_done = done.exact ? done.at : -1.0;
 		t.ready_fence->Release();
-		t.done_fence->Release();
 		std::lock_guard<std::mutex> lock(trace_mutex_);
-		trace_d3d12_.push_back(d12);
-		trace_d3d11_.push_back(d11);
+		if (t.seq == trace_void_)
+			continue;
+		if (done.at < 0.0 || !done.exact)
+			++work_untimed_;
+		else if (done.waited)
+			++work_seen_;
+		else
+			++work_found_;
+		if (pace_csv_ != nullptr)
+			std::fprintf(pace_csv_, "work,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n", t.planned, t.display, t.submitted, ready.at,
+				done.at, done.at < 0.0 ? 0 : done.waited ? 1 : done.exact ? 2 : 3);
+		if (done.at < 0.0)
+			continue;
+		if (ready.exact)
+			trace_d3d12_.push_back(ready.at - t.submitted);
+		if (done.exact)
+			trace_d3d11_.push_back(done.at - t.submitted);
+		if (trace_done_.size() < 256)
+			trace_done_.push_back(GpuDone{ t.planned, t.display, done.at, done.exact });
 	}
-	if (ev != nullptr)
-		CloseHandle(ev);
+	if (last_fence != nullptr)
+		last_fence->Release();
+	CloseHandle(ev);
 }
 
 void OverlayPresenter::wait_until(double t_ms) noexcept
@@ -1264,8 +1315,27 @@ bool OverlayPresenter::render(const OverlayChoice &c)
 	if (shared_free_[si] != 0)
 		queue_->Wait(done12_, shared_free_[si]);
 	ID3D12CommandList *lists[] = { list_ };
+	const double submitted = qpc_ms();
 	queue_->ExecuteCommandLists(1, lists);
 	queue_->Signal(ready12_, ++ready_value_);
+	uint64_t traced = 0;
+	if (trace_thread_.joinable() && ready12_ != nullptr && done12_ != nullptr) {
+		std::lock_guard<std::mutex> lock(trace_mutex_);
+		if (trace_pending_.size() < 64) {
+			ready12_->AddRef();
+			done12_->AddRef();
+			traced = ++trace_seq_;
+			trace_pending_.push_back(GpuTrace{ ready12_, done12_, ready_value_, done_value_ + 1, submitted, planned_at_,
+				planned_display_, traced });
+			trace_cv_.notify_one();
+		}
+	}
+	const auto untrace = [&]() {
+		if (traced != 0) {
+			std::lock_guard<std::mutex> lock(trace_mutex_);
+			trace_void_ = traced;
+		}
+	};
 	HRESULT presented = E_FAIL;
 	UINT count = 0;
 	bool counted = false;
@@ -1278,6 +1348,7 @@ bool OverlayPresenter::render(const OverlayChoice &c)
 			if (host_->alive())
 				diag_logf(DiagLevel::Warn, "framegen", L"frame generation: AeonSRHost.exe's present failed (0x%08X)",
 					static_cast<unsigned>(a.present_hr));
+			untrace();
 			lose_host(promised);
 			alloc_done_[alloc_at_] = reserve;
 			alloc_at_ = (alloc_at_ + 1) % kLists;
@@ -1299,15 +1370,10 @@ bool OverlayPresenter::render(const OverlayChoice &c)
 		ctx->Signal(static_cast<ID3D11Fence *>(done11_), ++done_value_);
 		presented = swap_->Present(1, 0);
 		counted = SUCCEEDED(swap_->GetLastPresentCount(&count));
+		if (FAILED(presented))
+			untrace();
 	}
 	t_present_.push_back(qpc_ms() - present_from);
-	if (gpu_trace_ && SUCCEEDED(presented) && ready12_ != nullptr && done12_ != nullptr && trace_pending_.size() < 64) {
-		ready12_->AddRef();
-		done12_->AddRef();
-		std::lock_guard<std::mutex> lock(trace_mutex_);
-		trace_pending_.push_back(GpuTrace{ ready12_, done12_, ready_value_, done_value_, present_from });
-		trace_cv_.notify_one();
-	}
 	shared_free_[si] = done_value_;
 	shared_at_ = (si + 1) % kShared;
 	if (SUCCEEDED(presented) && c.kind == OverlayChoice::Kind::Real && c.held_ms >= 0.0)
@@ -1338,8 +1404,10 @@ void OverlayPresenter::run()
 		wchar_t c[16] = {};
 		if (GetEnvironmentVariableW(L"AEONSR_FG_LEAD_CAP", c, 16) != 0)
 			pace_.set_lead_cap(_wtof(c));
-		wchar_t g[8] = {};
-		gpu_trace_ = GetEnvironmentVariableW(L"AEONSR_FG_GPU_TRACE", g, 8) != 0 && g[0] == L'1';
+		wchar_t csv[MAX_PATH] = {};
+		if (GetEnvironmentVariableW(L"AEONSR_FG_PACE_CSV", csv, MAX_PATH) != 0 && _wfopen_s(&pace_csv_, csv, L"w") == 0 &&
+			pace_csv_ != nullptr)
+			std::fprintf(pace_csv_, "kind,a,b,c,d,e,f\n");
 	}
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 	std::wstring why;
@@ -1365,13 +1433,13 @@ void OverlayPresenter::run()
 		stats_.running = true;
 		stats_.in_host = host_ != nullptr;
 		stats_.host_pid = host_ != nullptr ? host_->host_pid() : 0u;
+		stats_.host_gpu_class = host_ != nullptr ? host_->gpu_class() : -1;
 	}
 	diag_logf(DiagLevel::Info, "framegen", L"frame generation: its own window started, shown from %ls",
 		host_ != nullptr ? L"AeonSRHost.exe" : L"the game's process");
-	if (gpu_trace_) {
-		trace_quit_ = false;
-		trace_thread_ = std::thread([this] { trace_run(); });
-	}
+	trace_quit_ = false;
+	trace_quit_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	trace_thread_ = std::thread([this] { trace_run(); });
 	second_start_ = qpc_ms();
 	second_reals_ = second_generated_ = 0;
 	kicks_left_ = 16;
@@ -1387,16 +1455,6 @@ void OverlayPresenter::run()
 		while (PeekMessageW(&msg, window_, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
-		}
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			if (reset_pending_) {
-				scheduler_.reset();
-				waiting_.clear();
-				reset_pending_ = false;
-			}
-			waiting_.insert(waiting_.end(), pending_.begin(), pending_.end());
-			pending_.clear();
 		}
 		const double now = qpc_ms();
 		if (last_wake_ > 0.0) {
@@ -1448,10 +1506,20 @@ void OverlayPresenter::run()
 				vblank = refresh = 0.0;
 		}
 		const bool by_compositor = source != OverlayStats::kPacedByReleases;
+		{
+			std::lock_guard<std::mutex> lock(trace_mutex_);
+			for (const GpuDone &d : trace_done_)
+				pace_.work_done(d.planned, d.display, d.done, d.exact);
+			trace_done_.clear();
+		}
+		if (pace_csv_ != nullptr)
+			std::fprintf(pace_csv_, "wake,%.3f,%.3f,%.3f,%.3f,%.3f\n", now, planned_display_, planned_at_, pace_.lead_ms(),
+				pace_.work_ms());
 		if (by_compositor) {
 			double at = now;
 			display = pace_.plan(now, vblank, refresh, &at);
 			period = refresh;
+			planned_at_ = at;
 			wait_until(at);
 			t_wake_late_.push_back(qpc_ms() - at);
 			planned_display_ = display;
@@ -1460,8 +1528,20 @@ void OverlayPresenter::run()
 			planned_display_ = 0.0;
 		}
 		wait_period = period;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (reset_pending_) {
+				scheduler_.reset();
+				waiting_.clear();
+				reset_pending_ = false;
+			}
+			waiting_.insert(waiting_.end(), pending_.begin(), pending_.end());
+			pending_.clear();
+		}
 		size_t taken = 0;
 		const double decided = qpc_ms();
+		if (!by_compositor)
+			planned_at_ = decided;
 		while (taken < waiting_.size() && feed_fence_->GetCompletedValue() >= waiting_[taken].fence_value) {
 			const Pending &w = waiting_[taken];
 			double ready = ready_time(w.fence_value);
@@ -1470,6 +1550,14 @@ void OverlayPresenter::run()
 			const bool timed = ready > 0.0 && ready <= decided;
 			scheduler_.add(w.id, w.presented_ms, w.pairs, display, w.steps, w.made, w.vendor,
 				timed ? decided - ready : -1.0, timed ? std::max(0.0, ready - w.presented_ms) : -1.0);
+			if (timed) {
+				ready_wait_.push_back(decided - ready);
+				if (decided - ready > period + 1.0)
+					++ready_wait_long_;
+			}
+			if (pace_csv_ != nullptr)
+				std::fprintf(pace_csv_, "frame,%.3f,%.3f,%.3f,%.3f,%.3f\n", w.presented_ms, ready, decided, display,
+					scheduler_.latency_ms());
 			++taken;
 		}
 		waiting_.erase(waiting_.begin(), waiting_.begin() + static_cast<long>(taken));
@@ -1536,6 +1624,10 @@ void OverlayPresenter::run()
 			stats_.screen_real_ms_p90 = pct(screen_real_, 0.9);
 			stats_.screen_samples = static_cast<uint32_t>(screen_all_.size());
 			stats_.held_real_ms_p50 = pct(held_real_, 0.5);
+			stats_.ready_wait_max = ready_wait_.empty() ? 0.0 : *std::max_element(ready_wait_.begin(), ready_wait_.end());
+			stats_.ready_wait_long = ready_wait_.empty() ? 0.0
+				: static_cast<double>(ready_wait_long_) / static_cast<double>(ready_wait_.size());
+			stats_.ready_wait_p90 = pct(ready_wait_, 0.9);
 			stats_.monitor_hz = monitor_hz_;
 			const auto both = [&](std::vector<double> &v, double *p90, double *most) {
 				*most = v.empty() ? 0.0 : *std::max_element(v.begin(), v.end());
@@ -1546,15 +1638,20 @@ void OverlayPresenter::run()
 			both(t_wake_late_, &stats_.thread_late_p90, &stats_.thread_late_max);
 			both(t_render_, &stats_.thread_render_p90, &stats_.thread_render_max);
 			both(t_present_, &stats_.thread_present_p90, &stats_.thread_present_max);
-			if (gpu_trace_) {
+			{
 				std::lock_guard<std::mutex> tl(trace_mutex_);
 				stats_.gpu_d3d12_p90 = pct(trace_d3d12_, 0.9);
 				stats_.gpu_d3d11_p90 = pct(trace_d3d11_, 0.9);
 				trace_d3d12_.clear();
 				trace_d3d11_.clear();
+				stats_.work_seen = work_seen_;
+				stats_.work_found = work_found_;
+				stats_.work_untimed = work_untimed_;
 			}
 			stats_.lead_ms = pace_.lead_ms();
+			stats_.work_ms = pace_.work_ms();
 			stats_.missed = pace_.misses();
+			stats_.missed_late_work = pace_.late_work();
 			if (offset_n_ > 0) {
 				double o[kOffsets];
 				std::copy(offsets_, offsets_ + offset_n_, o);
@@ -1566,11 +1663,14 @@ void OverlayPresenter::run()
 			screen_all_.clear();
 			screen_real_.clear();
 			held_real_.clear();
+			ready_wait_.clear();
+			ready_wait_long_ = 0;
 			stats_.period_ms = period;
 			stats_.compositor_paced = by_compositor;
 			stats_.paced_by = source;
 			stats_.in_host = host_ != nullptr;
 			stats_.host_pid = host_ != nullptr ? host_->host_pid() : 0u;
+			stats_.host_gpu_class = host_ != nullptr ? host_->gpu_class() : -1;
 			stats_.real_per_s = second_reals_ / secs;
 			stats_.generated_per_s = second_generated_ / secs;
 			second_start_ = now;
@@ -1583,6 +1683,7 @@ void OverlayPresenter::run()
 	stats_.visible = false;
 	stats_.in_host = false;
 	stats_.host_pid = 0;
+	stats_.host_gpu_class = -1;
 }
 
 }

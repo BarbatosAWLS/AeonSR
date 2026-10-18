@@ -37,7 +37,6 @@ struct FrameGenReadout {
 	double screen_hz = 0.0;
 	bool through_game_present = false;
 	uint64_t generated = 0;
-	uint64_t present_failures = 0;
 	std::string route;
 	FrameGenerator generator = FrameGenerator::AeonSR;
 	std::wstring generator_version;
@@ -88,7 +87,6 @@ private:
 	FramePresenter presenter_;
 	std::wstring note_;
 	uint64_t generated_ = 0;
-	uint64_t present_failures_ = 0;
 	bool route_given_up_ = false;
 	bool sync_watched_ = false;
 	bool sync_watch_failed_ = false;

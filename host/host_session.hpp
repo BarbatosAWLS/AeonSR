@@ -3,6 +3,7 @@
 #include "aeon_sr/upscalers/backend_dlss.hpp"
 #include "aeon_sr/upscalers/backend_fsr.hpp"
 #include "aeon_sr/upscalers/backend_xess.hpp"
+#include "aeon_sr/upscalers/backend_vsr.hpp"
 #include "aeon_sr/interop/interop.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
@@ -56,6 +57,7 @@ private:
 
 	bool ensure_fence();
 	bool open_planes();
+	bool open_plane(Plane &cached, const remote::PlaneDesc &desc, const std::wstring &role_text);
 	bool run_upscaler(const FrameInputs &inputs);
 	void fail_neural(const std::wstring &text);
 	void run_neural(const FrameInputs &inputs, ID3D12Resource *colour,
@@ -76,10 +78,16 @@ private:
 	DlssD3D12Backend dlss_;
 	Fsr4D3D12Backend fsr_;
 	XessD3D12Backend xess_;
+	VsrD3D11Backend vsr_;
 	NeuralRenderD3D12 neural_;
 	bool neural_init_failed_ = false;
+	void take_extras();
+	void write_info() noexcept;
+	bool extras_seen_ = false;
+	uint32_t restart_epoch_ = 0, accum_epoch_ = 0, capture_epoch_ = 0;
 
 	Plane planes_[static_cast<uint32_t>(remote::PlaneRole::Count)];
+	Plane output_;
 
 	ID3D12Fence *fence_ = nullptr;
 	wchar_t fence_name_[remote::kNameChars] = {};

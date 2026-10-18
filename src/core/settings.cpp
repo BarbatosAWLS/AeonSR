@@ -86,21 +86,37 @@ unsigned int clamp_neural_mode(unsigned int mode) noexcept
 	return mode < kNeuralModeCount ? mode : 0u;
 }
 
-unsigned int neural_mode_width(unsigned int frame_w, float scale, unsigned int mode) noexcept
+unsigned int neural_mode_width(unsigned int frame_w, float scale, unsigned int mode, unsigned int frame_h) noexcept
 {
 	constexpr unsigned int kGrid = 256u;
 	const float base = scale > 0.0f && scale < 1.0f ? scale : 1.0f;
 	const unsigned int detail = neural_model_width(frame_w, base);
+	if (frame_w == 0u)
+		return detail;
+	const double aspect = frame_h != 0u ? static_cast<double>(frame_h) / frame_w : 9.0 / 16.0;
+	const auto cost = [&](unsigned int w) {
+		const double px = static_cast<double>(w) * (static_cast<double>(w) * aspect);
+		return kNeuralPassFixedCost + kNeuralPassPixelCost * px / (2560.0 * 1440.0);
+	};
+	const double detail_cost = cost(detail);
 	unsigned int width = detail;
 	mode = clamp_neural_mode(mode);
 	for (unsigned int m = 1u; m <= mode; ++m) {
-		unsigned int want = neural_model_width(frame_w, base * kNeuralModeKeep[m]);
-		const unsigned int below = width > kGrid ? (width - 1u) / kGrid * kGrid : 0u;
-		if (want >= width)
-			want = below;
-		if (want == 0u || static_cast<float>(want) < kNeuralModeKeepMin * static_cast<float>(detail))
+		const double want = kNeuralModeCost[m] * detail_cost;
+		unsigned int best = 0u;
+		double best_d = 0.0;
+		for (unsigned int w = width > kGrid ? (width - 1u) / kGrid * kGrid : 0u; w >= kGrid; w -= kGrid) {
+			if (static_cast<float>(w) < kNeuralModeKeepMin * static_cast<float>(detail))
+				break;
+			const double d = std::fabs(cost(w) - want);
+			if (best == 0u || d < best_d - 1e-9) {
+				best = w;
+				best_d = d;
+			}
+		}
+		if (best == 0u)
 			break;
-		width = want;
+		width = best;
 	}
 	return width;
 }
@@ -283,6 +299,13 @@ void scaled_render_size(uint32_t display_w, uint32_t display_h, float scale,
 		*out_h = even_dim(display_h, s);
 }
 
+float clamp_sharpness(float v) noexcept
+{
+	if (std::isnan(v))
+		return kSharpnessDefault;
+	return std::clamp(v, 0.0f, kSharpnessMax);
+}
+
 void load_settings(Settings &out, const std::wstring &ini_path)
 {
 	out = Settings{};
@@ -311,7 +334,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 		else if (key == "ShowOsd") out.show_osd = parse_bool(val);
 		else if (key == "UpscaleEffects") out.upscale_effects = parse_bool(val);
 		else if (key == "RenderPreset") out.render_preset = normalize_render_preset(static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10)));
-		else if (key == "Sharpness") out.sharpness = static_cast<float>(std::atof(val.c_str()));
+		else if (key == "Sharpness") out.sharpness = clamp_sharpness(static_cast<float>(std::atof(val.c_str())));
 		else if (key == "MvProbe") out.mv_probe = parse_bool(val);
 		else if (key == "GpuTimings") out.gpu_timings = parse_bool(val);
 		else if (key == "HostGpuPriority") out.host_gpu_priority = parse_bool(val);
@@ -331,6 +354,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.backend = (v >= 1u && v <= kBackendChoiceCount) ? v - 1u : Settings::kBackendUnset;
 		}
 		else if (key == "FsrProvider") out.fsr_provider = val;
+		else if (key == "OptiScalerUpscale") out.optiscaler_upscale = parse_bool(val);
 		else if (key == "VsrInputFormat") {
 			const unsigned int v = static_cast<unsigned int>(std::strtoul(val.c_str(), nullptr, 10));
 			out.vsr_input_format = (v < kVsrInputFormatCount) ? v : 0u;
@@ -413,6 +437,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.scope_frames = v >= 1ul && v <= kScopeFramesMax ? static_cast<unsigned int>(v) : kScopeFramesDefault;
 		}
 		else if (key == "ScopeDir") out.scope_dir = val;
+		else if (key == "ScopePlanes") out.scope_planes = val;
 		else if (key == "ScopeKey") {
 			const unsigned long v = std::strtoul(val.c_str(), nullptr, 0);
 			out.scope_key = v >= 1ul && v <= 0xFEul ? static_cast<unsigned int>(v) : kScopeKeyDefault;
@@ -484,7 +509,7 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 	out << "ShowOsd=" << (in.show_osd ? 1 : 0) << "\n";
 	out << "UpscaleEffects=" << (in.upscale_effects ? 1 : 0) << "\n";
 	out << "RenderPreset=" << in.render_preset << "\n";
-	out << "Sharpness=" << in.sharpness << "\n";
+	out << "Sharpness=" << clamp_sharpness(in.sharpness) << "\n";
 	out << "SpatialJitter=" << (in.spatial_jitter ? 1 : 0) << "\n";
 	out << "PaceToDisplay=" << (in.pace_to_display ? 1 : 0) << "\n";
 	out << "LowLatency=" << (in.low_latency <= 2u ? in.low_latency : 0u) << "\n";
@@ -493,6 +518,7 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		out << "Upscaler=" << in.backend << "\n";
 	out << "VsrInputFormat=" << (in.vsr_input_format < kVsrInputFormatCount ? in.vsr_input_format : 0u) << "\n";
 	out << "FsrProvider=" << in.fsr_provider << "\n";
+	out << "OptiScalerUpscale=" << (in.optiscaler_upscale ? 1 : 0) << "\n";
 	out << "NeuralRender=" << (in.neural_render ? 1 : 0) << "\n";
 	out << "NeuralStyle=" << clamp_neural_style(in.neural_style) << "\n";
 	if (in.neural_model != 0u)
@@ -542,6 +568,8 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		? in.scope_frames : kScopeFramesDefault) << "\n";
 	if (!in.scope_dir.empty())
 		out << "ScopeDir=" << in.scope_dir << "\n";
+	if (!in.scope_planes.empty())
+		out << "ScopePlanes=" << in.scope_planes << "\n";
 	if (in.scope_key != kScopeKeyDefault)
 		out << "ScopeKey=" << in.scope_key << "\n";
 	out << "GameRenderScale=" << (in.game_render_scale ? 1 : 0) << "\n";

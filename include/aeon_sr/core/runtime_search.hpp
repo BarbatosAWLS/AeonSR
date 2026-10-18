@@ -1,10 +1,32 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
 
 namespace aeon_sr {
+
+class RecentLook {
+public:
+	static constexpr uint64_t kHoldMs = 1000;
+	bool fresh(uint64_t now_ms) const noexcept { return looked_ && now_ms - at_ms_ < kHoldMs; }
+	bool found() const noexcept { return found_; }
+	uint32_t walks() const noexcept { return walks_; }
+	void note(bool found, uint64_t now_ms) noexcept
+	{
+		looked_ = true;
+		found_ = found;
+		at_ms_ = now_ms;
+		++walks_;
+	}
+
+private:
+	bool looked_ = false;
+	bool found_ = false;
+	uint64_t at_ms_ = 0;
+	uint32_t walks_ = 0;
+};
 
 inline constexpr const wchar_t *kFsrPreferredSubdir = L"fsr4-int8";
 

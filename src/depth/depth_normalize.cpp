@@ -1,4 +1,6 @@
 #include "aeon_sr/depth/depth_normalize.hpp"
+#include "aeon_sr/core/com_release.hpp"
+#include "aeon_sr/core/dxgi_format_util.hpp"
 
 #include <d3dcompiler.h>
 
@@ -6,15 +8,6 @@
 
 namespace aeon_sr {
 namespace {
-
-template <class T>
-void release(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 constexpr uint32_t kRingSize = 256;
 constexpr uint32_t kTableSize = 2;
@@ -81,7 +74,7 @@ DepthNormalizeD3D12::~DepthNormalizeD3D12()
 
 void DepthNormalizeD3D12::release_texture()
 {
-	::aeon_sr::release(out_);
+	safe_release(out_);
 	width_ = height_ = 0;
 	out_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
@@ -89,9 +82,9 @@ void DepthNormalizeD3D12::release_texture()
 void DepthNormalizeD3D12::release()
 {
 	release_texture();
-	::aeon_sr::release(heap_);
-	::aeon_sr::release(pso_);
-	::aeon_sr::release(root_);
+	safe_release(heap_);
+	safe_release(pso_);
+	safe_release(root_);
 	device_ = nullptr;
 	ring_ = 0;
 }
@@ -146,33 +139,33 @@ bool DepthNormalizeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t 
 	if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
 		FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
 			IID_PPV_ARGS(&root_)))) {
-		::aeon_sr::release(blob);
-		::aeon_sr::release(err);
+		safe_release(blob);
+		safe_release(err);
 		if (error != nullptr)
 			*error = L"depth: root signature failed";
 		release();
 		return false;
 	}
-	::aeon_sr::release(blob);
-	::aeon_sr::release(err);
+	safe_release(blob);
+	safe_release(err);
 
 	ID3DBlob *cs = nullptr, *cerr = nullptr;
 	if (FAILED(D3DCompile(kHlsl, std::strlen(kHlsl), "aeon_depth", nullptr, nullptr, "main",
 			"cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
-		::aeon_sr::release(cs);
-		::aeon_sr::release(cerr);
+		safe_release(cs);
+		safe_release(cerr);
 		if (error != nullptr)
 			*error = L"depth: shader failed to compile";
 		release();
 		return false;
 	}
-	::aeon_sr::release(cerr);
+	safe_release(cerr);
 	D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
 	pd.pRootSignature = root_;
 	pd.CS.pShaderBytecode = cs->GetBufferPointer();
 	pd.CS.BytecodeLength = cs->GetBufferSize();
 	const HRESULT pso_ok = device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_));
-	::aeon_sr::release(cs);
+	safe_release(cs);
 	if (FAILED(pso_ok)) {
 		if (error != nullptr)
 			*error = L"depth: pipeline state failed";
@@ -228,18 +221,7 @@ bool DepthNormalizeD3D12::record(ID3D12GraphicsCommandList *cmd, ID3D12Resource 
 	}
 
 	const D3D12_RESOURCE_DESC sd = src->GetDesc();
-	DXGI_FORMAT read_as = sd.Format;
-	switch (sd.Format) {
-	case DXGI_FORMAT_R32_TYPELESS:
-	case DXGI_FORMAT_D32_FLOAT: read_as = DXGI_FORMAT_R32_FLOAT; break;
-	case DXGI_FORMAT_R24G8_TYPELESS:
-	case DXGI_FORMAT_D24_UNORM_S8_UINT: read_as = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
-	case DXGI_FORMAT_R16_TYPELESS:
-	case DXGI_FORMAT_D16_UNORM: read_as = DXGI_FORMAT_R16_UNORM; break;
-	case DXGI_FORMAT_R32G8X24_TYPELESS:
-	case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: read_as = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
-	default: break;
-	}
+	const DXGI_FORMAT read_as = depth_read_format(sd.Format);
 	if ((sd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
 		if (error != nullptr)
 			*error = L"depth: the game's buffer cannot be read by a shader";

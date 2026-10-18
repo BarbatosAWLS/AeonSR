@@ -1,4 +1,5 @@
 #include "aeon_sr/framegen/frame_interpolator.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/core/dxgi_format_util.hpp"
 #include "aeon_sr/interop/blit_d3d12.hpp"
@@ -38,21 +39,6 @@ static_assert(sizeof(Constants) == kConstantCount * 4, "root constants and the H
 uint32_t groups(uint32_t extent, uint32_t per) noexcept
 {
 	return (extent + per - 1) / per;
-}
-
-template <typename T>
-void rel(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
-
-bool is_srgb(DXGI_FORMAT f) noexcept
-{
-	return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-		f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
 }
 
 bool is_float_family(DXGI_FORMAT family) noexcept
@@ -125,9 +111,9 @@ void FrameInterpolatorD3D12::release() noexcept
 		builder_.join();
 	release_textures();
 	for (ID3D12PipelineState *&p : pso_)
-		rel(p);
-	rel(root_);
-	rel(heap_);
+		safe_release(p);
+	safe_release(root_);
+	safe_release(heap_);
 	device_ = nullptr;
 	state_.store(kIdle, std::memory_order_release);
 	build_error_.clear();
@@ -143,7 +129,7 @@ void FrameInterpolatorD3D12::release_textures() noexcept
 	ID3D12Resource **const all[] = { &output_, &tile_stats_, &search_errors_, &summary_, &refined_, &layers_,
 		&layer_depth_ };
 	for (ID3D12Resource **r : all)
-		rel(*r);
+		safe_release(*r);
 	w_ = h_ = 0;
 	color_format_ = family_ = input_family_ = uav_format_ = DXGI_FORMAT_UNKNOWN;
 	textures_failed_ = false;
@@ -182,8 +168,8 @@ void FrameInterpolatorD3D12::build_kernels(ID3D12Device *device)
 	ID3D12RootSignature *root = nullptr;
 	ok = SUCCEEDED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sig_err)) &&
 		SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root)));
-	rel(sig);
-	rel(sig_err);
+	safe_release(sig);
+	safe_release(sig_err);
 	if (!ok)
 		error = L"frame generation: the interpolator's root signature was refused";
 
@@ -210,8 +196,8 @@ void FrameInterpolatorD3D12::build_kernels(ID3D12Device *device)
 				ok = false;
 			}
 		}
-		rel(code);
-		rel(messages);
+		safe_release(code);
+		safe_release(messages);
 	}
 
 	ID3D12DescriptorHeap *heap = nullptr;
@@ -234,10 +220,10 @@ void FrameInterpolatorD3D12::build_kernels(ID3D12Device *device)
 		stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		state_.store(kReady, std::memory_order_release);
 	} else {
-		rel(root);
+		safe_release(root);
 		for (ID3D12PipelineState *&p : psos)
-			rel(p);
-		rel(heap);
+			safe_release(p);
+		safe_release(heap);
 		build_error_ = error;
 		state_.store(kFailed, std::memory_order_release);
 	}

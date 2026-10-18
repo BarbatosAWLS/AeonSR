@@ -1,3 +1,4 @@
+#include "aeon_sr/interop/agility_core.hpp"
 #include "aeon_sr/upscalers/ffx_loader.hpp"
 #include "aeon_sr/upscalers/fsr_warmup.hpp"
 
@@ -167,6 +168,27 @@ int run(const Args &a)
 	factory->Release();
 	ID3D12Device *device = nullptr;
 	const HRESULT dr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+	if (SUCCEEDED(dr) && device != nullptr) {
+		D3D12_FEATURE_DATA_SHADER_MODEL sm{ D3D_SHADER_MODEL_6_6 };
+		const bool system_sm66 = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
+			sm.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
+		wchar_t forced[8]{};
+		const DWORD fn = GetEnvironmentVariableW(L"AEONSR_AGILITY_CORE", forced, 8);
+		const bool force_on = fn > 0 && fn < 8 && forced[0] == L'1';
+		const bool force_off = fn > 0 && fn < 8 && forced[0] == L'0';
+		if (!force_off && (force_on || !system_sm66)) {
+			std::wstring say;
+			ID3D12Device *agility = nullptr;
+			if (SUCCEEDED(create_device_on_agility_core(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&agility), &say)) &&
+				agility != nullptr) {
+				device->Release();
+				device = agility;
+				note(a, L"device on the Direct3D 12 Agility SDK core %u from %s", kAgilitySdkVersion, say.c_str());
+			} else {
+				note(a, L"the bundled Direct3D 12 core was not used: %s", say.c_str());
+			}
+		}
+	}
 	adapter->Release();
 	if (FAILED(dr) || device == nullptr) {
 		note(a, L"FAIL D3D12CreateDevice 0x%08lx", static_cast<unsigned long>(dr));

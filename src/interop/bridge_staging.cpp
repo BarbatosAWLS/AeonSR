@@ -1,4 +1,5 @@
 #include "aeon_sr/depth/d3d9_depth.hpp"
+#include "aeon_sr/core/com_release.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/interop/interop_bridges.hpp"
 
@@ -9,15 +10,6 @@ namespace aeon_sr {
 namespace {
 
 namespace rapi = reshade::api;
-
-template <typename T>
-void safe_release(T *&p)
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 constexpr uint64_t kWaitNanoseconds = 2000ull * 1000ull * 1000ull;
 

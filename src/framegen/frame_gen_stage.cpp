@@ -2,6 +2,7 @@
 
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/dxgi_format_util.hpp"
+#include "aeon_sr/core/settings.hpp"
 #include "aeon_sr/framegen/overlay_presenter.hpp"
 #include "aeon_sr/interop/blit_d3d12.hpp"
 
@@ -22,29 +23,11 @@ DXGI_FORMAT vendor_format_for(ID3D12Device *device, DXGI_FORMAT frame) noexcept
 	return f == DXGI_FORMAT_R16G16B16A16_FLOAT ? f : DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
-std::wstring widen_ascii(const char *s)
-{
-	std::wstring w;
-	for (; s != nullptr && *s != '\0'; ++s)
-		w += static_cast<wchar_t>(static_cast<unsigned char>(*s));
-	return w;
-}
-
 }
 
 DXGI_FORMAT FrameGenStage::vendor_output_format(ID3D12Device *device, DXGI_FORMAT frame) noexcept
 {
 	return vendor_format_for(device, frame);
-}
-
-const char *frame_gen_result_label(FrameGenResult r) noexcept
-{
-	switch (r) {
-	case FrameGenResult::Generated: return "generated";
-	case FrameGenResult::Warming: return "warming up";
-	case FrameGenResult::Building: return "building its kernels";
-	default: return "failed";
-	}
 }
 
 FrameGenStage::~FrameGenStage()
@@ -89,6 +72,30 @@ void FrameGenStage::release_vendors() noexcept
 	vendor_unavailable_ = false;
 	vendor_reset_ = true;
 	active_ = FrameGenerator::AeonSR;
+}
+
+uint64_t frame_gen_settings_key(const Settings &s) noexcept
+{
+	return static_cast<uint64_t>(s.frame_generator & 0xffu) | static_cast<uint64_t>(s.frame_generation_multiplier & 0xffu) << 8 |
+		static_cast<uint64_t>(s.frame_generation_own_window ? 1u : 0u) << 16 |
+		static_cast<uint64_t>(s.frame_generation_window_host ? 1u : 0u) << 17;
+}
+
+void FrameGenStage::forget_refusal() noexcept
+{
+	if (!vendor_unavailable_ || vendor_ != nullptr)
+		return;
+	vendor_unavailable_ = false;
+	unavailable_kind_ = FrameGenerator::AeonSR;
+	fallback_note_.clear();
+}
+
+void FrameGenStage::settings_changed(uint64_t key) noexcept
+{
+	if (key == settings_key_)
+		return;
+	settings_key_ = key;
+	forget_refusal();
 }
 
 void FrameGenStage::reset() noexcept
@@ -146,11 +153,7 @@ FrameGenResult FrameGenStage::record(ID3D12Device *device, ID3D12GraphicsCommand
 	if (w != w_ || h != h_ || format_family(cd.Format) != format_family(format_) || device != flow_device_ ||
 		o.color_space != last_color_) {
 		reset();
-		if (vendor_unavailable_ && vendor_ == nullptr && o.generator == unavailable_kind_) {
-			vendor_unavailable_ = false;
-			unavailable_kind_ = FrameGenerator::AeonSR;
-			fallback_note_.clear();
-		}
+		forget_refusal();
 		last_color_ = o.color_space;
 	}
 
@@ -313,11 +316,14 @@ FrameGenResult FrameGenStage::record_feed(ID3D12Device *device, ID3D12GraphicsCo
 			*note = L"frame generation: the frame does not fit the ring of its own window";
 		return FrameGenResult::Failed;
 	}
-	if (w != w_ || h != h_ || format_family(cd.Format) != format_family(format_) || device != flow_device_) {
+	if (w != w_ || h != h_ || format_family(cd.Format) != format_family(format_) || device != flow_device_ ||
+		o.color_space != last_color_) {
 		reset();
+		forget_refusal();
 		w_ = w;
 		h_ = h;
 		format_ = cd.Format;
+		last_color_ = o.color_space;
 	}
 	if (flow_device_ != device) {
 		if (flow_builder_.joinable())
@@ -383,7 +389,7 @@ FrameGenResult FrameGenStage::record_feed(ID3D12Device *device, ID3D12GraphicsCo
 			vendor_failures_ = 0;
 			unavailable_kind_ = o.generator;
 			vendor_unavailable_ = true;
-			fallback_note_ = widen_ascii(frame_generator_label(o.generator)) +
+			fallback_note_ = diag_widen(frame_generator_label(o.generator)) +
 				L" frame generation: its textures could not be made (out of video memory?); AeonSR's generator is used";
 			diag_logf(DiagLevel::Warn, "framegen", L"%ls", fallback_note_.c_str());
 			retire_vendor();
@@ -422,8 +428,8 @@ bool FrameGenStage::select_generator(const FrameGenOptions &o)
 		if (vendor_ == nullptr) {
 			vendor_unavailable_ = true;
 			unavailable_kind_ = o.generator;
-			fallback_note_ = widen_ascii(frame_generator_label(o.generator)) +
-				L" frame generation runs in 64-bit games only; AeonSR's generator is used";
+			fallback_note_ = diag_widen(frame_generator_label(o.generator)) +
+				L" frame generation needs AeonSRHost.exe beside the add-on in a 32-bit game; AeonSR's generator is used";
 		}
 	} else if (!want_vendor) {
 		retire_vendor();

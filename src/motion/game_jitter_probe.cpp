@@ -1,4 +1,5 @@
 #include "aeon_sr/motion/game_jitter_probe.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include <d3dcompiler.h>
 
@@ -7,15 +8,6 @@
 
 namespace aeon_sr {
 namespace {
-
-template <class T>
-void release_com(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
 
 constexpr uint32_t kSums = 28u;
 constexpr uint32_t kResultUints = 30u;
@@ -286,17 +278,17 @@ void GameJitterProbeD3D12::release()
 	if (readback_ != nullptr && mapped_ != nullptr)
 		readback_->Unmap(0, nullptr);
 	mapped_ = nullptr;
-	release_com(readback_);
-	release_com(result_);
-	release_com(partials_);
+	safe_release(readback_);
+	safe_release(result_);
+	safe_release(partials_);
 	for (int i = 0; i < 2; ++i) {
-		release_com(prev_luma_[i]);
-		release_com(prev_depth_[i]);
+		safe_release(prev_luma_[i]);
+		safe_release(prev_depth_[i]);
 	}
-	release_com(heap_);
-	release_com(reduce_);
-	release_com(accumulate_);
-	release_com(root_);
+	safe_release(heap_);
+	safe_release(reduce_);
+	safe_release(accumulate_);
+	safe_release(root_);
 	device_ = nullptr;
 	width_ = height_ = groups_x_ = groups_y_ = 0;
 	reset();
@@ -337,8 +329,8 @@ bool GameJitterProbeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t
 		const bool rs_ok = SUCCEEDED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) &&
 			SUCCEEDED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
 				IID_PPV_ARGS(&root_)));
-		release_com(blob);
-		release_com(err);
+		safe_release(blob);
+		safe_release(err);
 		bool ok = rs_ok;
 		std::wstring why;
 		for (int k = 0; ok && k < 2; ++k) {
@@ -349,7 +341,7 @@ bool GameJitterProbeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t
 				const char *msg = static_cast<const char *>(cerr->GetBufferPointer());
 				why.assign(msg, msg + std::strlen(msg));
 			}
-			release_com(cerr);
+			safe_release(cerr);
 			if (ok) {
 				D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
 				pd.pRootSignature = root_;
@@ -357,7 +349,7 @@ bool GameJitterProbeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t
 				pd.CS.BytecodeLength = cs->GetBufferSize();
 				ok = SUCCEEDED(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(k == 0 ? &accumulate_ : &reduce_)));
 			}
-			release_com(cs);
+			safe_release(cs);
 		}
 		D3D12_DESCRIPTOR_HEAP_DESC hd{};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -379,10 +371,10 @@ bool GameJitterProbeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t
 		std::memset(mapped_, 0xFF, kResultUints * 4u * kRing);
 	}
 	for (int i = 0; i < 2; ++i) {
-		release_com(prev_luma_[i]);
-		release_com(prev_depth_[i]);
+		safe_release(prev_luma_[i]);
+		safe_release(prev_depth_[i]);
 	}
-	release_com(partials_);
+	safe_release(partials_);
 	width_ = width;
 	height_ = height;
 	groups_x_ = (width + 31u) / 32u;

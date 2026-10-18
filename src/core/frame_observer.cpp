@@ -1,4 +1,5 @@
 #include "aeon_sr/core/frame_observer.hpp"
+#include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/interop/blit_d3d12.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
@@ -134,15 +135,6 @@ ID3DBlob *compile(const char *entry)
 	return blob;
 }
 
-template <typename T>
-void rel(T *&p) noexcept
-{
-	if (p != nullptr) {
-		p->Release();
-		p = nullptr;
-	}
-}
-
 ID3D12Resource *make_buffer(ID3D12Device *device, uint64_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
 	D3D12_RESOURCE_STATES state)
 {
@@ -191,10 +183,10 @@ bool FrameObserverD3D12::ensure(ID3D12Device *device, uint32_t w, uint32_t h, DX
 		rs.pParameters = rp;
 		ID3DBlob *sig = nullptr, *sig_err = nullptr;
 		bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sig_err));
-		rel(sig_err);
+		safe_release(sig_err);
 		ok = ok && SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
 			IID_PPV_ARGS(&root_)));
-		rel(sig);
+		safe_release(sig);
 		ID3DBlob *cs[2] = { ok ? compile("CSObserve") : nullptr, ok ? compile("CSClear") : nullptr };
 		ID3D12PipelineState **const outs[2] = { &observe_, &clear_ };
 		for (uint32_t k = 0; k < 2; ++k) {
@@ -204,8 +196,8 @@ bool FrameObserverD3D12::ensure(ID3D12Device *device, uint32_t w, uint32_t h, DX
 				cd.CS = { cs[k]->GetBufferPointer(), cs[k]->GetBufferSize() };
 			ok = ok && cs[k] != nullptr && SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(outs[k])));
 		}
-		rel(cs[0]);
-		rel(cs[1]);
+		safe_release(cs[0]);
+		safe_release(cs[1]);
 		D3D12_DESCRIPTOR_HEAP_DESC hd{};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 		hd.NumDescriptors = kSlots * kSlotDescriptors;
@@ -230,7 +222,7 @@ bool FrameObserverD3D12::ensure(ID3D12Device *device, uint32_t w, uint32_t h, DX
 		return true;
 	ID3D12Resource **const planes[] = { &drawn_[0], &drawn_[1], &out_[0], &out_[1] };
 	for (ID3D12Resource **r : planes)
-		rel(*r);
+		safe_release(*r);
 	w_ = w;
 	h_ = h;
 	format_ = format;
@@ -238,7 +230,7 @@ bool FrameObserverD3D12::ensure(ID3D12Device *device, uint32_t w, uint32_t h, DX
 	for (ID3D12Resource **r : planes) {
 		if (!create_tex12(device, w, h, format, false, kSrv, r)) {
 			for (ID3D12Resource **q : planes)
-				rel(*q);
+				safe_release(*q);
 			w_ = h_ = 0;
 			return false;
 		}
@@ -420,11 +412,11 @@ void FrameObserverD3D12::release() noexcept
 	mapped_ = nullptr;
 	ID3D12Resource **const all[] = { &drawn_[0], &drawn_[1], &out_[0], &out_[1], &sums_, &readback_ };
 	for (ID3D12Resource **r : all)
-		rel(*r);
-	rel(observe_);
-	rel(clear_);
-	rel(root_);
-	rel(heap_);
+		safe_release(*r);
+	safe_release(observe_);
+	safe_release(clear_);
+	safe_release(root_);
+	safe_release(heap_);
 	for (uint32_t k = 0; k < kReadback; ++k)
 		written_[k] = false;
 	held_count_ = 0;

@@ -1,6 +1,5 @@
 #include "aeon_sr/upscalers/backend_dlss.hpp"
 #include "aeon_sr/upscalers/backend_fsr.hpp"
-#include "aeon_sr/upscalers/backend_vsr.hpp"
 #include "aeon_sr/upscalers/backend_xess.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
 #include "aeon_sr/ngx/ngx_runtime.hpp"
@@ -75,18 +74,6 @@ bool XessD3D12Backend::run(reshade::api::effect_runtime *, const FrameInputs &, 
 	return refuse(*this);
 }
 
-const char *VsrD3D11Backend::name() const { return "RTX VSR"; }
-reshade::api::device_api VsrD3D11Backend::api() const { return reshade::api::device_api::d3d11; }
-bool VsrD3D11Backend::runtime_present() { return false; }
-void VsrD3D11Backend::on_destroy_swapchain() {}
-void VsrD3D11Backend::shutdown() {}
-bool VsrD3D11Backend::run(reshade::api::effect_runtime *, const FrameInputs &, const UpscalerParams &)
-{
-	status = UpscalerStatus::UnsupportedApi;
-	last_error = L"RTX VSR is not offered in a 32-bit game. Pick DLSS, FSR or XeSS.";
-	return false;
-}
-
 void NgxRuntime::shutdown_device() {}
 void NgxRuntimeD3D12::shutdown_device() {}
 
@@ -117,6 +104,8 @@ bool NeuralRenderD3D12::run(ID3D12GraphicsCommandList *, ID3D12Resource *,
 {
 	return false;
 }
+
+bool ngx12_has_table(HMODULE) { return false; }
 
 }
 

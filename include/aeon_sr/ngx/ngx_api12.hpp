@@ -51,6 +51,12 @@ struct Ngx12Api {
 
 Ngx12Api ngx12_load_module(const std::wstring &path);
 
+Ngx12Api ngx12_attach_module(const std::wstring &path);
+
+bool ngx12_has_table(HMODULE module);
+
+const Ngx12Api &ngx12_layer_api(const std::wstring &path);
+
 const Ngx12Api &ngx12_static_api();
 
 const Ngx12Api &ngx12_api(const std::wstring &addon_dir);

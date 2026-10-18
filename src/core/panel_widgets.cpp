@@ -1,4 +1,6 @@
 #include "aeon_sr/core/panel_widgets.hpp"
+#include "aeon_sr/core/bidi.hpp"
+#include "aeon_sr/core/i18n.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -6,6 +8,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace aeon_sr {
@@ -41,6 +44,9 @@ constexpr float kCaptionChars = 17.0f;
 float g_title_fit = 0.0f;
 float g_title_next = 0.0f;
 ImGuiID g_title_fit_id = 0;
+bool g_title_caps = true;
+bool g_title_caps_next = true;
+ImGuiID g_title_caps_id = 0;
 
 float unit()
 {
@@ -138,19 +144,151 @@ void shade(ImDrawList *dl, int first, const ImVec2 &p0, const ImVec2 &p1, const 
 	}
 }
 
+unsigned int code_point(const char *p, int *len)
+{
+	const unsigned char *u = reinterpret_cast<const unsigned char *>(p);
+	if (u[0] < 0x80 || (u[0] & 0xC0) == 0x80) {
+		*len = 1;
+		return u[0];
+	}
+	const int n = (u[0] & 0xE0) == 0xC0 ? 2 : (u[0] & 0xF0) == 0xE0 ? 3 : 4;
+	unsigned int c = u[0] & (n == 2 ? 0x1Fu : n == 3 ? 0x0Fu : 0x07u);
+	for (int i = 1; i < n; ++i) {
+		if ((u[i] & 0xC0) != 0x80) {
+			*len = i;
+			return 0xFFFD;
+		}
+		c = (c << 6) | (u[i] & 0x3Fu);
+	}
+	*len = n;
+	return c;
+}
+
+void append_utf8(std::string &s, unsigned int c)
+{
+	if (c < 0x80) {
+		s.push_back(static_cast<char>(c));
+	} else if (c < 0x800) {
+		s.push_back(static_cast<char>(0xC0 | (c >> 6)));
+		s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+	} else if (c < 0x10000) {
+		s.push_back(static_cast<char>(0xE0 | (c >> 12)));
+		s.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+		s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+	} else {
+		s.push_back(static_cast<char>(0xF0 | (c >> 18)));
+		s.push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
+		s.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+		s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+	}
+}
+
+bool combining(unsigned int c)
+{
+	return (c >= 0x0300 && c <= 0x036F) || c == 0x0E31 || (c >= 0x0E34 && c <= 0x0E3A) ||
+		(c >= 0x0E47 && c <= 0x0E4E) || (c >= 0x064B && c <= 0x065F) || c == 0x0670;
+}
+
+bool breaks_after(unsigned int c)
+{
+	return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFE30 && c <= 0xFE4F) ||
+		(c >= 0xFF00 && c <= 0xFFEF);
+}
+
+bool stays_with_previous(unsigned int c)
+{
+	if (combining(c))
+		return true;
+	switch (c) {
+	case 0x3001: case 0x3002: case 0xFF0C: case 0xFF0E: case 0xFF1A: case 0xFF1B: case 0xFF01: case 0xFF1F:
+	case 0xFF09: case 0xFF3D: case 0xFF5D: case 0x300D: case 0x300F: case 0x3011: case 0x3009: case 0x300B:
+	case 0x3015: case 0x30FC: case 0x3005: case 0x309D: case 0x309E: case 0x30FB:
+	case 0x3041: case 0x3043: case 0x3045: case 0x3047: case 0x3049: case 0x3063: case 0x3083: case 0x3085:
+	case 0x3087: case 0x308E: case 0x30A1: case 0x30A3: case 0x30A5: case 0x30A7: case 0x30A9: case 0x30C3:
+	case 0x30E3: case 0x30E5: case 0x30E7: case 0x30EE: case 0x30F5: case 0x30F6:
+	case '.': case ',': case ':': case ';': case '!': case '?': case ')': case ']': case '}': case '%':
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool stays_with_next(unsigned int c)
+{
+	return c == 0xFF08 || c == 0x300C || c == 0x300E || c == 0x3010 || c == 0x3008 || c == 0x300A ||
+		c == 0x3014 || c == 0xFF3B || c == 0xFF5B || c == '(' || c == '[';
+}
+
+unsigned int capital(unsigned int c)
+{
+	const bool turkish = i18n::current() == i18n::Lang::tr_TR;
+	if (c >= 'a' && c <= 'z')
+		return turkish && c == 'i' ? 0x0130u : c - 0x20u;
+	if (c >= 0xE0 && c <= 0xFE && c != 0xF7)
+		return c - 0x20u;
+	if (c == 0x0131)
+		return 'I';
+	if ((c >= 0x0100 && c <= 0x0137) || (c >= 0x014A && c <= 0x0177))
+		return c & ~1u;
+	if ((c >= 0x0139 && c <= 0x0148) || (c >= 0x0179 && c <= 0x017E))
+		return (c & 1u) == 0 ? c - 1u : c;
+	if (c >= 0x0430 && c <= 0x044F)
+		return c - 0x20u;
+	if (c >= 0x0450 && c <= 0x045F)
+		return c - 0x50u;
+	return c;
+}
+
+std::string upper_case(const char *s)
+{
+	std::string out;
+	for (const char *p = s; *p != '\0';) {
+		int n = 1;
+		const unsigned int c = code_point(p, &n);
+		append_utf8(out, capital(c));
+		p += n;
+	}
+	return out;
+}
+
+const char *cluster_end(const char *p)
+{
+	int n = 1;
+	code_point(p, &n);
+	p += n;
+	while (*p != '\0') {
+		const unsigned int c = code_point(p, &n);
+		if (!combining(c))
+			break;
+		p += n;
+	}
+	return p;
+}
+
 float tracked_width(const char *s, float tracking)
 {
+	if (bidi::needs_shaping(s))
+		return ImGui::CalcTextSize(s).x;
 	float w = 0.0f;
-	for (const char *c = s; *c != '\0'; ++c)
-		w += ImGui::CalcTextSize(c, c + 1).x + (c[1] != '\0' ? tracking : 0.0f);
+	for (const char *c = s; *c != '\0';) {
+		const char *e = cluster_end(c);
+		w += ImGui::CalcTextSize(c, e).x + (*e != '\0' ? tracking : 0.0f);
+		c = e;
+	}
 	return w;
 }
 
 float tracked_text(ImDrawList *dl, float x, float y, const ImVec4 &c, const char *s, float tracking)
 {
-	for (const char *ch = s; *ch != '\0'; ++ch) {
-		dl->AddText(ImVec2(x, y), col(c), ch, ch + 1);
-		x += ImGui::CalcTextSize(ch, ch + 1).x + tracking;
+	if (bidi::needs_shaping(s)) {
+		dl->AddText(ImVec2(x, y), col(c), s);
+		return x + ImGui::CalcTextSize(s).x;
+	}
+	for (const char *ch = s; *ch != '\0';) {
+		const char *e = cluster_end(ch);
+		dl->AddText(ImVec2(x, y), col(c), ch, e);
+		x += ImGui::CalcTextSize(ch, e).x + tracking;
+		ch = e;
 	}
 	return x;
 }
@@ -192,14 +330,23 @@ struct Layout {
 	std::vector<Piece> pieces;
 	std::vector<TextLine> lines;
 	float w = 0.0f;
+	bool rtl = false;
 };
+
+float piece_width(const char *b, const char *e, bool rtl)
+{
+	if (!rtl)
+		return ImGui::CalcTextSize(b, e).x;
+	const std::string v = bidi::visual(std::string_view(b, static_cast<size_t>(e - b)), 1);
+	return ImGui::CalcTextSize(v.c_str(), v.c_str() + v.size()).x;
+}
 
 bool soft_break_after(char c)
 {
 	return c == '_' || c == '.' || c == '/' || c == '\\' || c == '-' || c == ',' || c == ':';
 }
 
-void lay_out(const Span *spans, int count, float width, Layout &out)
+void lay_out(const Span *spans, int count, float width, Layout &out, float align = 0.0f)
 {
 	struct Unit {
 		int first, count;
@@ -207,7 +354,12 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 	};
 	std::vector<Piece> src;
 	std::vector<Unit> units;
-	bool space = false, brk = false;
+	bool space = false, brk = false, cjk = false;
+	int dir = 0;
+	for (int s = 0; s < count && dir == 0; ++s)
+		if (spans[s].text != nullptr)
+			dir = bidi::direction(spans[s].text);
+	const bool rtl = dir > 0;
 	for (int s = 0; s < count; ++s) {
 		const char *p = spans[s].text;
 		while (p != nullptr && *p != '\0') {
@@ -223,12 +375,21 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 				continue;
 			}
 			const char *b = p;
-			while (*p != '\0' && *p != ' ' && *p != '\n')
-				++p;
+			bool split = false;
+			while (*p != '\0' && *p != ' ' && *p != '\n') {
+				int n = 1;
+				const unsigned int c = code_point(p, &n);
+				p += n;
+				if (breaks_after(c) && !stays_with_next(c) && *p != '\0' && *p != ' ' && *p != '\n' &&
+					!stays_with_previous(code_point(p, &n))) {
+					split = true;
+					break;
+				}
+			}
 			const bool dash = p - b == 1 && *b == '-';
 			if (!units.empty() && !brk && space && dash && src.back().span == s) {
 				src.back().e = p;
-			} else if (!units.empty() && !brk && !space) {
+			} else if (!units.empty() && !brk && !space && !cjk) {
 				src.push_back(Piece{ b, p, s, 0.0f });
 				++units.back().count;
 			} else {
@@ -236,12 +397,15 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 				src.push_back(Piece{ b, p, s, 0.0f });
 			}
 			space = brk = false;
+			cjk = split;
 		}
+		cjk = false;
 	}
 
 	out.pieces.clear();
 	out.lines.clear();
 	out.w = 0.0f;
+	out.rtl = rtl;
 	out.lines.push_back(TextLine{ 0, 0, 0.0f });
 	const float space_w = ImGui::CalcTextSize(" ").x;
 	float x = 0.0f;
@@ -259,7 +423,7 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 	for (const Unit &u : units) {
 		float w = 0.0f;
 		for (int i = 0; i < u.count; ++i)
-			w += ImGui::CalcTextSize(src[static_cast<size_t>(u.first + i)].b, src[static_cast<size_t>(u.first + i)].e).x;
+			w += piece_width(src[static_cast<size_t>(u.first + i)].b, src[static_cast<size_t>(u.first + i)].e, rtl);
 		bool empty = out.lines.back().count == 0;
 		if (u.brk && !empty) {
 			new_line();
@@ -275,7 +439,7 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 			float at = x + gap;
 			for (int i = 0; i < u.count; ++i) {
 				const Piece &p = src[static_cast<size_t>(u.first + i)];
-				const float pw = ImGui::CalcTextSize(p.b, p.e).x;
+				const float pw = piece_width(p.b, p.e, rtl);
 				place(p.b, p.e, p.span, at, pw);
 				at += pw;
 			}
@@ -290,14 +454,17 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 				for (const char *c = b + 1; c <= p.e; ++c) {
 					if (c < p.e && (static_cast<unsigned char>(*c) & 0xC0) == 0x80)
 						continue;
-					if (ImGui::CalcTextSize(b, c).x > room)
+					int n = 1;
+					if (c < p.e && stays_with_previous(code_point(c, &n)))
+						continue;
+					if (piece_width(b, c, rtl) > room)
 						break;
 					cut = c;
 					if (c < p.e && soft_break_after(c[-1]))
 						soft = c;
 				}
 				if (cut == p.e) {
-					place(b, p.e, p.span, x, ImGui::CalcTextSize(b, p.e).x);
+					place(b, p.e, p.span, x, piece_width(b, p.e, rtl));
 					break;
 				}
 				const char *at = soft != nullptr ? soft : cut;
@@ -306,17 +473,47 @@ void lay_out(const Span *spans, int count, float width, Layout &out)
 						new_line();
 						continue;
 					}
-					at = b + 1;
-					while (at < p.e && (static_cast<unsigned char>(*at) & 0xC0) == 0x80)
-						++at;
+					at = cluster_end(b);
+					if (at > p.e)
+						at = p.e;
 				}
-				place(b, at, p.span, x, ImGui::CalcTextSize(b, at).x);
+				place(b, at, p.span, x, piece_width(b, at, rtl));
 				new_line();
 				b = at;
 			}
 		}
 	}
 	out.w = std::max(out.w, out.lines.back().w);
+	if (!rtl)
+		return;
+	const float edge = align > 0.0f ? align : width < 1.0e8f ? width : out.w;
+	const auto ltr = [](const Piece &q) {
+		return bidi::direction(std::string_view(q.b, static_cast<size_t>(q.e - q.b))) < 0;
+	};
+	std::vector<Piece> pieces;
+	pieces.reserve(out.pieces.size());
+	for (TextLine &line : out.lines) {
+		const int first = static_cast<int>(pieces.size());
+		for (int i = 0; i < line.count;) {
+			Piece p = out.pieces[static_cast<size_t>(line.first + i)];
+			int j = i;
+			if (ltr(p))
+				while (j + 1 < line.count) {
+					const Piece &q = out.pieces[static_cast<size_t>(line.first + j + 1)];
+					if (q.span != p.span || !ltr(q))
+						break;
+					++j;
+				}
+			p.e = out.pieces[static_cast<size_t>(line.first + j)].e;
+			p.x = edge - (p.x + piece_width(p.b, p.e, true));
+			pieces.push_back(p);
+			i = j + 1;
+		}
+		line.first = first;
+		line.count = static_cast<int>(pieces.size()) - first;
+	}
+	out.pieces = std::move(pieces);
+	out.w = std::max(out.w, edge);
 }
 
 void lay_out_paragraph(const Span *spans, int count, float width, Layout &out)
@@ -329,7 +526,7 @@ void lay_out_paragraph(const Span *spans, int count, float width, Layout &out)
 	if (n < 2 || out.lines[n - 2].count < 3 || out.lines[n - 1].count != 1)
 		return;
 	Layout tighter;
-	lay_out(spans, count, out.lines[n - 2].w - 1.0f, tighter);
+	lay_out(spans, count, out.lines[n - 2].w - 1.0f, tighter, width < 1.0e8f ? width : 0.0f);
 	if (tighter.lines.size() == n && tighter.lines[n - 1].count > 1)
 		out = tighter;
 }
@@ -341,6 +538,11 @@ void draw_layout(ImDrawList *dl, const Layout &l, const ImVec2 &origin, const Sp
 		const float y = origin.y + static_cast<float>(li) * line_h;
 		for (int i = 0; i < line.count; ++i) {
 			const Piece &p = l.pieces[static_cast<size_t>(line.first + i)];
+			if (l.rtl) {
+				const std::string v = bidi::visual(std::string_view(p.b, static_cast<size_t>(p.e - p.b)), 1);
+				dl->AddText(ImVec2(origin.x + p.x, y), col(ink(spans[p.span].colour)), v.c_str(), v.c_str() + v.size());
+				continue;
+			}
 			dl->AddText(ImVec2(origin.x + p.x, y), col(ink(spans[p.span].colour)), p.b, p.e);
 		}
 	}
@@ -383,11 +585,14 @@ ImVec4 pill_text_colour(const ImVec4 &c)
 	return same(c, g_pal.off) ? g_pal.label : g_pal.text;
 }
 
-const char *pill_caption(const char *text, char (&buf)[192])
+const char *pill_caption(const char *text, char (&buf)[512])
 {
-	std::snprintf(buf, sizeof(buf), "%s", text);
-	if (buf[0] >= 'a' && buf[0] <= 'z')
-		buf[0] = static_cast<char>(buf[0] - 'a' + 'A');
+	int n = 1;
+	const unsigned int c = code_point(text, &n);
+	std::string first;
+	if (*text != '\0')
+		append_utf8(first, capital(c));
+	std::snprintf(buf, sizeof(buf), "%s%s", first.c_str(), *text != '\0' ? text + n : "");
 	return buf;
 }
 
@@ -409,7 +614,7 @@ float pill_wrap(const char *caption, float max_w)
 
 ImVec2 pill_size(const char *text, float max_w = 0.0f)
 {
-	char buf[192];
+	char buf[512];
 	const char *t = pill_caption(text, buf);
 	ImVec2 s = ImGui::CalcTextSize(t);
 	if (max_w > 0.0f) {
@@ -448,7 +653,7 @@ void status_dot(ImDrawList *dl, const ImVec2 &c, const ImVec4 &colour)
 void pill_at(ImDrawList *dl, const ImVec2 &p, const ImVec4 &colour, const char *text, float max_w = 0.0f)
 {
 	const float k = unit();
-	char buf[192];
+	char buf[512];
 	const char *t = pill_caption(text, buf);
 	const ImVec2 s = pill_size(text, max_w);
 	const float dot = 3.0f * k;
@@ -1058,6 +1263,9 @@ Theme::Theme()
 	g_title_fit_id = ImGui::GetID("##aeon_title_fit");
 	g_title_fit = ImGui::GetStateStorage()->GetFloat(g_title_fit_id, 0.0f);
 	g_title_next = 1.0e9f;
+	g_title_caps_id = ImGui::GetID("##aeon_title_caps");
+	g_title_caps = ImGui::GetStateStorage()->GetInt(g_title_caps_id, 1) != 0;
+	g_title_caps_next = true;
 
 	const auto colour = [this](ImGuiCol idx, const ImVec4 &c) {
 		ImGui::PushStyleColor(idx, c);
@@ -1108,6 +1316,7 @@ Theme::~Theme()
 	ImGui::GetStateStorage()->SetFloat(g_caption_fit_id, g_caption_next);
 	ImGui::GetStateStorage()->SetFloat(g_value_fit_id, g_value_next);
 	ImGui::GetStateStorage()->SetFloat(g_title_fit_id, g_title_next < 1.0e9f ? g_title_next : 0.0f);
+	ImGui::GetStateStorage()->SetInt(g_title_caps_id, g_title_caps_next ? 1 : 0);
 	ImGui::PopStyleVar(vars_);
 	ImGui::PopStyleColor(colours_);
 }
@@ -1398,7 +1607,9 @@ bool section(const char *id, const char *icon_glyph, const char *title, bool def
 	const float tag_w = has_tag ? chip_size(tag).x + 8.0f * k : 0.0f;
 	ImVec2 badge_s = has_badge ? pill_size(badge) : ImVec2(0.0f, 0.0f);
 
-	const bool caps = mark_can_draw(title);
+	const bool drawable = mark_can_draw(title);
+	g_title_caps_next = g_title_caps_next && drawable;
+	const bool caps = drawable && g_title_caps;
 	const float want = std::round(11.0f * k);
 	const float least = std::round(8.0f * k);
 	const auto title_width = [&](float cap) {
@@ -1446,7 +1657,7 @@ bool section(const char *id, const char *icon_glyph, const char *title, bool def
 		st->SetInt(sid, open ? 1 : 0);
 	}
 	if (shortened && hovered) {
-		char buf[192];
+		char buf[512];
 		ImGui::SetTooltip("%s", pill_caption(badge, buf));
 	}
 
@@ -1719,10 +1930,8 @@ void disclosure_end()
 void subsection(const char *title, const char *aside)
 {
 	const float k = unit();
-	char upper[64]{};
-	size_t n = 0;
-	for (; title[n] != '\0' && n + 1 < sizeof(upper); ++n)
-		upper[n] = static_cast<char>(std::toupper(static_cast<unsigned char>(title[n])));
+	const std::string upper_title = upper_case(title);
+	const char *upper = upper_title.c_str();
 	const float tracking = 1.0f * k;
 	ImGui::Dummy(ImVec2(0.0f, 6.0f * k));
 	const ImVec2 a = ImGui::GetCursorScreenPos();
@@ -1864,7 +2073,7 @@ struct SliderLook {
 	ImGuiID edit_id = 0;
 	bool editing = false;
 	const char *use = nullptr;
-	char id[160]{};
+	char id[512]{};
 };
 
 void slider_begin(SliderLook &s, const char *label, float frac, float zero, const char *shown, float widest,
@@ -2002,7 +2211,7 @@ bool button(const char *icon_glyph, const char *label)
 {
 	if (!g_icons || icon_glyph == nullptr)
 		return ImGui::Button(label);
-	char text[160];
+	char text[1024];
 	std::snprintf(text, sizeof(text), "%s  %s###%s", icon_glyph, label, label);
 	return ImGui::Button(text);
 }
@@ -2244,7 +2453,7 @@ void callout(const ImVec4 &colour, const char *icon_glyph, const char *text)
 
 void calloutf(const ImVec4 &colour, const char *icon_glyph, const char *fmt, ...)
 {
-	char text[512];
+	char text[2048];
 	va_list args;
 	va_start(args, fmt);
 	std::vsnprintf(text, sizeof(text), fmt, args);
@@ -2266,13 +2475,6 @@ void wrapped(const ImVec4 &colour, const char *text)
 {
 	const Span span{ text, colour };
 	flow(&span, 1);
-}
-
-void value_line(const char *label, const char *value)
-{
-	ImGui::TextDisabled("%s", label);
-	ImGui::SameLine(0.0f, ImGui::CalcTextSize(" ").x);
-	ImGui::TextUnformatted(value);
 }
 
 float avail_width()

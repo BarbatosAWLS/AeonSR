@@ -74,7 +74,6 @@ void UpscalerCaptureD3D12::request(const std::wstring &root, uint32_t frames)
 	root_ = root;
 	wanted_ = left_ = frames;
 	next_index_ = 0;
-	last_recorded_ = 0;
 	recorded_this_frame_ = false;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -260,7 +259,6 @@ void UpscalerCaptureD3D12::record(ID3D12Device *device, ID3D12GraphicsCommandLis
 	}
 	in_flight_.push_back(std::move(f));
 	recorded_this_frame_ = true;
-	last_recorded_ = sequence_;
 	++next_index_;
 	--left_;
 }
@@ -436,7 +434,6 @@ void UpscalerCaptureD3D12::writer_main()
 				std::lock_guard<std::mutex> lock(mutex_);
 				if (f.n != UINT32_MAX) {
 					--scope_outstanding_;
-					++scope_frames_written_;
 					if (f.n < scope_members_.size()) {
 						scope_members_[f.n] = members;
 						scope_held_[f.n] = held;
@@ -536,7 +533,6 @@ void UpscalerCaptureD3D12::request_scope(const std::wstring &dir, uint32_t frame
 		scope_outstanding_ = 0;
 		scope_closed_ = false;
 		scope_done_ = false;
-		scope_frames_written_ = 0;
 		scope_note_.clear();
 		scope_error_.clear();
 	}
@@ -568,13 +564,17 @@ bool UpscalerCaptureD3D12::scope_size(ID3D12Device *device, const D3D12_RESOURCE
 	motion.Format = DXGI_FORMAT_R16G16_FLOAT;
 	motion.Width = scope_motion_w_;
 	motion.Height = scope_motion_h_;
+	D3D12_RESOURCE_DESC depth = motion;
+	depth.Format = DXGI_FORMAT_R32_FLOAT;
 	if (scope_motion_w_ == 0 || scope_motion_h_ == 0)
-		scope_wanted_ &= ~(1u << static_cast<uint32_t>(ScopePlane::Motion));
+		scope_wanted_ &= ~((1u << static_cast<uint32_t>(ScopePlane::Motion)) |
+			(1u << static_cast<uint32_t>(ScopePlane::Depth)));
 	UINT64 offset = 0;
 	CapturedPlane fmt[kScopeStagePlanes];
 	for (uint32_t i = 0; i < kScopeStagePlanes; ++i) {
 		const ScopePlane p = static_cast<ScopePlane>(i);
-		const D3D12_RESOURCE_DESC &d = p == ScopePlane::Mask ? mask : p == ScopePlane::Motion ? motion : color;
+		const D3D12_RESOURCE_DESC &d = p == ScopePlane::Mask ? mask : p == ScopePlane::Motion ? motion
+			: p == ScopePlane::Depth ? depth : color;
 		ScopeSlot &s = scope_slots_[i];
 		if ((scope_wanted_ & (1u << i)) == 0) {
 			s = ScopeSlot{};
@@ -638,13 +638,17 @@ void UpscalerCaptureD3D12::scope_copy(ScopePlane plane, ID3D12Device *device, ID
 {
 	const uint32_t i = static_cast<uint32_t>(plane);
 	if (scope_left_ == 0 || i >= kScopeStagePlanes || device == nullptr || cmd == nullptr || res == nullptr ||
-		(scope_cur_.scope_planes & (1u << i)) != 0 || (scope_wanted_ & (1u << i)) == 0)
+		(scope_cur_.scope_planes & (1u << i)) != 0)
+		return;
+	const bool wanted = (scope_wanted_ & (1u << i)) != 0;
+	const bool colour = plane != ScopePlane::Mask && plane != ScopePlane::Motion && plane != ScopePlane::Depth;
+	if (!wanted && (scope_sized_ || !colour))
 		return;
 	const D3D12_RESOURCE_DESC desc = res->GetDesc();
 	if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1)
 		return;
 	if (!scope_sized_) {
-		if (plane == ScopePlane::Mask || plane == ScopePlane::Motion)
+		if (!colour)
 			return;
 		if (!scope_size(device, desc)) {
 			{
@@ -655,11 +659,15 @@ void UpscalerCaptureD3D12::scope_copy(ScopePlane plane, ID3D12Device *device, ID
 			return;
 		}
 	}
+	if (!wanted)
+		return;
 	const bool fits = plane == ScopePlane::Mask
 		? desc.Width == scope_color_.Width && desc.Height == scope_color_.Height &&
 			desc.Format == DXGI_FORMAT_R8_UNORM
 		: plane == ScopePlane::Motion
 		? desc.Width == scope_motion_w_ && desc.Height == scope_motion_h_ && desc.Format == DXGI_FORMAT_R16G16_FLOAT
+		: plane == ScopePlane::Depth
+		? desc.Width == scope_motion_w_ && desc.Height == scope_motion_h_ && desc.Format == DXGI_FORMAT_R32_FLOAT
 		: desc.Width == scope_color_.Width && desc.Height == scope_color_.Height &&
 			desc.Format == scope_color_.Format;
 	if (!fits) {
@@ -785,7 +793,12 @@ void UpscalerCaptureD3D12::scope_finalize()
 		trace += format_scope_trace_row(r);
 	if (!write_file(dir + L"\\trace.csv", trace.data(), trace.size()))
 		error = L"could not write " + dir;
-	const std::string scope = format_scope_txt(header, static_cast<uint32_t>(rows.size()));
+	uint32_t written_planes = 0;
+	for (uint32_t i = 0; i < kScopeStagePlanes; ++i) {
+		if (!fmt[i].file.empty())
+			written_planes |= 1u << i;
+	}
+	const std::string scope = format_scope_txt(header, static_cast<uint32_t>(rows.size()), written_planes);
 	if (!write_file(dir + L"\\scope.txt", scope.data(), scope.size()))
 		error = L"could not write " + dir;
 	std::lock_guard<std::mutex> lock(mutex_);

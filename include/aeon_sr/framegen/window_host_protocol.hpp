@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace aeon_sr::window_host {
@@ -79,6 +80,10 @@ struct Block {
 
 constexpr uint32_t kBlockSize = 752;
 static_assert(sizeof(Block) == kBlockSize, "window_host::Block changed shape; bump kVersion and kBlockSize");
+static_assert(offsetof(Block, shared) == 48, "window_host::Block moved; bump kVersion");
+static_assert(offsetof(Block, seq) == 136, "window_host::Block moved; bump kVersion");
+static_assert(offsetof(Block, answered_seq) == 192, "window_host::Block moved; bump kVersion");
+static_assert(offsetof(Block, message) == 240, "window_host::Block moved; bump kVersion");
 static_assert(sizeof(wchar_t) == 2, "the text field assumes UTF-16");
 
 struct Setup {

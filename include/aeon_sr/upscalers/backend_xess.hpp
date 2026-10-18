@@ -4,6 +4,7 @@
 #include "aeon_sr/interop/gpu12.hpp"
 #include "aeon_sr/upscalers/upscaler_backend.hpp"
 #include "aeon_sr/upscalers/xess_loader.hpp"
+#include "aeon_sr/core/runtime_search.hpp"
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -30,6 +31,7 @@ struct XessD3D12Backend : UpscalerBackend {
 	const char *name() const override;
 	reshade::api::device_api api() const override;
 	bool runtime_present() override;
+	const RecentLook &runtime_look() const noexcept { return looked_; }
 	bool run(reshade::api::effect_runtime *runtime,
 		const FrameInputs &inputs,
 		const UpscalerParams &params) override;
@@ -60,6 +62,7 @@ private:
 	Gpu12Fence gpu_fence_;
 	BlitPipelineD3D12 blit_;
 	std::wstring dll_path_;
+	RecentLook looked_;
 
 	static constexpr D3D12_RESOURCE_STATES kXessSrvState =
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -94,7 +97,7 @@ private:
 	uint32_t worker_render_w_ = 0, worker_render_h_ = 0;
 	FsrPipelineCache *pso_cache_ = nullptr;
 
-	bool ensure_dll_present();
+	bool ensure_dll_present(bool may_keep = false);
 	bool build(ID3D12Device *device, uint32_t w, uint32_t h, uint32_t quality, float scale);
 	void join_init();
 	bool ensure_resources(uint32_t w, uint32_t h, DXGI_FORMAT fmt);

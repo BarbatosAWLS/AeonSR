@@ -1,4 +1,5 @@
 #include "aeon_sr/interop/interop_bridges.hpp"
+#include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/retry_backoff.hpp"
 #include "aeon_sr/jitter/spirv_compile.hpp"
 #include "aeon_sr/depth/vulkan_depth_pass.hpp"
@@ -31,14 +32,6 @@ uint64_t vk_value(H handle) noexcept
 		return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
 	else
 		return static_cast<uint64_t>(handle);
-}
-
-std::wstring to_wide(const char *s)
-{
-	std::wstring w;
-	for (const char *p = s; p != nullptr && *p != '\0'; ++p)
-		w.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
-	return w;
 }
 
 std::wstring one_line(std::wstring text)
@@ -292,7 +285,7 @@ struct ImportError {
 	{
 		if (stage == nullptr)
 			return std::wstring();
-		return result == VK_SUCCESS ? to_wide(stage) : to_wide(stage) + L" " + vk_text(result);
+		return result == VK_SUCCESS ? diag_widen(stage) : diag_widen(stage) + L" " + vk_text(result);
 	}
 };
 
@@ -350,7 +343,7 @@ public:
 			return false;
 		}
 		if (const char *const missing = vk_.load(device_vk_)) {
-			last_error = L"this Vulkan driver does not provide " + to_wide(missing) +
+			last_error = L"this Vulkan driver does not provide " + diag_widen(missing) +
 				L". The add-on shares the frame through VK_KHR_external_memory_win32, which "
 				L"ReShade turns on for every Vulkan game it runs in, so a driver without it is "
 				L"either very old or a software one. Until it is updated the frame has to "
@@ -568,25 +561,10 @@ public:
 		engine_->wait_cpu(engine_->last_submitted());
 		bridge_util::release_plane(plane);
 
-		D3D12_HEAP_PROPERTIES heap{};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		D3D12_RESOURCE_DESC desc{};
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		desc.Width = w;
-		desc.Height = h;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.Format = fmt;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		if (FAILED(engine_->device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-				SharedPlane::kState, nullptr, IID_PPV_ARGS(&plane.engine)))) {
+		if (!bridge_util::make_engine_plane(*engine_, w, h, fmt, plane)) {
 			last_error = L"the engine device refused a texture.";
 			return false;
 		}
-		plane.width = w;
-		plane.height = h;
-		plane.format = fmt;
 		return true;
 	}
 
@@ -1138,7 +1116,7 @@ private:
 		};
 
 		if (const char *const missing = vkc_.load(device_vk_))
-			return fail(L"this Vulkan driver does not provide " + to_wide(missing) +
+			return fail(L"this Vulkan driver does not provide " + diag_widen(missing) +
 				L", which the pass that reads the depth buffer needs.");
 
 		std::vector<uint8_t> code;

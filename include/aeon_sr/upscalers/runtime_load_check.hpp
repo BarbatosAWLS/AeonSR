@@ -154,4 +154,16 @@ inline std::wstring runtime_load_redirect_error(const std::wstring &asked, const
 		L"process; its upscalers move to AeonSRHost.exe, apart from it";
 }
 
+template <typename Fn>
+bool resolve_export(HMODULE module, const char *name, Fn *&out, std::wstring &error)
+{
+	out = reinterpret_cast<Fn *>(GetProcAddress(module, name));
+	if (out == nullptr) {
+		error = L"GetProcAddress failed for ";
+		error += std::wstring(name, name + strlen(name));
+		return false;
+	}
+	return true;
+}
+
 }

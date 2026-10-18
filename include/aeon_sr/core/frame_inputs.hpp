@@ -65,8 +65,6 @@ struct FrameInputs {
 	bool depth_view_withheld = false;
 	reshade::api::resource global_flow = { 0 };
 
-	reshade::api::resource motion_confidence = { 0 };
-
 	bool have_motion_vectors = false;
 	bool have_depth = false;
 	bool have_global_flow = false;
