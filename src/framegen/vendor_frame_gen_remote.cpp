@@ -13,6 +13,7 @@ namespace aeon_sr {
 namespace {
 
 constexpr uint32_t kHandshakeMs = 5000;
+constexpr uint32_t kDlssHandshakeMs = 30000;
 constexpr uint32_t kFirstFrameMs = 20000;
 constexpr uint32_t kFrameMs = 2000;
 constexpr uint32_t kMostStarts = 2;
@@ -118,16 +119,24 @@ void RemoteVendorFrameGenerator::Shared::release() noexcept
 	format = DXGI_FORMAT_UNKNOWN;
 }
 
+uint32_t vendor_host_handshake_ms(FrameGenerator kind) noexcept
+{
+	return kind == FrameGenerator::Dlss ? kDlssHandshakeMs : kHandshakeMs;
+}
+
 RemoteVendorFrameGenerator::RemoteVendorFrameGenerator(FrameGenerator kind, std::wstring host_exe)
-	: kind_(kind), exe_(std::move(host_exe))
+	: kind_(kind), exe_(std::move(host_exe)), cancel_(CreateEventW(nullptr, TRUE, FALSE, nullptr))
 {
 }
 
 RemoteVendorFrameGenerator::~RemoteVendorFrameGenerator()
 {
+	if (cancel_ != nullptr)
+		SetEvent(cancel_);
 	if (starter_.joinable())
 		starter_.join();
 	end_host(false);
+	close(cancel_);
 	shared_.release();
 	for (Retired &r : retired_)
 		r.s.release();
@@ -234,8 +243,8 @@ void RemoteVendorFrameGenerator::start_host()
 	ResumeThread(launch.thread);
 	CloseHandle(launch.thread);
 
-	HANDLE waits[2] = { response_, process_ };
-	const DWORD hit = WaitForMultipleObjects(2, waits, FALSE, kHandshakeMs);
+	HANDLE waits[3] = { response_, process_, cancel_ };
+	const DWORD hit = WaitForMultipleObjects(cancel_ != nullptr ? 3 : 2, waits, FALSE, vendor_host_handshake_ms(kind_));
 	MemoryBarrier();
 	if (hit != WAIT_OBJECT_0 || block_->host_state != static_cast<uint32_t>(fg_host::HostState::Ready)) {
 		wchar_t text[fg_host::kTextChars + 1] = {};
@@ -243,8 +252,11 @@ void RemoteVendorFrameGenerator::start_host()
 			std::memcpy(text, const_cast<const wchar_t *>(block_->message), sizeof(block_->message));
 		DWORD code = STILL_ACTIVE;
 		GetExitCodeProcess(process_, &code);
-		return refuse(hit == WAIT_TIMEOUT ? std::wstring(L"AeonSRHost.exe did not answer in time")
+		return refuse(hit == WAIT_TIMEOUT ? std::wstring(kind_ == FrameGenerator::Dlss
+				? L"AeonSRHost.exe did not answer in time (a DLSS Frame Generation unlocker it loads may hang it)"
+				: L"AeonSRHost.exe did not answer in time")
 			: hit == WAIT_OBJECT_0 + 1 ? error_text(L"AeonSRHost.exe closed at once", code)
+			: hit == WAIT_OBJECT_0 + 2 ? std::wstring(L"AeonSRHost.exe's start given up: the generator was let go")
 			: std::wstring(L"AeonSRHost.exe could not run it: ") + text);
 	}
 	host_pid_ = launch.pid;

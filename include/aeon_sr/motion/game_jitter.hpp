@@ -253,4 +253,13 @@ private:
 	int agree_vote_ = 0;
 };
 
+inline bool verdict_turn_resets_landing(GameJitterDetector::Change change, bool lands) noexcept
+{
+	if (change == GameJitterDetector::Change::None)
+		return false;
+	if (change == GameJitterDetector::Change::NotJittering)
+		return true;
+	return !lands;
+}
+
 }

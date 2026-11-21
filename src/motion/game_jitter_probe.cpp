@@ -1,5 +1,6 @@
 #include "aeon_sr/motion/game_jitter_probe.hpp"
 #include "aeon_sr/core/com_release.hpp"
+#include "aeon_sr/interop/shader_cache.hpp"
 
 #include <d3dcompiler.h>
 
@@ -334,9 +335,10 @@ bool GameJitterProbeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t
 		bool ok = rs_ok;
 		std::wstring why;
 		for (int k = 0; ok && k < 2; ++k) {
-			ID3DBlob *cs = nullptr, *cerr = nullptr;
-			ok = SUCCEEDED(D3DCompile(kHlsl, std::strlen(kHlsl), "aeon_game_jitter", nullptr, nullptr,
-				k == 0 ? "Accumulate" : "Reduce", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr));
+			ID3DBlob *cerr = nullptr;
+			ID3DBlob *cs = shader_cache_compile(kHlsl, std::strlen(kHlsl), "aeon_game_jitter",
+				k == 0 ? "Accumulate" : "Reduce", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, &cerr);
+			ok = cs != nullptr;
 			if (!ok && error != nullptr && cerr != nullptr) {
 				const char *msg = static_cast<const char *>(cerr->GetBufferPointer());
 				why.assign(msg, msg + std::strlen(msg));
@@ -516,6 +518,13 @@ bool GameJitterProbeD3D12::take(GameJitterFit *out) noexcept
 	f.motion_y = s[13] > 0.0f ? s[27] / s[13] : 0.0f;
 	*out = f;
 	return true;
+}
+
+void game_jitter_warm_shaders()
+{
+	for (const char *entry : { "Accumulate", "Reduce" })
+		shader_cache_warm(kHlsl, std::strlen(kHlsl), "aeon_game_jitter", entry, "cs_5_0",
+			D3DCOMPILE_OPTIMIZATION_LEVEL3);
 }
 
 }

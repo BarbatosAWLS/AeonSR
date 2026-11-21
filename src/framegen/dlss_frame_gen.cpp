@@ -4,6 +4,7 @@
 #include "aeon_sr/interop/blit_d3d12.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
 #include "aeon_sr/ngx/ngx_dlssg_files.hpp"
+#include "aeon_sr/ngx/ngx_dlssg_unlocker.hpp"
 #include "aeon_sr/ngx/ngx_shared_d3d12.hpp"
 
 #include <nvsdk_ngx.h>
@@ -97,13 +98,13 @@ public:
 			const NVSDK_NGX_Result r = create_guarded(f.cmd, &handle_, params_, &cp, &seh);
 			if (NVSDK_NGX_FAILED(r) || handle_ == nullptr) {
 				handle_ = nullptr;
-				error_ = ngx_format_result(L"DLSS Frame Generation: CreateFeature", r);
+				std::wstring created = ngx_format_result(L"DLSS Frame Generation: CreateFeature", r);
 				if (seh != 0)
-					error_ += seh_text(seh);
-				if (!refused_.empty())
-					error_ = refused_ + L"; " + error_;
+					created += seh_text(seh);
+				error_ = dlssg_refusal_text(refused_, created, unlocker_);
 				if (dlssg_refusal_is_final(!refused_.empty(), static_cast<uint32_t>(r), seh)) {
-					diag_logf(DiagLevel::Warn, "framegen", L"%ls", error_.c_str());
+					diag_logf(DiagLevel::Warn, "framegen", L"%ls",
+						dlssg_refusal_text(refused_, created, unlocker_, std::wstring::npos).c_str());
 					unavailable_ = true;
 					*note = error_;
 					return VendorStep::Unavailable;
@@ -115,8 +116,9 @@ public:
 			h_ = f.height;
 			format_ = f.format;
 			frames_ = 0;
-			diag_logf(DiagLevel::Info, "framegen", L"DLSS Frame Generation ready, %ux%u%ls", w_, h_, refused_.empty()
-				? L"" : L", although NGX said it is not available here: CreateFeature succeeded anyway");
+			diag_logf(DiagLevel::Info, "framegen", L"DLSS Frame Generation ready, %ux%u%ls%ls%ls", w_, h_,
+				refused_.empty() ? L"" : L", although NGX said it is not available here: CreateFeature succeeded anyway",
+				refused_.empty() || unlocker_.empty() ? L"" : L"; ", refused_.empty() ? L"" : unlocker_.c_str());
 			if (!created_logged_) {
 				created_logged_ = true;
 				diag_logf(DiagLevel::Info, "framegen", L"DLSS Frame Generation after CreateFeature: %ls",
@@ -205,6 +207,11 @@ private:
 	bool start(ID3D12Device *device)
 	{
 		const std::wstring addon_dir = vendor_module_directory();
+		unlocker_ = prepare_dlssg_unlocker(addon_dir);
+		if (device == nullptr) {
+			error_ = L"DLSS Frame Generation: no device to start NGX on";
+			return false;
+		}
 		const DlssgChoice choice = find_dlssg(addon_dir);
 		std::wstring dlss_dir = find_ngx_runtime_dir(addon_dir);
 		if (dlss_dir.empty())
@@ -233,8 +240,11 @@ private:
 		info.LoggingInfo.DisableOtherLoggingSinks = false;
 		const NVSDK_NGX_Result r = ngx12_acquire(ngx12_static_api(), device, data.c_str(), &info, kTag);
 		if (NVSDK_NGX_FAILED(r)) {
-			error_ = ngx_format_result(L"DLSS Frame Generation needs an NVIDIA GeForce RTX 40 or newer; NGX did not start", r);
-			diag_logf(DiagLevel::Warn, "framegen", L"%ls", error_.c_str());
+			const std::wstring why = ngx_format_result(L"DLSS Frame Generation needs an NVIDIA GeForce RTX 40 or newer; "
+				L"NGX did not start", r);
+			error_ = dlssg_refusal_text(why, L"", unlocker_);
+			diag_logf(DiagLevel::Warn, "framegen", L"%ls", dlssg_refusal_text(why, L"", unlocker_,
+				std::wstring::npos).c_str());
 			unavailable_ = true;
 			return false;
 		}
@@ -255,8 +265,10 @@ private:
 		NVSDK_NGX_Parameter *caps = nullptr;
 		const NVSDK_NGX_Result cr = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
 		if (NVSDK_NGX_FAILED(cr) || caps == nullptr) {
-			error_ = ngx_format_result(L"DLSS Frame Generation: NGX gave no capabilities", cr);
-			diag_logf(DiagLevel::Warn, "framegen", L"%ls", error_.c_str());
+			const std::wstring why = ngx_format_result(L"DLSS Frame Generation: NGX gave no capabilities", cr);
+			error_ = dlssg_refusal_text(why, L"", unlocker_);
+			diag_logf(DiagLevel::Warn, "framegen", L"%ls", dlssg_refusal_text(why, L"", unlocker_,
+				std::wstring::npos).c_str());
 			if (caps != nullptr)
 				NVSDK_NGX_D3D12_DestroyParameters(caps);
 			unavailable_ = true;
@@ -351,6 +363,7 @@ private:
 	bool unavailable_ = false;
 	std::wstring error_;
 	std::wstring refused_;
+	std::wstring unlocker_;
 	bool created_logged_ = false;
 	struct Retired {
 		NVSDK_NGX_Handle *handle = nullptr;
@@ -368,6 +381,46 @@ bool dlssg_refusal_is_final(bool capability_refused, uint32_t ngx_result, uint32
 	const NVSDK_NGX_Result r = static_cast<NVSDK_NGX_Result>(ngx_result);
 	return r == NVSDK_NGX_Result_FAIL_Denied || r == NVSDK_NGX_Result_FAIL_FeatureNotSupported ||
 		r == NVSDK_NGX_Result_FAIL_OutOfDate || r == NVSDK_NGX_Result_FAIL_PlatformError;
+}
+
+std::wstring dlssg_refusal_text(const std::wstring &ngx_refusal, const std::wstring &create_error,
+	const std::wstring &unlocker_note, size_t max_chars)
+{
+	std::wstring why = ngx_refusal;
+	std::wstring created = create_error;
+	std::wstring note = unlocker_note;
+	const std::wstring prefix = L"DLSS Frame Generation: ";
+	if (!why.empty() && created.compare(0, prefix.size(), prefix) == 0)
+		created.erase(0, prefix.size());
+	const auto join = [&]() {
+		std::wstring t;
+		for (const std::wstring *p : { &why, &note, &created })
+			if (!p->empty())
+				t += (t.empty() ? L"" : L"; ") + *p;
+		return t;
+	};
+	const auto head = [](const std::wstring &s, size_t n) {
+		if (n > 0 && n < s.size() && s[n - 1] >= 0xD800 && s[n - 1] <= 0xDBFF)
+			--n;
+		return s.substr(0, n);
+	};
+	const auto cut = [&](std::wstring &part, size_t over) {
+		if (part.empty() || over == 0)
+			return;
+		if (part.size() <= over + 4) {
+			part.clear();
+			return;
+		}
+		part = head(part, part.size() - over - 3) + L"...";
+	};
+	std::wstring t = join();
+	for (std::wstring *p : { &created, &why, &note }) {
+		if (t.size() <= max_chars)
+			break;
+		cut(*p, t.size() - max_chars);
+		t = join();
+	}
+	return t.size() <= max_chars ? t : head(t, max_chars);
 }
 
 std::unique_ptr<VendorFrameGenerator> make_dlss_frame_generator()

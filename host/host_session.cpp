@@ -111,6 +111,11 @@ HostCapabilities HostSession::capabilities()
 	if (engine_.device11() != nullptr)
 		caps.backends_present |= 1u << static_cast<uint32_t>(BackendChoice::Vsr);
 	caps.neural_present = neural_.ensure_dll_present() ? 1u : 0u;
+	if (caps.neural_present != 0u) {
+		const NeuralRenderCommon::Text t = neural_.text();
+		model_peek_.start(!t.dll_path.empty() ? t.dll_path
+			: !t.candidates.empty() ? t.candidates.front() : std::wstring());
+	}
 
 	GpuInfo gpu;
 	if (query_gpu_info(engine_.device(), &gpu))
@@ -130,6 +135,7 @@ HostCapabilities HostSession::capabilities()
 void HostSession::shutdown()
 {
 	engine_.wait_cpu(engine_.last_submitted());
+	neural_loader_.join();
 	neural_.shutdown_device();
 	dlss_.shutdown();
 	fsr_.shutdown();
@@ -389,18 +395,19 @@ void HostSession::take_extras()
 	}
 	if (restart != restart_epoch_) {
 		restart_epoch_ = restart;
+		neural_loader_.join();
 		neural_.destroy_feature();
 		neural_init_failed_ = false;
 		diag_info("host.neural", L"the game asked for DLSS neural rendering to start again");
 	}
-	if (accum != accum_epoch_) {
+	if (accum != accum_epoch_ && !neural_loader_.loading()) {
 		accum_epoch_ = accum;
 		if (target != 0)
 			neural_.accum.start(target);
 		else
 			neural_.accum.stop();
 	}
-	if (capture != capture_epoch_) {
+	if (capture != capture_epoch_ && !neural_loader_.loading()) {
 		capture_epoch_ = capture;
 		wchar_t dir[remote::kPathChars] = {};
 		std::memcpy(dir, block_->capture_dir, sizeof(dir));
@@ -468,7 +475,17 @@ void HostSession::write_info() noexcept
 	ascii(block_->neural_runtime_cards, sizeof(block_->neural_runtime_cards),
 		nt.targets_known ? neural_kernels_cards(nt.kernels) : std::string());
 	copy_text(block_->neural_runtime_file, remote::kPathChars, nt.dll_path);
-	copy_text(block_->neural_capture_status, 128, neural_.capture.last);
+	if (!neural_loader_.loading())
+		copy_text(block_->neural_capture_status, 128, neural_.capture.last);
+	{
+		std::vector<uint32_t> ids = neural_model_ids(nt.identity.models);
+		if (ids.empty())
+			ids = model_peek_.models();
+		const uint32_t n = static_cast<uint32_t>(std::min<size_t>(ids.size(), remote::kNeuralModels));
+		for (uint32_t k = 0; k < n; ++k)
+			block_->neural_model_ids[k] = ids[k];
+		block_->neural_model_count = n;
+	}
 	MemoryBarrier();
 	block_->neural_flags = f;
 }
@@ -670,23 +687,28 @@ void HostSession::run_neural(const FrameInputs &inputs, ID3D12Resource *colour,
 		neural_ran_ = 0xFFFFFFFFu;
 		return;
 	}
+	if (dlss_.dlss_loading() || fsr_.fsr_loading() || xess_.xess_loading()) {
+		neural_ran_ = 0;
+		return;
+	}
 
 	const bool want_depth = block_->neural_want_depth != 0;
 	const NeuralRenderParams np = block_->neural;
 
 	ID3D12Device *const device = engine_.device();
-	if (neural_.initialized && neural_.device != device)
-		neural_.shutdown_device();
-
-	if (!neural_.initialized) {
-		if (neural_init_failed_ || !neural_.init_device(device, inputs.width, inputs.height)) {
-			neural_init_failed_ = true;
-			fail_neural(neural_.last_error.empty()
-				? std::wstring(L"DLSS neural rendering could not start on this machine.") : neural_.last_error);
-			return;
-		}
+	switch (neural_loader_.step(neural_, device, engine_.queue(), inputs.width, inputs.height, colour, np,
+		&neural_init_failed_)) {
+	case NeuralLoader::Step::Wait:
+		neural_ran_ = 0;
+		return;
+	case NeuralLoader::Step::Failed: {
+		const std::wstring why = neural_.text().last_error;
+		fail_neural(why.empty() ? std::wstring(L"DLSS neural rendering could not start on this machine.") : why);
+		return;
 	}
-	neural_.set_command_queue(engine_.queue());
+	case NeuralLoader::Step::Run:
+		break;
+	}
 
 	float depth_u = 0.0f, depth_v = 0.0f;
 	remote::depth_jitter_to_read(*block_, backend_ran_, &depth_u, &depth_v);

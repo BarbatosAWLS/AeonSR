@@ -95,9 +95,12 @@ struct Fsr4D3D12Backend final : UpscalerBackend {
 
 	std::string want_provider;
 	std::string created_provider;
+	bool lite_by_default = true;
+	bool lite_default_failed() const noexcept { return lite_default_failed_; }
 
 	std::wstring addon_dir;
 	std::wstring dll_dir;
+	std::wstring driver_path;
 
 	~Fsr4D3D12Backend() override
 	{
@@ -148,6 +151,12 @@ private:
 	FfxApi api_{};
 	ffxContext context_ = nullptr;
 	bool dll_present_ = false;
+	bool sdk_found_ = false;
+	bool lite_absent_said_ = false;
+	bool lite_default_failed_ = false;
+	std::string created_want_;
+	bool created_lite_default_ = false;
+	bool lite_default_absent_said_ = false;
 	RecentLook looked_;
 	bool initialized_ = false;
 
@@ -172,12 +181,19 @@ private:
 	static constexpr unsigned long kPrebuildTimeoutMs = 10ul * 60ul * 1000ul;
 	HANDLE cancel_event_ = nullptr;
 	bool prebuild_given_up_ = false;
+	bool first_run_pending_ = false;
 	uint32_t build_quality_ = 0;
 	float build_scale_ = 0.0f;
 	std::string build_provider_;
 	uint32_t build_color_flags_ = 0;
 	std::wstring build_dll_path_;
 	std::wstring build_addon_dir_;
+	bool build_lite_ = false;
+	bool build_lite_default_ = false;
+	std::string build_want_;
+	std::wstring build_sdk_path_;
+	std::wstring build_driver_path_;
+	bool api_is_driver_ = false;
 	int run_prebuild(ID3D12Device *device, const FsrWarmupDesc &desc, const std::wstring &cache_file,
 		double *ms);
 	static const wchar_t *prebuild_failure(int code);

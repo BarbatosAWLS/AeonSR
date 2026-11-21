@@ -2,6 +2,8 @@
 
 #include "aeon_sr/framegen/display_clock.hpp"
 #include "aeon_sr/framegen/frame_interpolator.hpp"
+#include "aeon_sr/framegen/frame_marker.hpp"
+#include "aeon_sr/framegen/overlay_cover.hpp"
 #include "aeon_sr/framegen/overlay_scheduler.hpp"
 #include "aeon_sr/framegen/vendor_frame_gen.hpp"
 #include "aeon_sr/framegen/window_host_link.hpp"
@@ -64,7 +66,10 @@ struct OverlayStats {
 	uint64_t reals = 0, skipped = 0, generated = 0, held = 0;
 	uint64_t repeated = 0;
 	uint64_t made_shown = 0;
+	uint64_t interp_full = 0, interp_reused = 0;
 	double real_per_s = 0.0, generated_per_s = 0.0;
+	uint64_t shown_reals = 0, shown_made = 0;
+	uint32_t starts = 0;
 	double period_ms = 0.0;
 	bool compositor_paced = false;
 	double screen_ms_p50 = 0.0, screen_real_ms_p50 = 0.0, screen_real_ms_p90 = 0.0;
@@ -90,6 +95,8 @@ struct OverlayStats {
 	bool in_host = false;
 	uint32_t host_pid = 0;
 	int host_gpu_class = -1;
+	uint64_t raised = 0;
+	bool covered = false;
 	std::wstring note;
 };
 
@@ -103,6 +110,14 @@ public:
 	{
 		if (exe != host_exe_)
 			host_exe_ = exe;
+	}
+	void set_marker(bool on) noexcept { marker_on_.store(on, std::memory_order_relaxed); }
+	void set_aside(bool on) noexcept { aside_.store(on, std::memory_order_relaxed); }
+	void set_queue(bool on) noexcept { queue_on_.store(on, std::memory_order_relaxed); }
+	uint64_t queued() const noexcept
+	{
+		const uint64_t fed = next_id_ - 1u, shown = shown_real_id_.load(std::memory_order_acquire);
+		return fed > shown ? fed - shown : 0u;
 	}
 
 	bool ensure(ID3D12Device *device, HWND game_window, uint32_t w, uint32_t h, DXGI_FORMAT frame_format,
@@ -187,6 +202,9 @@ private:
 
 	std::thread thread_;
 	std::atomic<bool> quit_{ false };
+	std::atomic<bool> queue_on_{ false };
+	std::atomic<uint64_t> shown_real_id_{ 0 };
+	void note_shown_real(uint64_t id) noexcept;
 	std::thread ready_thread_;
 	HANDLE ready_event_ = nullptr;
 	static constexpr uint32_t kReadyRing = 64;
@@ -248,6 +266,9 @@ private:
 	HANDLE timer_ = nullptr;
 	FrameInterpolatorD3D12 interp_;
 	BlitPipelineD3D12 blit_;
+	std::atomic<bool> marker_on_{ false };
+	std::atomic<bool> aside_{ false };
+	FrameMarker marker_;
 	OverlayScheduler scheduler_;
 	std::vector<Pending> waiting_;
 	enum class Last : uint8_t { None, Real, Generated, Made } last_ = Last::None;
@@ -307,6 +328,7 @@ private:
 	RECT shown_rect_{};
 	bool shown_ = false;
 	bool had_content_ = false;
+	OverlayCover cover_;
 	static constexpr uint32_t kWakes = 32;
 	double wakes_[kWakes] = {};
 	uint32_t wake_n_ = 0, wake_at_ = 0;
@@ -314,6 +336,8 @@ private:
 	double next_display_ = 0.0;
 	double second_start_ = 0.0;
 	uint32_t second_reals_ = 0, second_generated_ = 0;
+	uint64_t shown_reals_ = 0, shown_made_ = 0;
+	uint32_t starts_ = 0;
 };
 
 }

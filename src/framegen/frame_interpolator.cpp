@@ -110,6 +110,7 @@ void FrameInterpolatorD3D12::release() noexcept
 	if (builder_.joinable())
 		builder_.join();
 	release_textures();
+	full_records_ = reused_records_ = 0;
 	for (ID3D12PipelineState *&p : pso_)
 		safe_release(p);
 	safe_release(root_);
@@ -133,6 +134,7 @@ void FrameInterpolatorD3D12::release_textures() noexcept
 	w_ = h_ = 0;
 	color_format_ = family_ = input_family_ = uav_format_ = DXGI_FORMAT_UNKNOWN;
 	textures_failed_ = false;
+	prepared_ids_[0] = prepared_ids_[1] = 0;
 }
 
 void FrameInterpolatorD3D12::build_kernels(ID3D12Device *device)
@@ -176,9 +178,11 @@ void FrameInterpolatorD3D12::build_kernels(ID3D12Device *device)
 	ID3D12PipelineState *psos[kPasses] = {};
 	for (uint32_t k = 0; ok && k < kPasses; ++k) {
 		ID3DBlob *code = nullptr, *messages = nullptr;
-		const HRESULT hr = D3DCompile(framegen_shaders::kInterpolatorHlsl, sizeof(framegen_shaders::kInterpolatorHlsl) - 1,
-			"aeon_frame_interpolator", nullptr, nullptr, kEntries[k], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code,
-			&messages);
+		const char *const source = source_for_test != nullptr ? source_for_test : framegen_shaders::kInterpolatorHlsl;
+		const size_t length = source_for_test != nullptr ? std::strlen(source_for_test)
+			: sizeof(framegen_shaders::kInterpolatorHlsl) - 1;
+		const HRESULT hr = D3DCompile(source, length, "aeon_frame_interpolator", nullptr, nullptr, kEntries[k], "cs_5_0",
+			D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &messages);
 		if (FAILED(hr) || code == nullptr) {
 			error = L"frame generation: kernel " + widen_ascii(kEntries[k], std::strlen(kEntries[k])) +
 				L" did not compile";
@@ -234,6 +238,27 @@ bool FrameInterpolatorD3D12::wait_for_kernels()
 	if (builder_.joinable())
 		builder_.join();
 	return state_.load(std::memory_order_acquire) == kReady;
+}
+
+void FrameInterpolatorD3D12::prepare(ID3D12Device *device)
+{
+	if (device == nullptr)
+		return;
+	if (device_ != device) {
+		release();
+		device_ = device;
+	}
+	if (state_.load(std::memory_order_acquire) != kIdle)
+		return;
+	if (builder_.joinable())
+		builder_.join();
+	state_.store(kBuilding, std::memory_order_release);
+	device->AddRef();
+	builder_ = std::thread([this, device] {
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+		build_kernels(device);
+		device->Release();
+	});
 }
 
 bool FrameInterpolatorD3D12::ensure(ID3D12Device *device, uint32_t w, uint32_t h, DXGI_FORMAT color_format,
@@ -417,10 +442,16 @@ bool FrameInterpolatorD3D12::record(ID3D12GraphicsCommandList *cmd, const Inputs
 		b.Transition.StateAfter = kRead;
 	}
 
-	ID3D12Resource *const written[kPasses + 1] = { tile_stats_, search_errors_, summary_, refined_, layers_,
-		layer_depth_, output_ };
+	const void *const inputs[5] = { in.previous, in.current, in.motion, in.global_flow, in.depth };
+	bool reuse = in.current_id != 0 && in.previous_id == prepared_ids_[0] && in.current_id == prepared_ids_[1];
+	for (uint32_t i = 0; reuse && i < 5; ++i)
+		reuse = inputs[i] == prepared_inputs_[i];
+
+	ID3D12Resource *const written[kPasses + 1] = { output_, tile_stats_, search_errors_, summary_, refined_, layers_,
+		layer_depth_ };
+	const uint32_t n_written = reuse ? 1 : kPasses + 1;
 	D3D12_RESOURCE_BARRIER to_write[kPasses + 1]{};
-	for (uint32_t i = 0; i < kPasses + 1; ++i) {
+	for (uint32_t i = 0; i < n_written; ++i) {
 		to_write[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		to_write[i].Transition.pResource = written[i];
 		to_write[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -430,7 +461,7 @@ bool FrameInterpolatorD3D12::record(ID3D12GraphicsCommandList *cmd, const Inputs
 	engine_journal_note(L"frame generation");
 	if (n_read != 0)
 		cmd->ResourceBarrier(n_read, to_read);
-	cmd->ResourceBarrier(kPasses + 1, to_write);
+	cmd->ResourceBarrier(n_written, to_write);
 
 	const Constants c{ w_, h_, 1.0f / static_cast<float>(w_), 1.0f / static_cast<float>(h_), in.t,
 		in.depth != nullptr ? 1u : 0u, stat_w_, stat_h_, tile_w_, tile_h_, srgb ? 1u : 0u,
@@ -455,29 +486,55 @@ bool FrameInterpolatorD3D12::record(ID3D12GraphicsCommandList *cmd, const Inputs
 		}
 		cmd->ResourceBarrier(n, b);
 	};
+	const auto stamp = [&](uint32_t k) {
+		if (stamps_ != nullptr)
+			cmd->EndQuery(stamps_, D3D12_QUERY_TYPE_TIMESTAMP, stamp_first_ + k);
+	};
 	const uint32_t px = groups(w_, kGroup), py = groups(h_, kGroup);
-	cmd->SetPipelineState(pso_[0]);
-	cmd->Dispatch(stat_w_, stat_h_, 1);
-	cmd->SetPipelineState(pso_[1]);
-	cmd->Dispatch(kSearchSpan, 2 * kSearchSpan, 1);
-	readable({ tile_stats_, search_errors_ });
-	cmd->SetPipelineState(pso_[2]);
-	cmd->Dispatch(1, 1, 1);
-	readable({ summary_ });
-	cmd->SetPipelineState(pso_[3]);
-	cmd->Dispatch(px, py, 1);
-	readable({ refined_ });
-	cmd->SetPipelineState(pso_[4]);
-	cmd->Dispatch(groups(tile_w_, kGroup), groups(tile_h_, kGroup), 1);
-	readable({ layers_, layer_depth_ });
+	stamp(0);
+	if (!reuse) {
+		cmd->SetPipelineState(pso_[0]);
+		cmd->Dispatch(stat_w_, stat_h_, 1);
+	}
+	stamp(1);
+	if (!reuse) {
+		cmd->SetPipelineState(pso_[1]);
+		cmd->Dispatch(kSearchSpan, 2 * kSearchSpan, 1);
+		readable({ tile_stats_, search_errors_ });
+	}
+	stamp(2);
+	if (!reuse) {
+		cmd->SetPipelineState(pso_[2]);
+		cmd->Dispatch(1, 1, 1);
+		readable({ summary_ });
+	}
+	stamp(3);
+	if (!reuse) {
+		cmd->SetPipelineState(pso_[3]);
+		cmd->Dispatch(px, py, 1);
+		readable({ refined_ });
+	}
+	stamp(4);
+	if (!reuse) {
+		cmd->SetPipelineState(pso_[4]);
+		cmd->Dispatch(groups(tile_w_, kGroup), groups(tile_h_, kGroup), 1);
+		readable({ layers_, layer_depth_ });
+	}
+	stamp(5);
 	cmd->SetPipelineState(pso_[5]);
 	cmd->Dispatch(px, py, 1);
 	readable({ output_ });
+	stamp(6);
 
 	for (uint32_t i = 0; i < n_read; ++i)
 		std::swap(to_read[i].Transition.StateBefore, to_read[i].Transition.StateAfter);
 	if (n_read != 0)
 		cmd->ResourceBarrier(n_read, to_read);
+	prepared_ids_[0] = in.previous_id;
+	prepared_ids_[1] = in.current_id;
+	for (uint32_t i = 0; i < 5; ++i)
+		prepared_inputs_[i] = inputs[i];
+	++(reuse ? reused_records_ : full_records_);
 	return true;
 }
 

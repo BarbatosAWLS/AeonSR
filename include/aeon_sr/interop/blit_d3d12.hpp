@@ -2,6 +2,7 @@
 #include <d3d12.h>
 #include <dxgi.h>
 #include <cstdint>
+#include <initializer_list>
 
 namespace aeon_sr {
 
@@ -82,6 +83,7 @@ struct BlitPipelineD3D12 {
 	bool blit_ready = false;
 
 	bool ensure(ID3D12Device *device);
+	bool prepare(ID3D12Device *device, std::initializer_list<DXGI_FORMAT> targets);
 	void release();
 	bool draw_fullscreen(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 		ID3D12Resource *effect,
@@ -104,9 +106,14 @@ struct BlitPipelineD3D12 {
 
 private:
 
+	PsoPair *pso_pair(ID3D12Device *device, DXGI_FORMAT rtv_fmt);
+	ID3D12PipelineState *pso_of(ID3D12Device *device, PsoPair &pair, ID3D12PipelineState *PsoPair::*slot,
+		void *ps_blob);
 	PsoPair *prepare_draw(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 		ID3D12Resource *t0, ID3D12Resource *t1, ID3D12Resource *t2, ID3D12Resource *t3,
 		ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h);
 };
+
+void blit12_warm_shaders();
 
 }

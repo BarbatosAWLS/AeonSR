@@ -92,6 +92,7 @@ private:
 	std::thread init_thread_;
 	std::atomic<int> init_state_{ kIdle };
 	bool init_ok_ = false;
+	bool first_run_pending_ = false;
 	UpscalerStatus worker_status_ = UpscalerStatus::Idle;
 	std::wstring worker_error_;
 	uint32_t worker_render_w_ = 0, worker_render_h_ = 0;

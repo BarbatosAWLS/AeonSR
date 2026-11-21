@@ -2,6 +2,7 @@
 #include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/interop/blit_d3d12.hpp"
+#include "aeon_sr/interop/shader_cache.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/dxgi_format_util.hpp"
 
@@ -16,7 +17,7 @@ namespace {
 enum : uint32_t {
 	kPixels = 0, kInterface, kHeld, kFlickerInterface, kFlickerRest, kMoving, kMotionPixels,
 	kOutInterface = 8, kOutRest = 10, kDrawnInterface = 12, kDrawnRest = 14, kMotionRest = 16,
-	kEdges = 18, kEdgesChanged = 19,
+	kEdges = 18, kEdgesChanged = 19, kProbeShown = 20,
 };
 constexpr double kFixed = 16.0;
 
@@ -27,7 +28,8 @@ cbuffer C : register(b0)
 	float have_prev;
 	float have_mask;
 	float have_motion;
-	float3 pad;
+	float have_scene;
+	float2 pad;
 };
 
 Texture2D<float4> drawn_now : register(t0);
@@ -36,9 +38,10 @@ Texture2D<float4> out_now : register(t2);
 Texture2D<float4> out_prev : register(t3);
 Texture2D<float> mask : register(t4);
 Texture2D<float2> motion : register(t5);
+Texture2D<float4> scene : register(t6);
 RWByteAddressBuffer sums : register(u0);
 
-groupshared uint g_count[9];
+groupshared uint g_count[10];
 groupshared uint g_sum[5];
 
 float luma(float3 c)
@@ -66,7 +69,7 @@ void CSClear(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
-	if (gi < 9u)
+	if (gi < 10u)
 		g_count[gi] = 0u;
 	if (gi < 5u)
 		g_sum[gi] = 0u;
@@ -89,6 +92,10 @@ void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 		InterlockedAdd(g_count[0], 1u);
 		if (hud)
 			InterlockedAdd(g_count[1], 1u);
+		[branch] if (have_scene > 0.5) {
+			if (hud || any(drawn_now.Load(p).rgb != scene.Load(p).rgb))
+				InterlockedAdd(g_count[9], 1u);
+		}
 		if (held)
 			InterlockedAdd(g_count[2], 1u);
 		if (dout > 2.0)
@@ -109,7 +116,7 @@ void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 	GroupMemoryBarrierWithGroupSync();
 	if (gi < 7u && g_count[gi] != 0u)
 		sums.InterlockedAdd(gi * 4u, g_count[gi]);
-	if ((gi == 7u || gi == 8u) && g_count[gi] != 0u)
+	if ((gi == 7u || gi == 8u || gi == 9u) && g_count[gi] != 0u)
 		sums.InterlockedAdd((gi + 11u) * 4u, g_count[gi]);
 	if (gi < 5u)
 		add64(8u + gi * 2u, g_sum[gi]);
@@ -118,10 +125,10 @@ void CSObserve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 
 ID3DBlob *compile(const char *entry)
 {
-	ID3DBlob *blob = nullptr, *err = nullptr;
-	const HRESULT hr = D3DCompile(kObserveHlsl, sizeof(kObserveHlsl) - 1, "aeon_frame_observer", nullptr, nullptr, entry,
-		"cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err);
-	if (FAILED(hr)) {
+	ID3DBlob *err = nullptr;
+	ID3DBlob *const blob = shader_cache_compile(kObserveHlsl, sizeof(kObserveHlsl) - 1, "aeon_frame_observer", entry,
+		"cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, &err);
+	if (blob == nullptr) {
 		std::wstring what = L"frame observer: shader " + std::wstring(entry, entry + std::strlen(entry)) +
 			L" did not compile";
 		if (err != nullptr) {
@@ -168,10 +175,10 @@ bool FrameObserverD3D12::ensure(ID3D12Device *device, uint32_t w, uint32_t h, DX
 	if (root_ == nullptr) {
 		D3D12_DESCRIPTOR_RANGE ranges[2]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-		ranges[0].NumDescriptors = 6;
+		ranges[0].NumDescriptors = 7;
 		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
 		ranges[1].NumDescriptors = 1;
-		ranges[1].OffsetInDescriptorsFromTableStart = 6;
+		ranges[1].OffsetInDescriptorsFromTableStart = 7;
 		D3D12_ROOT_PARAMETER rp[2]{};
 		rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		rp[0].Constants.Num32BitValues = 8;
@@ -257,6 +264,8 @@ void FrameObserverD3D12::collect() noexcept
 			e.changed = c[kEdgesChanged];
 			e.pixels = c[kPixels];
 			e.shown = c[kInterface];
+			e.probe = probe_[k];
+			e.probe_shown = probe_[k] ? c[kProbeShown] : 0u;
 		}
 		acc_.edges += c[kEdges];
 		acc_.edges_changed += c[kEdgesChanged];
@@ -297,16 +306,16 @@ bool FrameObserverD3D12::begin(ID3D12Device *device, ID3D12GraphicsCommandList *
 	return true;
 }
 
-void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
+bool FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
 	D3D12_RESOURCE_STATES state, ID3D12Resource *mask, D3D12_RESOURCE_STATES mask_state, ID3D12Resource *motion,
-	D3D12_RESOURCE_STATES motion_state, uint64_t serial)
+	D3D12_RESOURCE_STATES motion_state, uint64_t serial, ID3D12Resource *scene, D3D12_RESOURCE_STATES scene_state)
 {
 	if (!begun_ || device == nullptr || cmd == nullptr || color == nullptr)
-		return;
+		return false;
 	begun_ = false;
 	const D3D12_RESOURCE_DESC d = color->GetDesc();
 	if (static_cast<uint32_t>(d.Width) != w_ || d.Height != h_ || d.Format != format_)
-		return;
+		return false;
 	const uint32_t now = cur_ ^ 1u;
 	barrier12(cmd, color, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	barrier12(cmd, out_[now], kSrv, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -324,16 +333,23 @@ void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 		if (vd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || vd.SampleDesc.Count != 1)
 			motion = nullptr;
 	}
+	if (scene != nullptr) {
+		const D3D12_RESOURCE_DESC sd = scene->GetDesc();
+		if (sd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || static_cast<uint32_t>(sd.Width) != w_ ||
+			sd.Height != h_ || sd.Format != format_ || sd.SampleDesc.Count != 1)
+			scene = nullptr;
+	}
 
 	slot_ = (slot_ + 1u) % kSlots;
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
 	cpu.ptr += static_cast<SIZE_T>(slot_) * kSlotDescriptors * stride_;
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
 	gpu.ptr += static_cast<UINT64>(slot_) * kSlotDescriptors * stride_;
-	ID3D12Resource *const srvs[6] = { drawn_[now], drawn_[cur_], out_[now], out_[cur_], mask, motion };
-	const DXGI_FORMAT fallback[6] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-		DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16G16_FLOAT };
-	for (uint32_t i = 0; i < 6; ++i) {
+	ID3D12Resource *const srvs[7] = { drawn_[now], drawn_[cur_], out_[now], out_[cur_], mask, motion, scene };
+	const DXGI_FORMAT fallback[7] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+		DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16G16_FLOAT,
+		DXGI_FORMAT_R8G8B8A8_UNORM };
+	for (uint32_t i = 0; i < 7; ++i) {
 		D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
 		sd.Format = srvs[i] != nullptr ? view_format_for(srvs[i]->GetDesc().Format) : fallback[i];
 		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -349,15 +365,17 @@ void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 	ud.Buffer.NumElements = kCounters;
 	ud.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
 	D3D12_CPU_DESCRIPTOR_HANDLE at = cpu;
-	at.ptr += static_cast<SIZE_T>(6) * stride_;
+	at.ptr += static_cast<SIZE_T>(7) * stride_;
 	device->CreateUnorderedAccessView(sums_, nullptr, &ud, at);
 
 	const float c[8] = { static_cast<float>(w_), static_cast<float>(h_), have_prev_ ? 1.0f : 0.0f,
-		mask != nullptr ? 1.0f : 0.0f, motion != nullptr ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+		mask != nullptr ? 1.0f : 0.0f, motion != nullptr ? 1.0f : 0.0f, scene != nullptr ? 1.0f : 0.0f, 0.0f, 0.0f };
 	if (mask != nullptr)
 		barrier12(cmd, mask, mask_state, kSrv);
 	if (motion != nullptr)
 		barrier12(cmd, motion, motion_state, kSrv);
+	if (scene != nullptr)
+		barrier12(cmd, scene, scene_state, kSrv);
 	cmd->SetComputeRootSignature(root_);
 	cmd->SetDescriptorHeaps(1, &heap_);
 	cmd->SetComputeRoot32BitConstants(0, 8, c, 0);
@@ -375,6 +393,8 @@ void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 		barrier12(cmd, mask, kSrv, mask_state);
 	if (motion != nullptr)
 		barrier12(cmd, motion, kSrv, motion_state);
+	if (scene != nullptr)
+		barrier12(cmd, scene, kSrv, scene_state);
 
 	barrier12(cmd, sums_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	ring_ = (ring_ + 1u) % kReadback;
@@ -383,8 +403,11 @@ void FrameObserverD3D12::end(ID3D12Device *device, ID3D12GraphicsCommandList *cm
 	written_[ring_] = have_prev_;
 	age_[ring_] = 0;
 	serial_[ring_] = serial;
+	probe_[ring_] = scene != nullptr;
+	const bool probed = scene != nullptr && written_[ring_];
 	cur_ = now;
 	have_prev_ = true;
+	return probed;
 }
 
 bool FrameObserverD3D12::take_edges(FrameEdges *out) noexcept
@@ -424,6 +447,13 @@ void FrameObserverD3D12::release() noexcept
 	format_ = DXGI_FORMAT_UNKNOWN;
 	have_prev_ = begun_ = failed_ = false;
 	acc_ = FrameObservation{};
+}
+
+void frame_observer_warm_shaders()
+{
+	for (const char *entry : { "CSObserve", "CSClear" })
+		shader_cache_warm(kObserveHlsl, sizeof(kObserveHlsl) - 1, "aeon_frame_observer", entry, "cs_5_0",
+			D3DCOMPILE_OPTIMIZATION_LEVEL3);
 }
 
 }

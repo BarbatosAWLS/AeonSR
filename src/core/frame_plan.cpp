@@ -212,4 +212,11 @@ FramePlan plan_frame(const Settings &s, const FrameSignals &sig, const BackendSl
 	return plan;
 }
 
+bool want_depth_from_motion(bool setting, BackendChoice backend, unsigned int upscale_mode,
+	bool game_scale) noexcept
+{
+	const bool dlaa = upscale_mode == static_cast<unsigned int>(UpscaleMode::Dlaa) && !game_scale;
+	return setting && !(backend == BackendChoice::Dlss && dlaa);
+}
+
 }

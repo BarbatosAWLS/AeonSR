@@ -39,7 +39,7 @@ core is bundled, or the bundled one fails, the device of the OS stays, as before
 
 `tools\fetch_agility_sdk.ps1` fetches `D3D12Core.dll` (Microsoft.Direct3D.D3D12 1.619.x, signed by
 Microsoft, redistributable under that package's licence) into `external\D3D12Core`. The build copies
-it into `runtime\` beside the built add-on, as a release ships it, which is the first
+it beside the built add-on; a release ships it in `runtime\` beside the add-on, which is the first
 folder the device creation looks in, then the add-on's own folder, then the same two beside the game.
 
 The build does not require it: without the file, FSR 4 is refused on Windows 10 and FSR 3.1 is

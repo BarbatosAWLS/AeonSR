@@ -121,6 +121,7 @@ bool WindowHostLink::start(const std::wstring &exe, ID3D12Device *device, ID3D12
 		return refuse(reason);
 	}
 	alive_ = true;
+	window_ = reinterpret_cast<HWND>(static_cast<uintptr_t>(block_->host_window));
 	GpuClass c = GpuClass::Normal;
 	gpu_class_ = get_gpu_class(process_, &c) ? static_cast<int>(c) : -1;
 	diag_logf(DiagLevel::Info, "framegen", L"frame generation: its own window is shown by AeonSRHost.exe (pid %u), "
@@ -207,6 +208,7 @@ void WindowHostLink::stop(bool kill) noexcept
 		*h = nullptr;
 	}
 	host_pid_ = 0;
+	window_ = nullptr;
 	gpu_class_ = -1;
 	seq_ = 0;
 }

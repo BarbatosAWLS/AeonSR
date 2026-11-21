@@ -14,8 +14,10 @@
 #include "aeon_sr/framegen/frame_generation.hpp"
 #include "aeon_sr/framegen/overlay_presenter.hpp"
 #include "aeon_sr/framegen/present_sync.hpp"
+#include "aeon_sr/framegen/keep_borderless.hpp"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cwchar>
 #include <cwctype>
@@ -107,10 +109,25 @@ void on_destroy_device(reshade::api::device *device)
 		a->on_destroy_device(device);
 }
 
+#if AEONSR_FRAME_GENERATION
+thread_local SwapchainNotices t_notices;
+#endif
+
 void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
 	if (from_own_window())
 		return;
+#if AEONSR_FRAME_GENERATION
+	const reshade::api::device_api api = swapchain->get_device()->get_api();
+	const bool dxgi = api == reshade::api::device_api::d3d10 || api == reshade::api::device_api::d3d11 ||
+		api == reshade::api::device_api::d3d12;
+	IDXGISwapChain *const native = dxgi ? reinterpret_cast<IDXGISwapChain *>(static_cast<uintptr_t>(swapchain->get_native()))
+		: nullptr;
+	const bool proxied = has_reshade_proxy(native);
+	if (t_notices.on_init(proxied, resize))
+		tell_game_fullscreen(native);
+	t_notices.expect_notice(proxied);
+#endif
 	if (auto *a = app())
 		a->on_init_swapchain(swapchain, resize);
 }
@@ -132,17 +149,78 @@ bool fill_d3d9_refresh(reshade::api::device_api api, reshade::api::swapchain_des
 	return true;
 }
 
-bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *)
+#if AEONSR_FRAME_GENERATION
+bool add_vulkan_images(reshade::api::device_api api, reshade::api::swapchain_desc &desc)
+{
+	if (api != reshade::api::device_api::vulkan || desc.back_buffer.texture.format == reshade::api::format::unknown)
+		return false;
+	const App *const a = app();
+	if (a == nullptr || !a->settings().frame_generation)
+		return false;
+	const unsigned int m = a->settings().frame_generation_multiplier;
+	const uint32_t extra = m >= 2 && m <= kFrameGenerationMultiplierMax ? m - 1u : 1u;
+	const uint32_t want = std::min<uint32_t>(std::max<uint32_t>(desc.back_buffer_count, 2u) + extra, 5u);
+	if (want <= desc.back_buffer_count)
+		return false;
+	diag_logf(DiagLevel::Info, "swapchain", L"%u images asked for the Vulkan swap chain instead of %u: frame "
+		L"generation through the game's present shows each made frame in one of its own", want, desc.back_buffer_count);
+	desc.back_buffer_count = want;
+	return true;
+}
+
+bool keep_out_of_exclusive(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *hwnd)
+{
+	if (!desc.fullscreen_state || api == reshade::api::device_api::vulkan || api == reshade::api::device_api::opengl)
+		return false;
+	const App *const a = app();
+	if (a == nullptr || !keep_borderless(a->settings()))
+		return false;
+	desc.fullscreen_state = false;
+	desc.fullscreen_refresh_rate = 0.0f;
+	if (api == reshade::api::device_api::d3d9 && desc.sync_interval != UINT32_MAX && desc.sync_interval > 1)
+		desc.sync_interval = 1;
+	note_game_wants_fullscreen(static_cast<HWND>(hwnd), true);
+	t_notices.on_made_windowed();
+	make_borderless(static_cast<HWND>(hwnd));
+	diag_info("framegen", L"frame generation: the game's swap chain asked for exclusive fullscreen and is made in "
+		L"a borderless window over its monitor instead, where frame generation's own window shows over it");
+	return true;
+}
+
+bool on_set_fullscreen_state(reshade::api::swapchain *swapchain, bool fullscreen, void *)
 {
 	if (from_own_window())
 		return false;
+	const bool notice = t_notices.take_notice();
+	const reshade::api::device_api api = swapchain->get_device()->get_api();
+	const bool dxgi = api == reshade::api::device_api::d3d10 || api == reshade::api::device_api::d3d11 ||
+		api == reshade::api::device_api::d3d12;
+	const App *const a = app();
+	if (!refuse_fullscreen_request(static_cast<HWND>(swapchain->get_hwnd()), dxgi, fullscreen,
+			a != nullptr && keep_borderless(a->settings()), notice))
+		return false;
+	make_borderless(static_cast<HWND>(swapchain->get_hwnd()));
+	diag_info("framegen", L"frame generation: the game asked for exclusive fullscreen and is kept in a borderless "
+		L"window over its monitor instead");
+	return true;
+}
+#endif
+
+bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *hwnd)
+{
+	if (from_own_window())
+		return false;
+	bool changed = false;
 #if AEONSR_FRAME_GENERATION
+	t_notices.on_create();
 	if (api == reshade::api::device_api::vulkan)
 		FrameGeneration::note_vulkan_present_mode(desc.present_mode);
+	changed = add_vulkan_images(api, desc);
+	changed = keep_out_of_exclusive(api, desc, hwnd) || changed;
 #endif
 	const bool refresh = fill_d3d9_refresh(api, desc);
 	if (!request_swapchain_usage(api, desc))
-		return refresh;
+		return refresh || changed;
 	diag_info("swapchain", L"asked for transfer usage on the Vulkan swap chain, so the frame can be "
 		L"carried to the upscalers and back");
 	return true;
@@ -152,6 +230,10 @@ void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
 	if (from_own_window())
 		return;
+#if AEONSR_FRAME_GENERATION
+	if (!resize)
+		cancel_switch(static_cast<HWND>(swapchain->get_hwnd()));
+#endif
 	if (auto *a = app())
 		a->on_destroy_swapchain(swapchain, resize);
 }
@@ -326,6 +408,9 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
 	reshade::register_event<reshade::addon_event::init_device>(on_init_device);
 	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 	reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
+#if AEONSR_FRAME_GENERATION
+	reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
+#endif
 	reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
 	reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
 	reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
@@ -364,6 +449,7 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE 
 	unregister_game_render_scale();
 #if AEONSR_FRAME_GENERATION
 	present_sync::unhook();
+	cancel_switch(nullptr);
 #endif
 	destroy_app();
 	diag_set_sink(nullptr);

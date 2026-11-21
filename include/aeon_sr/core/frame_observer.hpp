@@ -20,15 +20,18 @@ struct FrameEdges {
 	uint64_t serial = 0;
 	uint32_t edges = 0, changed = 0;
 	uint32_t pixels = 0, shown = 0;
+	bool probe = false;
+	uint32_t probe_shown = 0;
 };
 
 class FrameObserverD3D12 {
 public:
 	bool begin(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
 		D3D12_RESOURCE_STATES state);
-	void end(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
+	bool end(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
 		D3D12_RESOURCE_STATES state, ID3D12Resource *mask, D3D12_RESOURCE_STATES mask_state,
-		ID3D12Resource *motion, D3D12_RESOURCE_STATES motion_state, uint64_t serial = 0);
+		ID3D12Resource *motion, D3D12_RESOURCE_STATES motion_state, uint64_t serial = 0,
+		ID3D12Resource *scene = nullptr, D3D12_RESOURCE_STATES scene_state = D3D12_RESOURCE_STATE_COMMON);
 	FrameObservation take() noexcept;
 	bool take_edges(FrameEdges *out) noexcept;
 	void release() noexcept;
@@ -38,7 +41,7 @@ public:
 private:
 	static constexpr uint32_t kReadback = 4;
 	static constexpr uint32_t kSlots = 16;
-	static constexpr uint32_t kSlotDescriptors = 7;
+	static constexpr uint32_t kSlotDescriptors = 8;
 
 	bool ensure(ID3D12Device *device, uint32_t w, uint32_t h, DXGI_FORMAT format);
 	void collect() noexcept;
@@ -53,6 +56,7 @@ private:
 	uint32_t age_[kReadback]{};
 	bool written_[kReadback]{};
 	uint64_t serial_[kReadback]{};
+	bool probe_[kReadback]{};
 	FrameEdges held_[kReadback]{};
 	uint32_t held_count_ = 0;
 	uint32_t ring_ = 0;
@@ -62,5 +66,7 @@ private:
 	bool have_prev_ = false, begun_ = false, failed_ = false;
 	FrameObservation acc_;
 };
+
+void frame_observer_warm_shaders();
 
 }

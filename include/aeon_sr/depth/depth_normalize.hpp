@@ -55,4 +55,6 @@ private:
 	uint32_t width_ = 0, height_ = 0;
 };
 
+void depth_normalize_warm();
+
 }

@@ -28,6 +28,7 @@ enum class FlightScene : uint8_t { Unknown, Depth, Size, Everything, Count };
 enum class FlightHost : uint8_t { None, Answered, Timeout, Busy, Lost, Failed, Count };
 enum class FlightBlocked : uint8_t { None, DeviceLost, NoBridge, NoBackBuffer, BridgeFailed, Count };
 enum class FlightGameJitter : uint8_t { Unmeasured, No, Yes, Count };
+enum class FlightFg : uint8_t { Off, Window, Present, PresentNone, Blocked, Count };
 enum class FlightTrigger : uint8_t {
 	JitterFlap, JitterPause, LandingLow, GameJitter, HostSlow, Failure, FrameSpike, Shutdown, Report, Count,
 };
@@ -38,6 +39,7 @@ inline constexpr uint8_t kFlightSplit = 2u;
 inline constexpr uint8_t kFlightRegistered = 4u;
 inline constexpr uint8_t kFlightAlone = 8u;
 inline constexpr uint8_t kFlightHeld = 16u;
+inline constexpr uint8_t kFlightProbe = 32u;
 
 inline constexpr float kFlightNone = std::numeric_limits<float>::quiet_NaN();
 
@@ -74,6 +76,9 @@ struct FlightRecord {
 	FlightHost host = FlightHost::None;
 	FlightGameJitter game_jitter = FlightGameJitter::Unmeasured;
 	FlightBlocked blocked = FlightBlocked::None;
+	FlightFg fg = FlightFg::Off;
+	float fg_round_ms = kFlightNone;
+	float fg_wait_ms = kFlightNone;
 };
 
 const char *flight_api_name(FlightApi a) noexcept;
@@ -83,6 +88,7 @@ const char *flight_scene_name(FlightScene s) noexcept;
 const char *flight_host_name(FlightHost h) noexcept;
 const char *flight_blocked_name(FlightBlocked b) noexcept;
 const char *flight_game_jitter_name(FlightGameJitter g) noexcept;
+const char *flight_fg_name(FlightFg f) noexcept;
 const char *flight_trigger_name(FlightTrigger t) noexcept;
 const char *flight_status_name(uint8_t status) noexcept;
 const char *flight_plan_name(uint8_t plan) noexcept;

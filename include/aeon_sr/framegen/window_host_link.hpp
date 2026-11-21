@@ -36,6 +36,7 @@ public:
 	HANDLE released() const noexcept { return released_; }
 	bool alive() const noexcept { return alive_; }
 	uint32_t host_pid() const noexcept { return host_pid_; }
+	HWND window() const noexcept { return window_; }
 	int gpu_class() const noexcept { return gpu_class_; }
 	const std::wstring &error() const noexcept { return error_; }
 
@@ -50,6 +51,7 @@ private:
 	HANDLE request_ = nullptr, response_ = nullptr, released_ = nullptr;
 	HANDLE process_ = nullptr;
 	uint32_t host_pid_ = 0;
+	HWND window_ = nullptr;
 	int gpu_class_ = -1;
 	uint64_t seq_ = 0;
 	bool alive_ = false;

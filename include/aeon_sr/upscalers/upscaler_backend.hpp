@@ -4,6 +4,7 @@
 #include "aeon_sr/core/settings.hpp"
 #include "aeon_sr/upscalers/upscaler_status.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -92,5 +93,11 @@ struct UpscalerBackend {
 	std::wstring last_error;
 	bool crashed = false;
 };
+
+inline std::atomic<int> g_neural_building{ 0 };
+inline bool neural_building() noexcept
+{
+	return g_neural_building.load(std::memory_order_acquire) != 0;
+}
 
 }

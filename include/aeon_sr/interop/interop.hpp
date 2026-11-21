@@ -63,8 +63,14 @@ public:
 
 	int queue_priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
 
-	enum class Ring : uint32_t { Frame = 0, FrameGeneration = 1, Remote = 2 };
-	static constexpr uint32_t kRings = 3;
+	enum class Ring : uint32_t { Frame = 0, FrameGeneration = 1, Remote = 2, FrameGenerationStep = 3 };
+	static constexpr uint32_t kStepRings = 4;
+	static constexpr uint32_t kRings = 3 + kStepRings;
+	static Ring step_ring(uint32_t k) noexcept
+	{
+		const uint32_t i = k < 2 ? 0u : k - 2u < kStepRings ? k - 2u : kStepRings - 1u;
+		return static_cast<Ring>(static_cast<uint32_t>(Ring::FrameGenerationStep) + i);
+	}
 	bool use_ring(Ring ring) noexcept
 	{
 		if (list_open_)
@@ -81,6 +87,8 @@ public:
 	bool wait_cpu(uint64_t value);
 	uint64_t begin_stalls() const noexcept { return begin_stalls_; }
 	double begin_stall_ms() const noexcept { return begin_stall_ms_; }
+	uint64_t stalls_epoch() const noexcept { return stalls_epoch_; }
+	bool video_memory(uint64_t *usage, uint64_t *budget) const noexcept;
 	bool drain();
 
 	std::wstring last_error;
@@ -101,6 +109,7 @@ private:
 	uint64_t last_gpu_value_ = 0;
 	uint64_t begin_stalls_ = 0;
 	double begin_stall_ms_ = 0.0;
+	uint64_t stalls_epoch_ = 0;
 	ID3D12Fence *drain_fence_ = nullptr;
 	uint64_t drain_value_ = 0;
 	bool list_open_ = false;
@@ -219,6 +228,47 @@ public:
 private:
 	std::mutex mutex_;
 	std::vector<const reshade::api::device *> devices_;
+};
+
+class FrameOwner {
+public:
+	using WindowShown = bool (*)(void *hwnd);
+	explicit FrameOwner(WindowShown shown = nullptr) noexcept;
+
+	struct Turn {
+		bool run = false;
+		const void *taken_from = nullptr;
+		bool became_owner = false;
+	};
+	Turn frame(const void *device, uint32_t thread) noexcept;
+
+	enum class Event : uint8_t {
+		Yours,
+		Other,
+		Busy,
+	};
+	Event event(const void *device, uint32_t thread, bool claim) noexcept;
+	void leave(uint32_t thread) noexcept;
+	void chain(const void *device, uint64_t id, void *hwnd, bool made) noexcept;
+	void gone(const void *device) noexcept;
+	const void *owner() const noexcept;
+	bool presents_for_work(const void *device) const noexcept;
+	uint32_t holder() const noexcept;
+
+private:
+	bool holds_a_window(const void *device) const noexcept;
+	WindowShown shown_;
+	mutable std::mutex mutex_;
+	const void *owner_ = nullptr;
+	uint32_t holder_ = 0;
+	uint32_t depth_ = 0;
+	const void *dropping_ = nullptr;
+	struct Chain {
+		const void *device;
+		uint64_t id;
+		void *hwnd;
+	};
+	std::vector<Chain> chains_;
 };
 
 DXGI_FORMAT dxgi_format_of(reshade::api::format fmt) noexcept;

@@ -275,6 +275,8 @@ struct NeuralRenderD3D12 : NeuralRenderCommon {
 
 	DXGI_FORMAT scratch_format = DXGI_FORMAT_UNKNOWN;
 	DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
+	bool chain_in_scratch = false;
+	DXGI_FORMAT chain_format(DXGI_FORMAT src_format) const;
 
 	BlitPipelineD3D12 blit;
 	uint32_t created_style = 0xFFFFFFFFu;
@@ -301,6 +303,8 @@ struct NeuralRenderD3D12 : NeuralRenderCommon {
 
 	bool ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w, uint32_t h,
 		DXGI_FORMAT color_format, DXGI_FORMAT src_format, const NeuralRenderParams &p);
+	bool feature_ready(uint32_t w, uint32_t h, DXGI_FORMAT src_format, const NeuralRenderParams &p) const;
+	bool build_feature(uint32_t w, uint32_t h, DXGI_FORMAT src_format, const NeuralRenderParams &p);
 	void destroy_feature();
 	void release_scratch();
 

@@ -1134,6 +1134,7 @@ ID3D12Resource *NeuralRenderD3D12::downscale_guide(ID3D12GraphicsCommandList *cm
 void NeuralRenderD3D12::shutdown_device()
 {
 	destroy_feature();
+	chain_in_scratch = false;
 
 	if (initialized && device != nullptr && !crashed) {
 		wait_gpu();
@@ -1166,10 +1167,58 @@ void NeuralRenderD3D12::shutdown_device()
 		status = UpscalerStatus::Idle;
 }
 
+DXGI_FORMAT NeuralRenderD3D12::chain_format(DXGI_FORMAT src_format) const
+{
+	return chain_in_scratch ? resolve_scratch_format(src_format) : DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
+bool NeuralRenderD3D12::feature_ready(uint32_t w, uint32_t h, DXGI_FORMAT src_format,
+	const NeuralRenderParams &np) const
+{
+	uint32_t mw = 0, mh = 0;
+	if (!warped_size_for(w, h, np.model_scale, np.mode, &mw, &mh))
+		model_size_for(w, h, np.model_scale, &mw, &mh);
+	return feature_handles[0] != nullptr && width == w && height == h && output_tex != nullptr &&
+		scratch_format == chain_format(src_format) && source_format == src_format &&
+		requested_passes == clamp_neural_passes(np.passes) && created_style == clamp_neural_style(np.style) &&
+		created_model == neural_model_to_ask(runtime_identity.models, np.render_preset) &&
+		model_width == mw && model_height == mh && created_scale == np.model_scale;
+}
+
+bool NeuralRenderD3D12::build_feature(uint32_t w, uint32_t h, DXGI_FORMAT src_format,
+	const NeuralRenderParams &np)
+{
+	if (crashed || feature_unsupported || queue == nullptr)
+		return false;
+	LARGE_INTEGER freq{}, begin{}, end{};
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&begin);
+	DXGI_FORMAT fmt = chain_format(src_format);
+	bool ok = ensure_feature(nullptr, w, h, fmt, src_format, np);
+	if (!ok && !crashed) {
+		const DXGI_FORMAT scratch = resolve_scratch_format(src_format);
+		if (scratch != fmt) {
+			diag_warn("neural", L"RGBA16F pass chain refused - falling back to the frame scratch format");
+			fmt = scratch;
+			ok = ensure_feature(nullptr, w, h, fmt, src_format, np);
+			chain_in_scratch = ok;
+		}
+	}
+	if (!ok)
+		return false;
+	blit.prepare(device, { fmt, src_format });
+	QueryPerformanceCounter(&end);
+	diag_logf(DiagLevel::Info, "neural", L"feature %ux%u, model %ux%u, %u pass(es), built in %.0f ms on a thread of "
+		L"its own, frames kept going", w, h, model_width, model_height, created_passes, freq.QuadPart != 0
+			? 1000.0 * static_cast<double>(end.QuadPart - begin.QuadPart) / static_cast<double>(freq.QuadPart)
+			: 0.0);
+	return true;
+}
+
 bool NeuralRenderD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w, uint32_t h,
 	DXGI_FORMAT color_format, DXGI_FORMAT src_format, const NeuralRenderParams &np)
 {
-	if (!initialized || crashed || feature_unsupported || cmd == nullptr || device == nullptr)
+	if (!initialized || crashed || feature_unsupported || device == nullptr || (cmd == nullptr && queue == nullptr))
 		return false;
 	if (params == nullptr)
 		return false;
@@ -1208,6 +1257,10 @@ bool NeuralRenderD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t 
 	const bool own_list = create_cmd != nullptr;
 	if (!own_list)
 		create_cmd = cmd;
+	if (create_cmd == nullptr) {
+		fail(UpscalerStatus::InitFailed, L"CreateFeature: no command list to record it on");
+		return false;
+	}
 
 	unsigned long seh = 0;
 	long cr = 0;
@@ -1323,7 +1376,7 @@ bool NeuralRenderD3D12::run(ID3D12GraphicsCommandList *cmd,
 
 	const DXGI_FORMAT scratch = resolve_scratch_format(desc.Format);
 
-	DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	DXGI_FORMAT fmt = chain_format(desc.Format);
 	if (!ensure_feature(cmd, w, h, fmt, desc.Format, np)) {
 		if (fmt == scratch || crashed)
 			return false;
@@ -1332,6 +1385,7 @@ bool NeuralRenderD3D12::run(ID3D12GraphicsCommandList *cmd,
 		fmt = scratch;
 		if (!ensure_feature(cmd, w, h, fmt, desc.Format, np))
 			return false;
+		chain_in_scratch = true;
 	}
 	if (color_copy == nullptr || output_tex == nullptr)
 		return false;

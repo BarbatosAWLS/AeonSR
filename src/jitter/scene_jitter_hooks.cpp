@@ -31,6 +31,19 @@ using namespace reshade::api;
 
 SceneJitter g_scene_jitter;
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+struct alignas(64) LiveStores {
+	std::atomic<int64_t> contexts{ 0 };
+	std::atomic<int64_t> lists{ 0 };
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+LiveStores g_live;
+
 struct JitterCounted {
 	std::mutex lock;
 	JitterDrawCounts counts;
@@ -110,13 +123,21 @@ struct __declspec(uuid("3f0c9a7e-4d2b-4a61-9e55-8b1f6d2c7a40")) JitterContextDat
 	uint64_t first_played = 0;
 	JitterDrawCounts recorded;
 
+	JitterContextData() noexcept { g_live.contexts.fetch_add(1, std::memory_order_relaxed); }
 	~JitterContextData();
+	JitterContextData(const JitterContextData &) = delete;
+	JitterContextData &operator=(const JitterContextData &) = delete;
 };
 
 struct __declspec(uuid("9b6a2f41-5c3e-4d7a-8f10-2e4b6c8d1a93")) JitterCommandListData : JitterCounted {
 	bool played = false;
 	uint64_t first_played = 0;
 	LayerNotes layer_notes;
+
+	JitterCommandListData() noexcept { g_live.lists.fetch_add(1, std::memory_order_relaxed); }
+	~JitterCommandListData() { g_live.lists.fetch_sub(1, std::memory_order_relaxed); }
+	JitterCommandListData(const JitterCommandListData &) = delete;
+	JitterCommandListData &operator=(const JitterCommandListData &) = delete;
 };
 
 static_assert(sizeof(JitterViewport) == sizeof(viewport), "JitterViewport has to stay reshade::api::viewport");
@@ -328,6 +349,7 @@ JitterContextData::~JitterContextData()
 		if (regrid[i].original != nullptr)
 			regrid[i].original->Release();
 	g_regrid_live.fetch_sub(regrid_count, std::memory_order_relaxed);
+	g_live.contexts.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void note_depth_written(command_list *cmd, uint64_t resource)
@@ -2537,6 +2559,33 @@ void register_scene_jitter_hooks() noexcept
 	reshade::register_event<reshade::addon_event::bind_pipeline_states>(jitter_events::bind_pipeline_states);
 	reshade::register_event<reshade::addon_event::init_pipeline>(jitter_events::init_pipeline);
 	reshade::register_event<reshade::addon_event::destroy_pipeline>(jitter_events::destroy_pipeline);
+}
+
+SceneJitterLoad scene_jitter_load() noexcept
+{
+	SceneJitterLoad l;
+	{
+		const std::shared_lock<std::shared_mutex> lock(g_facts_lock);
+		l.pipelines = g_facts.size();
+	}
+	{
+		const std::shared_lock<std::shared_mutex> lock(g_untested_lock);
+		l.untested = g_untested.size();
+	}
+	{
+		const std::lock_guard<std::mutex> lock(jitter_events::g_vertex_classes_lock);
+		l.vertex_classes = jitter_events::g_vertex_classes.size();
+	}
+	{
+		const std::lock_guard<std::mutex> lock(jitter_events::g_wterms_lock);
+		l.w_terms = jitter_events::g_wterms.size();
+	}
+	l.constant_reads = constant_reads().size();
+	const int64_t contexts = g_live.contexts.load(std::memory_order_relaxed);
+	const int64_t lists = g_live.lists.load(std::memory_order_relaxed);
+	l.contexts = contexts > 0 ? static_cast<uint64_t>(contexts) : 0u;
+	l.lists = lists > 0 ? static_cast<uint64_t>(lists) : 0u;
+	return l;
 }
 
 JitterFrame take_scene_jitter_frame(reshade::api::effect_runtime *runtime) noexcept

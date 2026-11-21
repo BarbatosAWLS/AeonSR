@@ -7,6 +7,7 @@
 #include "aeon_sr/interop/blit_d3d12.hpp"
 
 #include <algorithm>
+#include <cwchar>
 
 namespace aeon_sr {
 
@@ -56,13 +57,19 @@ void FrameGenStage::release() noexcept
 	interp_.release();
 	flow_.release();
 	blit_.release();
-	if (history_ != nullptr) {
-		history_->Release();
-		history_ = nullptr;
-	}
+	release_history();
 	w_ = h_ = 0;
 	format_ = DXGI_FORMAT_UNKNOWN;
-	have_history_ = false;
+}
+
+void FrameGenStage::release_history() noexcept
+{
+	for (ID3D12Resource **r : { &history_, &prev_history_ }) {
+		if (*r != nullptr)
+			(*r)->Release();
+		*r = nullptr;
+	}
+	have_history_ = have_prev_ = false;
 }
 
 void FrameGenStage::release_vendors() noexcept
@@ -100,7 +107,7 @@ void FrameGenStage::settings_changed(uint64_t key) noexcept
 
 void FrameGenStage::reset() noexcept
 {
-	have_history_ = false;
+	have_history_ = have_prev_ = false;
 	vendor_reset_ = true;
 	if (vendor_ != nullptr)
 		vendor_->reset();
@@ -121,12 +128,9 @@ bool FrameGenStage::ensure_history(ID3D12Device *device, const D3D12_RESOURCE_DE
 	const uint32_t w = static_cast<uint32_t>(d.Width), h = d.Height;
 	if (history_ != nullptr && w == w_ && h == h_ && format_family(d.Format) == format_family(format_))
 		return true;
-	if (history_ != nullptr) {
-		history_->Release();
-		history_ = nullptr;
-	}
-	have_history_ = false;
+	release_history();
 	if (!create_tex12(device, w, h, format_family(d.Format), false, D3D12_RESOURCE_STATE_COPY_DEST, &history_)) {
+		release_history();
 		if (note != nullptr)
 			*note = L"frame generation: the copy of the frame before could not be made";
 		return false;
@@ -162,6 +166,9 @@ FrameGenResult FrameGenStage::record(ID3D12Device *device, ID3D12GraphicsCommand
 
 	bool building = false;
 	std::wstring why;
+	last_filled_ = false;
+	if (use_vendor)
+		interp_.prepare(device);
 	const bool interp_ok = !use_vendor && interp_.ensure(device, w, h, cd.Format, &building, &why);
 	if (!use_vendor && !interp_ok && !building) {
 		if (note != nullptr)
@@ -174,11 +181,7 @@ FrameGenResult FrameGenStage::record(ID3D12Device *device, ID3D12GraphicsCommand
 		if (flow_device_ != nullptr) {
 			flow_.release();
 			blit_.release();
-			if (history_ != nullptr) {
-				history_->Release();
-				history_ = nullptr;
-			}
-			have_history_ = false;
+			release_history();
 		}
 		flow_device_ = device;
 		flow_state_.store(kFlowIdle, std::memory_order_release);
@@ -229,28 +232,61 @@ FrameGenResult FrameGenStage::record(ID3D12Device *device, ID3D12GraphicsCommand
 	};
 	stamp(0);
 	FrameGenResult result = FrameGenResult::Warming;
-	if (building)
+	if (building && !use_vendor)
 		result = FrameGenResult::Building;
 	ID3D12Resource *out = nullptr;
 	D3D12_RESOURCE_STATES out_state = D3D12_RESOURCE_STATE_COMMON;
 	const D3D12_RESOURCE_DESC dd = dst->GetDesc();
 	bool out_copies = false;
+	vendor_made_ = 0;
+	++frame_id_;
+	last_format_ = cd.Format;
+	record_vendor_ = use_vendor;
+	uint32_t steps = std::clamp(o.steps, 2u, kVendorMaxGenerated + 1u);
 	if (use_vendor) {
-		if (!ensure_vendor_textures(device, cmd, w, h, vendor_format_for(device, cd.Format), note)) {
+		const uint32_t count = std::min(steps - 1, std::max(1u, vendor_->max_generated()));
+		bool textures = ensure_vendor_textures(device, cmd, w, h, vendor_format_for(device, cd.Format), note);
+		bool short_textures = false;
+		for (uint32_t i = 1; textures && i < count; ++i)
+			if (vendor_more_[i - 1] == nullptr &&
+				!create_tex12(device, w, h, vendor_format_, true, VendorFrameGenerator::kOutputState, &vendor_more_[i - 1])) {
+				vendor_more_[i - 1] = nullptr;
+				short_textures = true;
+				break;
+			}
+		if (!short_textures)
+			steps = count + 1;
+		if (short_textures) {
+			vendor_reset_ = true;
+			if (have_history_)
+				++memory_fills_;
+		} else if (!textures) {
 			result = FrameGenResult::Failed;
+			vendor_textures_failed(o.generator);
 		} else {
-			ID3D12Resource *const one[1] = { vendor_out_ };
-			if (record_vendor(device, cmd, color, color_state, one, 1, o, &result, note) == VendorTurn::ListLost) {
+			ID3D12Resource *outs[kVendorMaxGenerated] = { vendor_out_ };
+			for (uint32_t i = 1; i < count; ++i)
+				outs[i] = vendor_more_[i - 1];
+			if (record_vendor(device, cmd, color, color_state, outs, count, o, &result, note) == VendorTurn::ListLost) {
 				reset();
 				return FrameGenResult::Failed;
 			}
+			if (result == FrameGenResult::Generated)
+				vendor_made_ = count;
 		}
 		if (result == FrameGenResult::Generated) {
 			out = vendor_out_;
 			out_state = VendorFrameGenerator::kOutputState;
 			out_copies = format_family(vendor_format_) == format_family(dd.Format);
 		}
-	} else if (interp_ok && have_history_ && flow_.has_history()) {
+	}
+	const bool fill = use_vendor && result != FrameGenResult::Generated;
+	bool fill_ok = false;
+	if (fill && have_history_ && flow_.has_history()) {
+		bool fill_building = false;
+		fill_ok = interp_.ensure(device, w, h, cd.Format, &fill_building, &why);
+	}
+	if (((!use_vendor && interp_ok) || fill_ok) && have_history_ && flow_.has_history()) {
 		FrameInterpolatorD3D12::Inputs in;
 		in.previous = history_;
 		in.previous_state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -260,7 +296,7 @@ FrameGenResult FrameGenStage::record(ID3D12Device *device, ID3D12GraphicsCommand
 		in.motion_state = OpticalFlowD3D12::kPublishedState;
 		in.global_flow = flow_.global_flow();
 		in.global_state = OpticalFlowD3D12::kPublishedState;
-		in.t = o.t;
+		in.t = steps > 2 ? 1.0f / static_cast<float>(steps) : o.t;
 		if (interp_.record(cmd, in, &why)) {
 			result = FrameGenResult::Generated;
 			out = interp_.output();
@@ -274,34 +310,111 @@ FrameGenResult FrameGenStage::record(ID3D12Device *device, ID3D12GraphicsCommand
 	}
 
 	stamp(1);
+	if (steps > 2 && prev_history_ == nullptr &&
+		!create_tex12(device, w_, h_, format_family(format_), false, D3D12_RESOURCE_STATE_COPY_DEST, &prev_history_)) {
+		prev_history_ = nullptr;
+		steps = 2;
+	}
+	if (prev_history_ != nullptr) {
+		std::swap(history_, prev_history_);
+		have_prev_ = have_history_;
+	} else {
+		have_prev_ = false;
+	}
 	barrier12(cmd, color, color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	cmd->CopyResource(history_, color);
 	barrier12(cmd, color, D3D12_RESOURCE_STATE_COPY_SOURCE, color_state);
 	have_history_ = true;
+	steps_ = steps;
 
-	if (result == FrameGenResult::Generated && out != nullptr) {
-		if (out_copies) {
-			barrier12(cmd, out, out_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-			barrier12(cmd, dst, dst_state, D3D12_RESOURCE_STATE_COPY_DEST);
-			cmd->CopyResource(dst, out);
-			barrier12(cmd, dst, D3D12_RESOURCE_STATE_COPY_DEST, dst_state);
-			barrier12(cmd, out, D3D12_RESOURCE_STATE_COPY_SOURCE, out_state);
-		} else {
-			barrier12(cmd, out, out_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-			barrier12(cmd, dst, dst_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-			const bool drawn = blit_.draw_fullscreen(device, cmd, out, dst, interpolator_read_format(dd.Format),
-				static_cast<uint32_t>(dd.Width), dd.Height);
-			barrier12(cmd, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, dst_state);
-			barrier12(cmd, out, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, out_state);
-			if (!drawn) {
-				if (note != nullptr)
-					*note = L"frame generation: the generated frame could not be drawn into this frame's format";
-				result = FrameGenResult::Failed;
-			}
-		}
+	if (result == FrameGenResult::Generated && out != nullptr &&
+		!write_out(device, cmd, out, out_state, out_copies, dst, dst_state, note))
+		result = FrameGenResult::Failed;
+	if (fill && result == FrameGenResult::Generated) {
+		++own_fills_;
+		last_filled_ = true;
+		filled_for_ = o.generator;
+		active_ = FrameGenerator::AeonSR;
 	}
 	stamp(2);
 	return result;
+}
+
+bool FrameGenStage::write_out(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *out,
+	D3D12_RESOURCE_STATES out_state, bool copies, ID3D12Resource *dst, D3D12_RESOURCE_STATES dst_state,
+	std::wstring *note)
+{
+	const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+	if (copies) {
+		barrier12(cmd, out, out_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		barrier12(cmd, dst, dst_state, D3D12_RESOURCE_STATE_COPY_DEST);
+		cmd->CopyResource(dst, out);
+		barrier12(cmd, dst, D3D12_RESOURCE_STATE_COPY_DEST, dst_state);
+		barrier12(cmd, out, D3D12_RESOURCE_STATE_COPY_SOURCE, out_state);
+		return true;
+	}
+	barrier12(cmd, out, out_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	barrier12(cmd, dst, dst_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	const bool drawn = blit_.draw_fullscreen(device, cmd, out, dst, interpolator_read_format(dd.Format),
+		static_cast<uint32_t>(dd.Width), dd.Height);
+	barrier12(cmd, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, dst_state);
+	barrier12(cmd, out, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, out_state);
+	if (!drawn && note != nullptr)
+		*note = L"frame generation: the generated frame could not be drawn into this frame's format";
+	return drawn;
+}
+
+FrameGenResult FrameGenStage::record_step(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, uint32_t k,
+	ID3D12Resource *dst, D3D12_RESOURCE_STATES dst_state, const FrameGenOptions &o, std::wstring *note)
+{
+	const uint32_t steps = std::min(steps_, std::clamp(o.steps, 2u, kVendorMaxGenerated + 1u));
+	if (device == nullptr || cmd == nullptr || dst == nullptr || k < 2 || k >= steps || !have_history_)
+		return FrameGenResult::Failed;
+	const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+	ID3D12Resource *out = nullptr;
+	D3D12_RESOURCE_STATES out_state = D3D12_RESOURCE_STATE_COMMON;
+	bool copies = false;
+	std::wstring why;
+	const bool vendor_run = record_vendor_ && o.generator != FrameGenerator::AeonSR;
+	if (vendor_run && vendor_made_ >= k) {
+		out = vendor_more_[k - 2];
+		out_state = VendorFrameGenerator::kOutputState;
+		copies = format_family(vendor_format_) == format_family(dd.Format);
+	} else {
+		if (!have_prev_ || !flow_.has_history())
+			return FrameGenResult::Warming;
+		bool building = false;
+		if (!interp_.ensure(device, w_, h_, last_format_, &building, &why))
+			return building ? FrameGenResult::Building : FrameGenResult::Failed;
+		FrameInterpolatorD3D12::Inputs in;
+		in.previous = prev_history_;
+		in.previous_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		in.current = history_;
+		in.current_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		in.motion = flow_.motion();
+		in.motion_state = OpticalFlowD3D12::kPublishedState;
+		in.global_flow = flow_.global_flow();
+		in.global_state = OpticalFlowD3D12::kPublishedState;
+		in.t = static_cast<float>(k) / static_cast<float>(steps);
+		in.previous_id = frame_id_ * 2 - 1;
+		in.current_id = frame_id_ * 2;
+		if (!interp_.record(cmd, in, &why)) {
+			if (note != nullptr)
+				*note = why;
+			return FrameGenResult::Failed;
+		}
+		out = interp_.output();
+		out_state = FrameInterpolatorD3D12::kOutputState;
+		copies = interp_.copies_into(dd.Format);
+		if (vendor_run) {
+			++own_fills_;
+			last_filled_ = true;
+			filled_for_ = o.generator;
+			active_ = FrameGenerator::AeonSR;
+		}
+	}
+	return write_out(device, cmd, out, out_state, copies, dst, dst_state, note) ? FrameGenResult::Generated
+		: FrameGenResult::Failed;
 }
 
 FrameGenResult FrameGenStage::record_feed(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *color,
@@ -378,23 +491,19 @@ FrameGenResult FrameGenStage::record_feed(ID3D12Device *device, ID3D12GraphicsCo
 	copy(feed.global, flow_.global_flow(), OpticalFlowD3D12::kPublishedState);
 
 	last_made_ = 0;
+	last_filled_ = false;
 	age_retired();
 	const bool use_vendor = select_generator(o);
-	const uint32_t want = std::min(o.made, feed.made_count);
+	const bool short_textures = use_vendor && o.made > 0 && feed.made_count < o.made;
+	const uint32_t want = short_textures ? 0u : o.made;
+	if (short_textures && flow_.has_history()) {
+		vendor_reset_ = true;
+		++memory_fills_;
+	}
 	const DXGI_FORMAT vf = use_vendor && want > 0 ? vendor_format_for(device, cd.Format) : DXGI_FORMAT_UNKNOWN;
 	if (use_vendor && want > 0 && flow_.has_history() &&
 		(vf != feed.made_format || !ensure_vendor_textures(device, cmd, w, h, vf, nullptr, false))) {
-		vendor_reset_ = true;
-		if (++vendor_failures_ >= kVendorFailures) {
-			vendor_failures_ = 0;
-			unavailable_kind_ = o.generator;
-			vendor_unavailable_ = true;
-			fallback_note_ = diag_widen(frame_generator_label(o.generator)) +
-				L" frame generation: its textures could not be made (out of video memory?); AeonSR's generator is used";
-			diag_logf(DiagLevel::Warn, "framegen", L"%ls", fallback_note_.c_str());
-			retire_vendor();
-			active_ = FrameGenerator::AeonSR;
-		}
+		vendor_textures_failed(o.generator);
 	} else if (use_vendor && want > 0 && flow_.has_history()) {
 		const uint32_t count = std::min(want, vendor_->max_generated());
 		for (uint32_t i = 0; i < count; ++i)
@@ -411,6 +520,11 @@ FrameGenResult FrameGenStage::record_feed(ID3D12Device *device, ID3D12GraphicsCo
 			last_made_ = count;
 	} else if (use_vendor) {
 		vendor_reset_ = true;
+	}
+	if (use_vendor && o.made > 0 && flow_.has_history() && last_made_ == 0 && active_ == o.generator) {
+		last_filled_ = true;
+		filled_for_ = o.generator;
+		active_ = FrameGenerator::AeonSR;
 	}
 	return flow_.has_history() ? FrameGenResult::Generated : FrameGenResult::Warming;
 }
@@ -447,6 +561,21 @@ bool FrameGenStage::select_generator(const FrameGenOptions &o)
 	return use_vendor;
 }
 
+void FrameGenStage::vendor_textures_failed(FrameGenerator g)
+{
+	vendor_reset_ = true;
+	if (++vendor_failures_ >= kVendorFailures) {
+		vendor_failures_ = 0;
+		unavailable_kind_ = g;
+		vendor_unavailable_ = true;
+		fallback_note_ = diag_widen(frame_generator_label(g)) +
+			L" frame generation: its textures could not be made (out of video memory?); AeonSR's generator is used";
+		diag_logf(DiagLevel::Warn, "framegen", L"%ls", fallback_note_.c_str());
+		retire_vendor();
+		active_ = FrameGenerator::AeonSR;
+	}
+}
+
 void FrameGenStage::retire_vendor() noexcept
 {
 	if (vendor_ == nullptr)
@@ -481,6 +610,16 @@ void FrameGenStage::release_vendor_textures(bool deferred) noexcept
 		}
 		*r = nullptr;
 	}
+	for (ID3D12Resource *&r : vendor_more_) {
+		if (r != nullptr) {
+			if (deferred)
+				retired_textures_.push_back(RetiredTexture{ r, 0 });
+			else
+				r->Release();
+		}
+		r = nullptr;
+	}
+	vendor_made_ = 0;
 	if (vendor_rtv_ != nullptr)
 		vendor_rtv_->Release();
 	vendor_rtv_ = nullptr;
@@ -550,6 +689,17 @@ FrameGenStage::VendorTurn FrameGenStage::record_vendor(ID3D12Device *device, ID3
 			if (note != nullptr)
 				*note = L"frame generation: the frame could not be drawn into the vendor generator's format";
 			*result = FrameGenResult::Failed;
+			vendor_reset_ = true;
+			if (++vendor_failures_ >= kVendorFailures) {
+				vendor_failures_ = 0;
+				unavailable_kind_ = o.generator;
+				vendor_unavailable_ = true;
+				fallback_note_ = diag_widen(frame_generator_label(o.generator)) +
+					L" frame generation: the frame could not be drawn into its format (every frame); AeonSR's generator is used";
+				diag_logf(DiagLevel::Warn, "framegen", L"%ls", fallback_note_.c_str());
+				retire_vendor();
+				*result = FrameGenResult::Warming;
+			}
 			return VendorTurn::Done;
 		}
 	}
@@ -575,7 +725,20 @@ FrameGenStage::VendorTurn FrameGenStage::record_vendor(ID3D12Device *device, ID3
 	f.frame_ms = o.frame_ms;
 	f.window = o.window;
 	std::wstring why;
-	const VendorStep step = vendor_->record(f, &why);
+	if (!stall_read_) {
+		stall_read_ = true;
+		wchar_t v[64] = {};
+		if (GetEnvironmentVariableW(L"AEONSR_FG_VENDOR_STALL", v, 64) != 0) {
+			unsigned long long from = 0, count = 0;
+			if (swscanf_s(v, L"%llu,%llu", &from, &count) == 2) {
+				stall_from_ = from;
+				stall_count_ = count;
+			}
+		}
+	}
+	const uint64_t n = vendor_records_++;
+	const bool stalled = stall_count_ > 0 && n >= stall_from_ && n - stall_from_ < stall_count_;
+	const VendorStep step = stalled ? VendorStep::Building : vendor_->record(f, &why);
 	vendor_reset_ = false;
 	if (step != VendorStep::Failed && step != VendorStep::ListLost)
 		vendor_failures_ = 0;

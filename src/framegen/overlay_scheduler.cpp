@@ -177,7 +177,9 @@ double OverlayPace::plan(double now_ms, double vblank_ms, double period_ms, doub
 
 void OverlayScheduler::reset() noexcept
 {
+	const bool queue = queue_;
 	*this = OverlayScheduler{};
+	queue_ = queue;
 }
 
 double OverlayScheduler::interval_stat(bool p90) const noexcept
@@ -307,8 +309,71 @@ double OverlayScheduler::due_at(double at, double display_ms, double period_ms, 
 	return display_ms + static_cast<double>(kPlanAhead) * period_ms;
 }
 
+uint32_t OverlayScheduler::unshown() const noexcept
+{
+	uint32_t n = 0;
+	for (const Real &r : reals_)
+		n += r.shown ? 0u : 1u;
+	return n;
+}
+
+OverlayChoice OverlayScheduler::choose_queue(double display_ms) noexcept
+{
+	OverlayChoice c;
+	size_t u = 0;
+	while (u < reals_.size() && reals_[u].shown)
+		++u;
+	if (u == reals_.size()) {
+		if (!reals_.empty()) {
+			c.kind = OverlayChoice::Kind::Hold;
+			++held_;
+		}
+		return c;
+	}
+	Real &b = reals_[u];
+	const double median = interval_stat(false);
+	if (u > 0 && b.pairs && b.steps >= 2 && b.at > reals_[u - 1].at &&
+		(median <= 0.0 || b.at - reals_[u - 1].at < kHitch * median)) {
+		const Real &a = reals_[u - 1];
+		if (q_of_ != b.id) {
+			q_of_ = b.id;
+			q_index_ = 0;
+		}
+		const uint32_t end = b.vendor ? std::min(b.made + 1u, b.steps) : b.steps;
+		if (q_index_ + 1u < end) {
+			++q_index_;
+			c.kind = OverlayChoice::Kind::Generated;
+			c.a = a.id;
+			c.b = b.id;
+			c.index = q_index_;
+			c.made = b.vendor;
+			c.t = static_cast<float>(static_cast<double>(q_index_) / b.steps);
+			c.content_ms = a.at + static_cast<double>(c.t) * (b.at - a.at);
+			last_index_ = q_index_;
+			last_index_of_ = b.id;
+			latency_ = display_ms - c.content_ms;
+			++generated_;
+			return c;
+		}
+	}
+	b.shown = true;
+	b.shown_at = display_ms;
+	++reals_shown_;
+	c.kind = OverlayChoice::Kind::Real;
+	c.b = b.id;
+	c.content_ms = b.at;
+	c.held_ms = std::max(0.0, display_ms - b.usable);
+	latency_ = display_ms - b.at;
+	return c;
+}
+
 OverlayChoice OverlayScheduler::choose(double display_ms, double period_ms) noexcept
 {
+	if (queue_) {
+		last_display_ = display_ms;
+		last_period_ = period_ms;
+		return choose_queue(display_ms);
+	}
 	OverlayChoice c;
 	skips_ = (skips_ << 1) |
 		(last_display_ > 0.0 && display_ms - last_display_ > 1.5 * last_period_ ? 1u : 0u);

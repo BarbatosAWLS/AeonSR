@@ -66,7 +66,7 @@ void append_settings(std::wstring &out, const Settings &s)
 	out += wformat(L"  upscale_effects=%hs  jitter=%hs  mv_probe=%hs\n",
 		bool_label(s.upscale_effects), bool_label(s.spatial_jitter), bool_label(s.mv_probe));
 	out += wformat(L"  vsr_input_format=%u  fsr_provider=%hs  optiscaler_upscale=%hs\n", s.vsr_input_format,
-		s.fsr_provider.empty() ? "auto" : s.fsr_provider.c_str(), bool_label(s.optiscaler_upscale));
+		s.fsr_provider.empty() ? "default" : s.fsr_provider.c_str(), bool_label(s.optiscaler_upscale));
 	static const wchar_t *const kModeNames[kNeuralModeCount] = {
 		L"quality", L"balanced", L"performance", L"ultra performance" };
 	const std::wstring mode = kModeNames[clamp_neural_mode(s.neural_mode)];

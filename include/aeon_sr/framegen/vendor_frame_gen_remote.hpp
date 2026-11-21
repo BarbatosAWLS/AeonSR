@@ -19,6 +19,8 @@ std::wstring vendor_frame_gen_host_path();
 
 VendorStep vendor_step_from_host(uint32_t step) noexcept;
 
+uint32_t vendor_host_handshake_ms(FrameGenerator kind) noexcept;
+
 class RemoteVendorFrameGenerator final : public VendorFrameGenerator {
 public:
 	RemoteVendorFrameGenerator(FrameGenerator kind, std::wstring host_exe);
@@ -70,6 +72,7 @@ private:
 	fg_host::Block *block_ = nullptr;
 	HANDLE request_ = nullptr, response_ = nullptr, process_ = nullptr;
 	std::thread starter_;
+	HANDLE cancel_ = nullptr;
 	std::atomic<bool> starting_{ false };
 	std::atomic<bool> alive_{ false };
 	std::atomic<uint32_t> host_pid_{ 0 };

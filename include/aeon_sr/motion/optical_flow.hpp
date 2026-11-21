@@ -40,6 +40,12 @@ public:
 	}
 	bool wait_for_camera_model();
 
+	bool async_kernels = false;
+	bool kernels_building() const noexcept
+	{
+		return matcher_state_.load(std::memory_order_acquire) == kModelBuilding;
+	}
+
 	uint32_t texture_retry_ms = 5000;
 	uint32_t fail_textures_for_test = 0;
 	uint32_t fail_model_textures_for_test = 0;
@@ -64,6 +70,16 @@ public:
 
 	void set_colour_space(uint32_t colour_space) noexcept { colour_space_ = colour_space; }
 
+	void set_depth_from_motion(bool on) noexcept
+	{
+		if (!on)
+			dfm_valid_ = false;
+		dfm_on_ = on;
+	}
+	ID3D12Resource *estimated_depth() const noexcept { return dfm_valid_ ? dfm_depth_.res : nullptr; }
+	ID3D12Resource *depth_from_motion_epipole_for_test() const noexcept { return dfm_epi_[dfm_epi_cur_].res; }
+	ID3D12Resource *depth_from_motion_accum_for_test() const noexcept { return dfm_acc_.res; }
+
 	void reset_history() noexcept
 	{
 		frames_ = 0;
@@ -71,6 +87,7 @@ public:
 		prev_jitter_y_ = 0.0f;
 		skipped_ = 0;
 		model_cold_ = true;
+		dfm_valid_ = false;
 	}
 
 	void release();
@@ -86,6 +103,23 @@ public:
 	ID3D12Resource *published_camera() const noexcept { return theta_pub_.res; }
 	ID3D12Resource *model_weight() const noexcept { return alpha_q_.res; }
 	bool camera_model_ran() const noexcept { return model_ran_; }
+	ID3D12Resource *matcher_for_test(D3D12_RESOURCE_STATES *state) const noexcept
+	{
+		*state = dense_[1].state;
+		return dense_[1].res;
+	}
+	ID3D12Resource *seed_for_test(D3D12_RESOURCE_STATES *state) const noexcept
+	{
+		*state = seed_.state;
+		return seed_.res;
+	}
+	ID3D12Resource *top_for_test(D3D12_RESOURCE_STATES *state, uint32_t *w, uint32_t *h) const noexcept
+	{
+		*state = l4_.state;
+		*w = l4_.w;
+		*h = l4_.h;
+		return l4_.res;
+	}
 	static constexpr uint32_t kLandingPeriod = 32;
 	bool landing(float out[4]) noexcept;
 	void reset_landing() noexcept
@@ -121,8 +155,9 @@ private:
 
 	enum Shader : uint32_t {
 		kLuma, kDownsample, kCoarseTop, kCoarse, kMedian, kRefine,
-		kGlobal, kConfidence, kExport, kCopyFlow,
-		kStructure, kModelTerms, kModelReduce, kModelSolve, kDecision, kFuse, kPhotoTerms, kThetaPublish, kShaderCount
+		kGlobal, kConfidence, kExport, kCopyFlow, kSeed,
+		kStructure, kModelTerms, kModelReduce, kModelSolve, kDecision, kFuse, kPhotoTerms, kThetaPublish,
+		kDfmEpipole, kDfmMeasure, kDfmWarp, kShaderCount
 	};
 	static constexpr uint32_t kFirstModelShader = kStructure;
 
@@ -166,6 +201,7 @@ private:
 	void level(ID3D12GraphicsCommandList *cmd, Tex &parent, Tex &a, Tex &b,
 		uint32_t mip1, uint32_t mip2, uint32_t first);
 	void record_camera_model(ID3D12GraphicsCommandList *cmd, const Constants &base);
+	void record_depth_from_motion(ID3D12GraphicsCommandList *cmd, const Constants &base, bool measure);
 
 	ID3D12Device *device_ = nullptr;
 	ID3D12RootSignature *root_ = nullptr;
@@ -178,11 +214,16 @@ private:
 	Tex luma_[2];
 	Tex l4_, l3_[2], l2_[2], l1_[2], l0_[2], dense_[2], dense_m_;
 	Tex prev_flow_, global_, conf_quarter_, prev_conf_;
+	Tex seed_;
 	Tex motion_, confidence_;
 	Tex struct_q_, partials_, sums_, theta_[2], alpha_q_;
 	Tex theta_pub_;
 	Tex kept_motion_;
 	Tex along_q_;
+	Tex dfm_epi_[2], dfm_acc_, dfm_depth_;
+	uint32_t dfm_epi_cur_ = 0;
+	bool dfm_on_ = false;
+	bool dfm_valid_ = false;
 	bool model_cold_ = true;
 	bool model_ran_ = false;
 	bool model_textures_ = false;
@@ -197,6 +238,11 @@ private:
 	std::thread model_builder_;
 	std::wstring model_build_error_;
 	void build_model_pipelines();
+	std::atomic<int> matcher_state_{ kModelNone };
+	std::wstring matcher_error_;
+	bool build_matcher_pipelines(std::wstring *first_error);
+	bool matcher_ready(std::wstring *error);
+	void start_model_builder(bool with_matcher);
 
 	ID3D12Device *textures_failed_on_ = nullptr;
 	uint32_t textures_failed_w_ = 0, textures_failed_h_ = 0;

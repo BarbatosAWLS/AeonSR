@@ -43,6 +43,7 @@ public:
 		std::wstring fsr_provider_version;
 		std::string neural_runtime_version, neural_runtime_sha256, neural_runtime_kernels, neural_runtime_cards;
 		std::wstring neural_runtime_file, neural_capture_status;
+		std::vector<uint32_t> neural_models;
 	};
 	struct Request {
 		const FrameInputs *inputs = nullptr;
@@ -77,6 +78,10 @@ public:
 	};
 
 	bool start(EngineDevice &engine, HMODULE module, reshade::api::device_api game_api);
+	bool begin_start(EngineDevice &engine, HMODULE module, reshade::api::device_api game_api);
+	enum class Handshake { Waiting, Done, Failed };
+	Handshake poll_handshake();
+	bool starting() const noexcept { return starting_; }
 	void stop();
 	bool ready() const noexcept;
 
@@ -149,6 +154,9 @@ private:
 	uint32_t neural_present_ = 0;
 	uint32_t host_gpu_vendor_ = static_cast<uint32_t>(GpuVendor::Unknown);
 	bool handshaked_ = false;
+	bool starting_ = false;
+	unsigned long long handshake_deadline_ = 0;
+	bool finish_handshake();
 	bool first_frame_ = true;
 
 	uint64_t last_wait_value_ = 0;

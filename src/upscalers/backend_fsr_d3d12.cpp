@@ -1,6 +1,8 @@
+#include "aeon_sr/core/runtime_load_scope.hpp"
 #include "aeon_sr/upscalers/backend_fsr.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
+#include "aeon_sr/upscalers/ffx_driver_lite.hpp"
 #include "aeon_sr/upscalers/fsr_warmup.hpp"
 #include "aeon_sr/ngx/neural_params.hpp"
 #include "aeon_sr/ngx/ngx_common.hpp"
@@ -99,29 +101,39 @@ bool Fsr4D3D12Backend::ensure_dll_present(bool may_keep)
 {
 	if (fsr_loading())
 		return true;
-	if (api_.module != nullptr) {
+	const bool want_lite = fsr_provider_wants_lite(want_provider, lite_by_default && !lite_default_failed_);
+	if (api_.module != nullptr && api_is_driver_ == (want_lite && !driver_path.empty())) {
 		dll_present_ = true;
 		return true;
 	}
 	const uint64_t now = GetTickCount64();
 	if (may_keep && looked_.fresh(now)) {
-		dll_present_ = looked_.found();
+		dll_present_ = sdk_found_ || (want_lite && !driver_path.empty());
 	} else {
-		dll_present_ = false;
+		bool sdk = false;
 		dll_dir.clear();
+		driver_path.clear();
 		for (const std::wstring &dir : fsr_search_dirs(addon_dir, exe_directory_w())) {
-			if (!file_exists_w(fsr_dll_path(dir)))
-				continue;
-			dll_present_ = true;
-			dll_dir = dir;
-			break;
+			if (driver_path.empty() && file_exists_w(join_path(dir, kFfxDriverDll)))
+				driver_path = join_path(dir, kFfxDriverDll);
+			if (!sdk && file_exists_w(fsr_dll_path(dir))) {
+				sdk = true;
+				dll_dir = dir;
+			}
+			if (sdk && !driver_path.empty())
+				break;
 		}
+		sdk_found_ = sdk;
+		dll_present_ = sdk_found_ || (want_lite && !driver_path.empty());
 		looked_.note(dll_present_, now);
 	}
 	if (!dll_present_) {
 		status = UpscalerStatus::MissingRuntime;
-		last_error = L"Place amd_fidelityfx_upscaler_dx12.dll next to AeonSR.addon64, "
-			L"or in a runtime\\ folder beside it";
+		last_error = want_lite
+			? L"Place amdxcffx64.dll (FSR 4 Lite) or amd_fidelityfx_upscaler_dx12.dll next to AeonSR.addon64, "
+			  L"or in a runtime\\ folder beside it"
+			: L"Place amd_fidelityfx_upscaler_dx12.dll next to AeonSR.addon64, "
+			  L"or in a runtime\\ folder beside it";
 	}
 	return dll_present_;
 }
@@ -228,28 +240,43 @@ bool Fsr4D3D12Backend::query_render_size(uint32_t display_w, uint32_t display_h,
 
 void Fsr4D3D12Backend::enumerate_providers(ID3D12Device *device)
 {
-	if (!providers.empty() || api_.Query == nullptr || device == nullptr)
+	if (!providers.empty() || device == nullptr)
 		return;
-	uint64_t count = 0;
-	ffxQueryDescGetVersions q{};
-	q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-	q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-	q.device = device;
-	q.outputCount = &count;
-	if (api_.Query(nullptr, &q.header) != FFX_API_RETURN_OK || count == 0 || count > 32)
-		return;
-	std::vector<uint64_t> ids(static_cast<size_t>(count));
-	std::vector<const char *> names(static_cast<size_t>(count));
-	q.versionIds = ids.data();
-	q.versionNames = names.data();
-	if (api_.Query(nullptr, &q.header) != FFX_API_RETURN_OK)
-		return;
-	for (uint64_t i = 0; i < count; ++i) {
-		FfxProvider p;
-		p.id = ids[static_cast<size_t>(i)];
-		p.name = names[static_cast<size_t>(i)] != nullptr ? names[static_cast<size_t>(i)] : "";
-		if (!p.name.empty())
-			providers.push_back(p);
+	FfxApi listing{};
+	const FfxApi *sdk = !api_is_driver_ ? &api_ : nullptr;
+	if (sdk == nullptr && !build_sdk_path_.empty() && file_exists_w(build_sdk_path_)) {
+		std::wstring ignored;
+		if (ffx_load(listing, build_sdk_path_, ignored))
+			sdk = &listing;
+	}
+	if (sdk != nullptr && sdk->Query != nullptr) {
+		uint64_t count = 0;
+		ffxQueryDescGetVersions q{};
+		q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+		q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+		q.device = device;
+		q.outputCount = &count;
+		if (sdk->Query(nullptr, &q.header) == FFX_API_RETURN_OK && count != 0 && count <= 32) {
+			std::vector<uint64_t> ids(static_cast<size_t>(count));
+			std::vector<const char *> names(static_cast<size_t>(count));
+			q.versionIds = ids.data();
+			q.versionNames = names.data();
+			if (sdk->Query(nullptr, &q.header) == FFX_API_RETURN_OK) {
+				for (uint64_t i = 0; i < count; ++i) {
+					FfxProvider p;
+					p.id = ids[static_cast<size_t>(i)];
+					p.name = names[static_cast<size_t>(i)] != nullptr ? names[static_cast<size_t>(i)] : "";
+					if (!p.name.empty())
+						providers.push_back(p);
+				}
+			}
+		}
+	}
+	ffx_unload(listing);
+	if (!build_driver_path_.empty()) {
+		const std::string lite = ffx_driver_lite_entry(build_driver_path_);
+		if (!lite.empty())
+			providers.push_back(FfxProvider{ 0, lite });
 	}
 }
 
@@ -292,8 +319,13 @@ bool Fsr4D3D12Backend::init_context(ID3D12Device *device, uint32_t w, uint32_t h
 		created_quality_mode_ == quality_mode_ &&
 		created_render_scale_ == render_scale_ &&
 		created_color_flags_ == color_flags_ &&
-		created_provider == want_provider)
+		created_want_ == want_provider)
 		return true;
+
+	if (neural_building()) {
+		status = UpscalerStatus::Loading;
+		return false;
+	}
 
 	destroy_context();
 	device_ = device;
@@ -306,18 +338,49 @@ bool Fsr4D3D12Backend::init_context(ID3D12Device *device, uint32_t w, uint32_t h
 	init_ok_ = false;
 	build_quality_ = quality_mode_;
 	build_scale_ = render_scale_;
-	build_provider_ = want_provider;
+	build_provider_ = want_provider == kFsrProviderAuto ? std::string() : want_provider;
+	build_want_ = want_provider;
 	build_color_flags_ = color_flags_;
-	build_dll_path_ = fsr_dll_path(!dll_dir.empty() ? dll_dir : addon_dir);
+	build_lite_ = fsr_provider_wants_lite(want_provider, lite_by_default && !lite_default_failed_) &&
+		!driver_path.empty();
+	build_lite_default_ = build_lite_ && !fsr_provider_is_lite(want_provider);
+	if (want_provider.empty() && lite_by_default && driver_path.empty() && !lite_default_absent_said_) {
+		lite_default_absent_said_ = true;
+		diag_logf(DiagLevel::Info, "upscaler", L"FSR 4 Lite, the default, has no amdxcffx64.dll in the runtime "
+			L"folders; FSR runs on Auto");
+	}
+	if (fsr_provider_is_lite(want_provider) && driver_path.empty() && !lite_absent_said_) {
+		lite_absent_said_ = true;
+		diag_logf(DiagLevel::Warn, "upscaler", L"FSR 4 Lite was picked but amdxcffx64.dll is not in the "
+			L"runtime folders; FSR runs on Auto");
+	}
+	build_sdk_path_ = fsr_dll_path(!dll_dir.empty() ? dll_dir : addon_dir);
+	build_driver_path_ = driver_path;
+	build_dll_path_ = build_lite_ ? build_driver_path_ : build_sdk_path_;
 	build_addon_dir_ = addon_dir;
 	if (cancel_event_ == nullptr)
 		cancel_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	else
 		ResetEvent(cancel_event_);
 	init_state_.store(kRunning, std::memory_order_release);
-	init_thread_ = std::thread([this, device, w, h, color_format, with_depth] {
+	const DXGI_FORMAT target_format = backbuffer_format_;
+	init_thread_ = std::thread([this, device, w, h, color_format, with_depth, target_format] {
 		device_busy_.store(true, std::memory_order_release);
 		init_ok_ = build_context(device, w, h, color_format, with_depth);
+		if (!init_ok_ && build_lite_ && build_lite_default_) {
+			diag_logf(DiagLevel::Warn, "upscaler", L"FSR 4 Lite, the default, failed here (%s); FSR runs on Auto",
+				worker_error_.c_str());
+			if (worker_status_ == UpscalerStatus::Crashed) {
+				context_ = nullptr;
+				pso_cache_ = nullptr;
+			}
+			lite_default_failed_ = true;
+			worker_status_ = UpscalerStatus::Loading;
+			worker_error_.clear();
+		}
+		first_run_pending_ = init_ok_;
+		if (init_ok_)
+			blit_.prepare(device, { color_format, DXGI_FORMAT_R32_FLOAT, target_format });
 		device_busy_.store(false, std::memory_order_release);
 		init_state_.store(kFinished, std::memory_order_release);
 	});
@@ -336,14 +399,47 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 				static_cast<double>(t_freq.QuadPart);
 	};
 
-	if (api_.module == nullptr) {
+	if (api_.module != nullptr && api_is_driver_ != build_lite_)
+		ffx_unload(api_);
+	if (api_.module == nullptr && build_lite_) {
+		std::wstring why;
+		FfxDriverLite info;
+		bool lite_loaded = fsr_lite_device_supported(device, &why);
+		if (lite_loaded) {
+			lite_loaded = [&] {
+				const RuntimeLoadScope loading;
+				return ffx_load_driver_lite(api_, build_dll_path_, &info, why);
+			}();
+		}
+		if (lite_loaded) {
+			api_is_driver_ = true;
+			diag_logf(DiagLevel::Info, "upscaler", L"FSR 4 Lite: %s, its upscaler %hs, %d model checks answered",
+				build_dll_path_.c_str(), info.version_name.c_str(), info.model_hooks);
+		} else if (build_lite_default_) {
+			diag_logf(DiagLevel::Warn, "upscaler", L"FSR 4 Lite, the default, cannot run here (%s); FSR runs on Auto",
+				why.c_str());
+			lite_default_failed_ = true;
+			build_lite_ = false;
+			build_dll_path_ = build_sdk_path_;
+		} else {
+			worker_status_ = UpscalerStatus::InitFailed;
+			worker_error_ = L"FSR 4 Lite: " + why;
+			return false;
+		}
+	}
+	if (api_.module == nullptr && !build_lite_) {
 		const std::wstring &path = build_dll_path_;
-		if (!ffx_load(api_, path, worker_error_)) {
+		const bool loaded = [&] {
+			const RuntimeLoadScope loading;
+			return ffx_load(api_, path, worker_error_);
+		}();
+		if (!loaded) {
 			worker_status_ = UpscalerStatus::InitFailed;
 			if (worker_error_.find(L"LoadLibraryW") != std::wstring::npos)
 				worker_error_ += L" | If using official SDK split DLLs, also place amd_fidelityfx_loader_dx12.dll beside the upscaler";
 			return false;
 		}
+		api_is_driver_ = false;
 	}
 
 	QueryPerformanceCounter(&t_dll);
@@ -369,9 +465,9 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 
 	ffxOverrideVersion override_version{};
 	bool pinned = false;
-	if (!build_provider_.empty()) {
+	if (!build_provider_.empty() && !build_lite_) {
 		for (const FfxProvider &p : providers) {
-			if (p.name == build_provider_) {
+			if (p.id != 0 && p.name == build_provider_) {
 				override_version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
 				override_version.header.pNext = nullptr;
 				override_version.versionId = p.id;
@@ -394,7 +490,10 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 	upscale.fpMessage = nullptr;
 
 	unsigned long seh_code = 0;
-	const ffxReturnCode_t cr = create_context_guarded(api_.CreateContext, &context_, &upscale.header, &seh_code);
+	const ffxReturnCode_t cr = [&] {
+		const RuntimeLoadScope loading;
+		return create_context_guarded(api_.CreateContext, &context_, &upscale.header, &seh_code);
+	}();
 	if (seh_code != 0) {
 		worker_status_ = UpscalerStatus::Crashed;
 		wchar_t buf[128]{};
@@ -458,7 +557,10 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 		context_ = nullptr;
 		pso_cache_ = nullptr;
 		unsigned long seh = 0;
-		const ffxReturnCode_t r = create_context_guarded(api_.CreateContext, &context_, &upscale.header, &seh);
+		const ffxReturnCode_t r = [&] {
+			const RuntimeLoadScope loading;
+			return create_context_guarded(api_.CreateContext, &context_, &upscale.header, &seh);
+		}();
 		if (seh != 0 || r != FFX_API_RETURN_OK || context_ == nullptr) {
 			context_ = nullptr;
 			worker_status_ = seh != 0 ? UpscalerStatus::Crashed : UpscalerStatus::InitFailed;
@@ -532,6 +634,8 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 	created_quality_mode_ = build_quality_;
 	created_render_scale_ = build_scale_;
 	created_provider = build_provider_;
+	created_want_ = build_want_;
+	created_lite_default_ = build_lite_ && build_lite_default_;
 	created_color_flags_ = build_color_flags_;
 	worker_status_ = UpscalerStatus::Ready;
 	worker_error_.clear();
@@ -542,6 +646,14 @@ bool Fsr4D3D12Backend::build_context(ID3D12Device *device, uint32_t w, uint32_t 
 		pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
 		if (api_.Query(&context_, &pv.header) == FFX_API_RETURN_OK)
 			provider_version = widen_utf8(pv.versionName);
+	}
+	if (build_lite_) {
+		const FfxDriverModel model = ffx_driver_active_model();
+		if (model == FfxDriverModel::Int8Lite && provider_version.size() > 1 && provider_version[0] == L'4')
+			provider_version += L" Lite";
+		diag_logf(DiagLevel::Info, "upscaler", L"FSR 4 Lite: the driver library runs %s with its %hs model",
+			provider_version.empty() ? L"an unnamed upscaler" : provider_version.c_str(),
+			ffx_driver_model_name(model));
 	}
 	return true;
 }
@@ -736,6 +848,10 @@ bool Fsr4D3D12Backend::run_native(
 			status = status_after_unready_init(status);
 		return false;
 	}
+	if (first_run_pending_ && neural_building()) {
+		status = UpscalerStatus::Loading;
+		return false;
+	}
 	if (!blit_.ensure(d3d12)) {
 		status = UpscalerStatus::InitFailed;
 		last_error = L"failed to create D3D12 blit pipeline";
@@ -822,7 +938,17 @@ bool Fsr4D3D12Backend::run_native(
 		const ffxReturnCode_t dr = dispatch_guarded(api_.Dispatch, &context_, &dispatch.header, &seh_code);
 		barrier12(cmd12, output_tex_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-		if (seh_code != 0) {
+		if (seh_code != 0 && created_lite_default_) {
+			diag_logf(DiagLevel::Warn, "upscaler", L"FSR 4 Lite, the default, crashed in its dispatch "
+				L"(exception 0x%08lX); FSR runs on Auto", seh_code);
+			context_ = nullptr;
+			pso_cache_ = nullptr;
+			initialized_ = false;
+			created_lite_default_ = false;
+			lite_default_failed_ = true;
+			status = UpscalerStatus::Loading;
+			ok = false;
+		} else if (seh_code != 0) {
 			crashed = true;
 			status = UpscalerStatus::Crashed;
 			wchar_t buf[128]{};
@@ -855,6 +981,8 @@ bool Fsr4D3D12Backend::run_native(
 		status = UpscalerStatus::Ready;
 		last_error.clear();
 	}
+	if (ok)
+		first_run_pending_ = false;
 	return ok && !crashed;
 }
 

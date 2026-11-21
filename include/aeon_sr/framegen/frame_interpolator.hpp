@@ -27,16 +27,30 @@ public:
 		ID3D12Resource *depth = nullptr;
 		D3D12_RESOURCE_STATES depth_state = D3D12_RESOURCE_STATE_COMMON;
 		float t = 0.5f;
+		uint64_t previous_id = 0, current_id = 0;
 	};
 
 	~FrameInterpolatorD3D12();
 
+	static inline const char *source_for_test = nullptr;
+
 	bool ensure(ID3D12Device *device, uint32_t w, uint32_t h, DXGI_FORMAT color_format, bool *building,
 		std::wstring *error);
+	void prepare(ID3D12Device *device);
 	bool wait_for_kernels();
 	bool failed_permanently() const noexcept { return state_.load(std::memory_order_acquire) == kFailed; }
 
 	bool record(ID3D12GraphicsCommandList *cmd, const Inputs &in, std::wstring *error);
+	void discard_prepared() noexcept { prepared_ids_[0] = prepared_ids_[1] = 0; }
+	uint64_t full_records() const noexcept { return full_records_; }
+	uint64_t reused_records() const noexcept { return reused_records_; }
+
+	void set_timestamps(ID3D12QueryHeap *heap, uint32_t first) noexcept
+	{
+		stamps_ = heap;
+		stamp_first_ = first;
+	}
+	static constexpr uint32_t kStampCount = 7;
 
 	ID3D12Resource *output() const noexcept { return output_; }
 	uint32_t width() const noexcept { return w_; }
@@ -83,6 +97,11 @@ private:
 	ID3D12Resource *layers_ = nullptr;
 	ID3D12Resource *layer_depth_ = nullptr;
 	bool textures_failed_ = false;
+	ID3D12QueryHeap *stamps_ = nullptr;
+	uint32_t stamp_first_ = 0;
+	uint64_t prepared_ids_[2] = {};
+	const void *prepared_inputs_[5] = {};
+	uint64_t full_records_ = 0, reused_records_ = 0;
 };
 
 DXGI_FORMAT interpolator_read_format(DXGI_FORMAT f) noexcept;

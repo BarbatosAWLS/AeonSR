@@ -588,6 +588,28 @@ NeuralRuntimeIdentity neural_identity_in(const char *bytes, size_t size)
 	return out;
 }
 
+uint32_t neural_model_choice(const std::vector<uint32_t> &ids, uint32_t wanted) noexcept
+{
+	uint32_t newest = 0u;
+	for (const uint32_t id : ids) {
+		if (wanted != 0u && id == wanted)
+			return wanted;
+		newest = std::max(newest, id);
+	}
+	return newest != 0u ? newest : 1u;
+}
+
+std::vector<uint32_t> neural_model_ids(const std::vector<NeuralModelEntry> &models)
+{
+	std::vector<uint32_t> ids;
+	for (const NeuralModelEntry &m : models) {
+		if (m.id != 0u && std::find(ids.begin(), ids.end(), m.id) == ids.end())
+			ids.push_back(m.id);
+	}
+	std::sort(ids.begin(), ids.end());
+	return ids;
+}
+
 uint32_t neural_model_to_ask(const std::vector<NeuralModelEntry> &models, uint32_t wanted) noexcept
 {
 	uint32_t newest = 0u;
@@ -597,6 +619,11 @@ uint32_t neural_model_to_ask(const std::vector<NeuralModelEntry> &models, uint32
 		newest = std::max(newest, m.id);
 	}
 	return newest != 0u ? newest : 1u;
+}
+
+char neural_model_letter(uint32_t id) noexcept
+{
+	return id >= 1u && id <= 26u ? static_cast<char>('A' + (id - 1u)) : '?';
 }
 
 const NeuralModelEntry *neural_model_named(const std::vector<NeuralModelEntry> &models, uint32_t id) noexcept

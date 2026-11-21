@@ -58,6 +58,11 @@ inline uint32_t xefg_interpolation_limit(bool intel, bool can_query, uint32_t ma
 
 bool dlssg_refusal_is_final(bool capability_refused, uint32_t ngx_result, uint32_t seh_code) noexcept;
 
+inline constexpr size_t kDlssgRefusalChars = 255;
+
+std::wstring dlssg_refusal_text(const std::wstring &ngx_refusal, const std::wstring &create_error,
+	const std::wstring &unlocker_note, size_t max_chars = kDlssgRefusalChars);
+
 void xefg_use_for_tests(const std::wstring &xefg_dll, const std::wstring &xell_dll, int intel);
 
 struct XefgPresentLedger {

@@ -31,7 +31,7 @@ enum : uint32_t {
 	kSlotLumaMipSrv = kSlotLumaSrv + 2,
 	kSlotLumaUav = kSlotLumaMipSrv + 2 * kMaxLumaMips,
 	kSlotFlow = kSlotLumaUav + 2 * kMaxLumaMips,
-	kStagingCount = kSlotFlow + 54
+	kStagingCount = kSlotFlow + 64
 };
 
 std::wstring widen_ascii(const char *text)
@@ -143,8 +143,9 @@ void OpticalFlowD3D12::release_textures()
 {
 	Tex *const all[] = { &luma_[0], &luma_[1], &l4_, &l3_[0], &l3_[1], &l2_[0], &l2_[1],
 		&l1_[0], &l1_[1], &l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_,
-		&prev_flow_, &global_, &conf_quarter_, &prev_conf_, &motion_, &confidence_,
-		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_ };
+		&prev_flow_, &global_, &seed_, &conf_quarter_, &prev_conf_, &motion_, &confidence_,
+		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_,
+		&dfm_epi_[0], &dfm_epi_[1], &dfm_acc_, &dfm_depth_ };
 	for (Tex *t : all) {
 		safe_release(t->res);
 		*t = Tex{};
@@ -160,6 +161,7 @@ void OpticalFlowD3D12::release_textures()
 	model_ran_ = false;
 	model_textures_ = false;
 	model_retry_ms_ = 0;
+	dfm_valid_ = false;
 }
 
 void OpticalFlowD3D12::release()
@@ -169,6 +171,7 @@ void OpticalFlowD3D12::release()
 		model_builder_.join();
 	model_cancel_.store(false, std::memory_order_relaxed);
 	model_state_.store(kModelNone, std::memory_order_relaxed);
+	matcher_state_.store(kModelNone, std::memory_order_relaxed);
 	textures_failed_on_ = nullptr;
 	release_textures();
 	for (uint32_t q = 0; q < 2; ++q)
@@ -194,9 +197,10 @@ const char *OpticalFlowD3D12::kernel_name(uint32_t shader) noexcept
 	static_assert(kFirstModelShader == flow_entries::kFirstModel, "and splits them where the estimator does");
 	static const char *const names[kShaderCount] = {
 		"luma", "downsample", "coarse top", "coarse", "median", "refine",
-		"global", "confidence", "export", "copy flow",
+		"global", "confidence", "export", "copy flow", "seed",
 		"structure", "model terms", "model reduce", "model solve", "decision", "fuse", "photo terms",
-		"theta publish",
+		"theta publish", "depth from motion: epipole", "depth from motion: measure",
+		"depth from motion: warp",
 	};
 	return shader < kShaderCount ? names[shader] : "?";
 }
@@ -363,10 +367,33 @@ bool OpticalFlowD3D12::make_pipelines(std::wstring *error)
 		return false;
 	}
 
+	if (async_kernels) {
+		start_model_builder(true);
+		return true;
+	}
 	std::wstring first_error;
-	for (uint32_t q = 0; q < 2; ++q) {
-		quality_ok[q] = true;
+	if (!build_matcher_pipelines(&first_error)) {
+		if (error != nullptr)
+			*error = first_error;
+		return false;
+	}
+	start_model_builder(false);
+	return true;
+}
+
+bool OpticalFlowD3D12::build_matcher_pipelines(std::wstring *out_error)
+{
+	std::wstring first_error;
+	bool ok_level[2] = { false, false };
+	for (uint32_t qi = 0; qi < 2; ++qi) {
+		const uint32_t q = 1u - qi;
+		ok_level[q] = true;
 		for (uint32_t i = 0; i < kFirstModelShader; ++i) {
+			if (model_cancel_.load(std::memory_order_relaxed)) {
+				ok_level[0] = ok_level[1] = false;
+				first_error = L"optical flow: kernels cancelled";
+				break;
+			}
 			ID3DBlob *cs = nullptr, *cerr = nullptr;
 			const void *code = nullptr;
 			size_t code_size = 0;
@@ -383,7 +410,7 @@ bool OpticalFlowD3D12::make_pipelines(std::wstring *error)
 				safe_release(cerr);
 				if (first_error.empty())
 					first_error = detail;
-				quality_ok[q] = false;
+				ok_level[q] = false;
 				break;
 			}
 			safe_release(cerr);
@@ -401,27 +428,58 @@ bool OpticalFlowD3D12::make_pipelines(std::wstring *error)
 						static_cast<unsigned>(ok));
 					first_error = buf;
 				}
-				quality_ok[q] = false;
+				ok_level[q] = false;
 				break;
 			}
 		}
+		if (model_cancel_.load(std::memory_order_relaxed))
+			break;
 	}
 
-	if (!quality_ok[0] && !quality_ok[1]) {
-		if (error != nullptr)
-			*error = first_error.empty() ? std::wstring(L"optical flow: no kernels could be built")
-			                             : first_error;
+	if (!ok_level[0] && !ok_level[1]) {
+		for (uint32_t q = 0; q < 2; ++q)
+			for (uint32_t i = 0; i < kFirstModelShader; ++i)
+				safe_release(pso_[q][i]);
+		if (out_error != nullptr)
+			*out_error = first_error.empty() ? std::wstring(L"optical flow: no kernels could be built")
+			                                 : first_error;
 		return false;
 	}
+	quality_ok[0] = ok_level[0];
+	quality_ok[1] = ok_level[1];
+	return true;
+}
 
+void OpticalFlowD3D12::start_model_builder(bool with_matcher)
+{
 	model_state_.store(kModelBuilding, std::memory_order_relaxed);
+	if (with_matcher)
+		matcher_state_.store(kModelBuilding, std::memory_order_relaxed);
 	try {
-		model_builder_ = std::thread([this]() { build_model_pipelines(); });
+		model_builder_ = std::thread([this, with_matcher]() {
+			if (with_matcher) {
+				std::wstring why;
+				if (!build_matcher_pipelines(&why)) {
+					matcher_error_ = why;
+					model_build_error_ = L"camera model: the matcher's kernels did not build";
+					model_state_.store(kModelFailed, std::memory_order_release);
+					matcher_state_.store(kModelFailed, std::memory_order_release);
+					return;
+				}
+				matcher_state_.store(kModelReady, std::memory_order_release);
+			}
+			build_model_pipelines();
+		});
 	} catch (...) {
 		model_build_error_ = L"camera model: no thread to build it on";
 		model_state_.store(kModelFailed, std::memory_order_release);
+		if (with_matcher) {
+			std::wstring why;
+			const bool ok = build_matcher_pipelines(&why);
+			matcher_error_ = why;
+			matcher_state_.store(ok ? kModelReady : kModelFailed, std::memory_order_release);
+		}
 	}
-	return true;
 }
 
 void OpticalFlowD3D12::build_model_pipelines()
@@ -516,6 +574,7 @@ bool OpticalFlowD3D12::make_textures(std::wstring *error)
 		!make_tex(dense_m_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16G16_FLOAT, 1, error) ||
 		!make_tex(prev_flow_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16G16_FLOAT, 1, error) ||
 		!make_tex(global_, 1, 1, DXGI_FORMAT_R16G16_FLOAT, 1, error) ||
+		!make_tex(seed_, 2, 1, DXGI_FORMAT_R16G16_FLOAT, 1, error) ||
 		!make_tex(conf_quarter_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16_FLOAT, 1, error) ||
 		!make_tex(prev_conf_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16_FLOAT, 1, error) ||
 		!make_tex(motion_, w, h, DXGI_FORMAT_R16G16_FLOAT, 1, error) ||
@@ -574,9 +633,10 @@ bool OpticalFlowD3D12::make_textures(std::wstring *error)
 void OpticalFlowD3D12::make_flow_views()
 {
 	Tex *const flow[] = { &l4_, &l3_[0], &l3_[1], &l2_[0], &l2_[1], &l1_[0], &l1_[1],
-		&l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_, &prev_flow_, &global_,
+		&l0_[0], &l0_[1], &dense_[0], &dense_[1], &dense_m_, &prev_flow_, &global_, &seed_,
 		&conf_quarter_, &prev_conf_, &motion_, &confidence_,
-		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_ };
+		&struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_,
+		&dfm_epi_[0], &dfm_epi_[1], &dfm_acc_, &dfm_depth_ };
 	static_assert(sizeof(flow) / sizeof(flow[0]) * 2 == kStagingCount - kSlotFlow,
 		"every flow texture needs an SRV and a UAV slot");
 	for (uint32_t i = 0; i < sizeof(flow) / sizeof(flow[0]); ++i) {
@@ -617,14 +677,20 @@ void OpticalFlowD3D12::make_model_textures()
 		make_tex(alpha_q_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16_FLOAT, 1, &error) &&
 		make_tex(theta_pub_, 16, 8, DXGI_FORMAT_R32_FLOAT, 1, &error) &&
 		make_tex(kept_motion_, w, h, DXGI_FORMAT_R16G16_FLOAT, 1, &error) &&
-		make_tex(along_q_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16G16_FLOAT, 1, &error);
+		make_tex(along_q_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R16G16_FLOAT, 1, &error) &&
+		make_tex(dfm_epi_[0], 3, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, &error) &&
+		make_tex(dfm_epi_[1], 3, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, &error) &&
+		make_tex(dfm_acc_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R32G32B32A32_FLOAT, 1, &error) &&
+		make_tex(dfm_depth_, level_size(w, 2), level_size(h, 2), DXGI_FORMAT_R32G32B32A32_FLOAT, 1, &error);
+	dfm_valid_ = false;
 	if (model_textures_) {
 		model_retry_ms_ = 0;
 		return;
 	}
 	model_textures_failed_at_ = GetTickCount64();
 	model_retry_ms_ = model_retry_ms_ == 0 ? texture_retry_ms : (std::min)(2u * model_retry_ms_, 60000u);
-	for (Tex *t : { &struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_ }) {
+	for (Tex *t : { &struct_q_, &partials_, &sums_, &theta_[0], &theta_[1], &alpha_q_, &theta_pub_, &kept_motion_, &along_q_,
+			 &dfm_epi_[0], &dfm_epi_[1], &dfm_acc_, &dfm_depth_ }) {
 		safe_release(t->res);
 		*t = Tex{};
 	}
@@ -661,6 +727,8 @@ bool OpticalFlowD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t hei
 		return false;
 	}
 	if (device_ == device && width_ == width && height_ == height && motion_.res != nullptr) {
+		if (!matcher_ready(error))
+			return false;
 		if (!model_textures_ && GetTickCount64() - model_textures_failed_at_ >= model_retry_ms_) {
 			make_model_textures();
 			if (model_textures_) {
@@ -711,6 +779,27 @@ bool OpticalFlowD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t hei
 		return false;
 	}
 	textures_failed_on_ = nullptr;
+	return matcher_ready(error);
+}
+
+bool OpticalFlowD3D12::matcher_ready(std::wstring *error)
+{
+	const int s = matcher_state_.load(std::memory_order_acquire);
+	if (s == kModelBuilding) {
+		if (error != nullptr)
+			*error = L"warming up: the estimator's kernels are being built on a thread of their own";
+		return false;
+	}
+	if (s == kModelFailed) {
+		const std::wstring why = matcher_error_;
+		ID3D12Device *const dev = device_;
+		release();
+		pipelines_failed_on = dev;
+		pipelines_error = why;
+		if (error != nullptr)
+			*error = why;
+		return false;
+	}
 	return true;
 }
 
@@ -796,14 +885,15 @@ void OpticalFlowD3D12::level(ID3D12GraphicsCommandList *cmd, Tex &parent, Tex &a
 	to_state(cmd, parent, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	to_state(cmd, a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	{
-		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[8] = {
+		const D3D12_CPU_DESCRIPTOR_HANDLE none{};
+		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
 			staging(kSlotColor), staging(kSlotLumaSrv + parity_),
 			staging(kSlotLumaSrv + (parity_ ^ 1u)), srv_of(parent),
 			srv_of(prev_flow_), srv_of(global_),
-			staging(kSlotDepth), D3D12_CPU_DESCRIPTOR_HANDLE{}
+			staging(kSlotDepth), none, seed_.res != nullptr ? srv_of(seed_) : none, none, none
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[2] = { uav_of(a), D3D12_CPU_DESCRIPTOR_HANDLE{} };
-		dispatch(cmd, kCoarse, c, srvs, 8, uavs, 2, groups(a.w, 8), groups(a.h, 8));
+		dispatch(cmd, kCoarse, c, srvs, kSrvCount, uavs, 2, groups(a.w, 8), groups(a.h, 8));
 	}
 
 	to_state(cmd, a, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -921,7 +1011,7 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 		Constants p = m;
 		p.pad_colour = kPublishedFits;
 		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
-			none, none, none, none, none, srv_of(global_), staging(kSlotDepth), none, none, srv_of(theta_[0]), none
+			none, none, none, srv_of(seed_), none, srv_of(global_), staging(kSlotDepth), none, none, srv_of(theta_[0]), none
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, uav_of(theta_pub_), none };
 		dispatch(cmd, kThetaPublish, p, srvs, kSrvCount, uavs, kUavCount, 1, 1);
@@ -964,6 +1054,67 @@ void OpticalFlowD3D12::record_camera_model(ID3D12GraphicsCommandList *cmd, const
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { uav_of(motion_), uav_of(confidence_), none };
 		dispatch(cmd, kFuse, f, srvs, kSrvCount, uavs, kUavCount, groups(width_, 8), groups(height_, 8));
 	}
+}
+
+void OpticalFlowD3D12::record_depth_from_motion(ID3D12GraphicsCommandList *cmd, const Constants &base, bool measure)
+{
+	const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	const D3D12_RESOURCE_STATES write_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	const D3D12_CPU_DESCRIPTOR_HANDLE none{};
+	const uint32_t qw = struct_q_.w, qh = struct_q_.h;
+
+	Constants m = base;
+	m.dst_w = qw;
+	m.dst_h = qh;
+	m.inv_dst_x = 1.0f / static_cast<float>(qw);
+	m.inv_dst_y = 1.0f / static_cast<float>(qh);
+	m.inv_src_x = m.inv_dst_x;
+	m.inv_src_y = m.inv_dst_y;
+	m.norm_x = 2.0f * static_cast<float>(width_) / static_cast<float>(height_);
+	m.px_per_unit = 0.5f * static_cast<float>(height_);
+	m.model_flags = (measure ? 0u : 4u) | (dfm_valid_ ? 0u : 16u);
+	const D3D12_CPU_DESCRIPTOR_HANDLE est = (m.has_depth == 2u) ? srv_of(dfm_depth_) : none;
+
+	to_state(cmd, struct_q_, read_state);
+	to_state(cmd, conf_quarter_, read_state);
+	to_state(cmd, dense_[1], read_state);
+	to_state(cmd, theta_[0], read_state);
+	if (measure) {
+		dfm_epi_cur_ ^= 1u;
+		to_state(cmd, dfm_epi_[dfm_epi_cur_ ^ 1u], read_state);
+		to_state(cmd, dfm_epi_[dfm_epi_cur_], write_state);
+		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
+			srv_of(dfm_epi_[dfm_epi_cur_ ^ 1u]), none, none, srv_of(dense_[1]), est, none,
+			none, srv_of(conf_quarter_), srv_of(struct_q_), srv_of(theta_[0]), none
+		};
+		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, none, uav_of(dfm_epi_[dfm_epi_cur_]) };
+		dispatch(cmd, kDfmEpipole, m, srvs, kSrvCount, uavs, kUavCount, 1, 1);
+	}
+	Tex &epi = dfm_epi_[dfm_epi_cur_];
+	to_state(cmd, epi, read_state);
+	to_state(cmd, dfm_acc_, write_state);
+	{
+		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
+			srv_of(epi), staging(kSlotLumaSrv + parity_), staging(kSlotLumaSrv + (parity_ ^ 1u)),
+			srv_of(dense_[1]), est, none,
+			none, srv_of(conf_quarter_), srv_of(struct_q_), srv_of(theta_[0]), none
+		};
+		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, none, uav_of(dfm_acc_) };
+		dispatch(cmd, kDfmMeasure, m, srvs, kSrvCount, uavs, kUavCount, groups(qw, 8), groups(qh, 8));
+	}
+	to_state(cmd, dfm_acc_, read_state);
+	to_state(cmd, motion_, read_state);
+	to_state(cmd, dfm_depth_, write_state);
+	{
+		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
+			srv_of(epi), none, none, srv_of(motion_), none, none,
+			none, none, srv_of(dfm_acc_), none, none
+		};
+		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[kUavCount] = { none, none, uav_of(dfm_depth_) };
+		dispatch(cmd, kDfmWarp, m, srvs, kSrvCount, uavs, kUavCount, groups(qw, 8), groups(qh, 8));
+	}
+	to_state(cmd, dfm_depth_, read_state);
+	dfm_valid_ = true;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE OpticalFlowD3D12::srv_of(const Tex &t) const
@@ -1028,7 +1179,24 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 			have_depth_ = true;
 		}
 	}
-	if (!have_depth_) {
+	parity_ ^= 1u;
+	if (frames_ < 4u)
+		++frames_;
+	const uint32_t first = has_history() ? 0u : 1u;
+
+	const bool dfm_runs = !have_depth_ && dfm_on_ && model_textures_ && !depth_logarithmic_;
+	if (!dfm_runs || first != 0u)
+		dfm_valid_ = false;
+	const bool est_depth = dfm_runs && dfm_valid_;
+	if (est_depth) {
+		D3D12_SHADER_RESOURCE_VIEW_DESC ed{};
+		ed.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+		ed.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		ed.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		ed.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(dfm_depth_.res, &ed, staging(kSlotDepth));
+		to_state(cmd, dfm_depth_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	} else if (!have_depth_) {
 		D3D12_SHADER_RESOURCE_VIEW_DESC nd{};
 		nd.Format = DXGI_FORMAT_R32_FLOAT;
 		nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1036,11 +1204,6 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 		nd.Texture2D.MipLevels = 1;
 		device_->CreateShaderResourceView(nullptr, &nd, staging(kSlotDepth));
 	}
-
-	parity_ ^= 1u;
-	if (frames_ < 4u)
-		++frames_;
-	const uint32_t first = has_history() ? 0u : 1u;
 
 	Tex &cur = luma_[parity_];
 	Tex &prev = luma_[parity_ ^ 1u];
@@ -1063,7 +1226,7 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	Constants c{};
 	c.inv_full_x = 1.0f / static_cast<float>(width_);
 	c.inv_full_y = 1.0f / static_cast<float>(height_);
-	c.has_depth = have_depth_ ? 1u : 0u;
+	c.has_depth = have_depth_ ? 1u : (est_depth ? 2u : 0u);
 	c.first = first;
 	c.filters = launcher_filters ? (frames_ >= 3u ? 3u : 1u) : 0u;
 	c.dejitter_x = jitter_x_px * c.inv_full_x;
@@ -1127,6 +1290,23 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	to_state(cmd, global_, read_state);
 
 	{
+		Constants s = c;
+		s.dst_w = 1u;
+		s.dst_h = 1u;
+		s.inv_dst_x = 1.0f;
+		s.inv_dst_y = 1.0f;
+		to_state(cmd, seed_, write_state);
+		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[8] = {
+			D3D12_CPU_DESCRIPTOR_HANDLE{}, staging(kSlotLumaSrv + parity_), staging(kSlotLumaSrv + (parity_ ^ 1u)),
+			D3D12_CPU_DESCRIPTOR_HANDLE{}, D3D12_CPU_DESCRIPTOR_HANDLE{}, srv_of(global_),
+			D3D12_CPU_DESCRIPTOR_HANDLE{}, D3D12_CPU_DESCRIPTOR_HANDLE{}
+		};
+		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[2] = { uav_of(seed_), D3D12_CPU_DESCRIPTOR_HANDLE{} };
+		dispatch(cmd, kSeed, s, srvs, 8, uavs, 2, 1, 1);
+		to_state(cmd, seed_, read_state);
+	}
+
+	{
 		Constants t = c;
 		t.dst_w = l4_.w;
 		t.dst_h = l4_.h;
@@ -1139,13 +1319,18 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 		t.texel2_x = t.texel1_x;
 		t.texel2_y = t.texel1_y;
 		to_state(cmd, l4_, write_state);
-		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[8] = {
+		const bool with_fit = theta_pub_.res != nullptr && model_ok() && model_ran_ && !model_cold_;
+		if (with_fit)
+			to_state(cmd, theta_pub_, read_state);
+		const D3D12_CPU_DESCRIPTOR_HANDLE srvs[kSrvCount] = {
 			staging(kSlotColor), staging(kSlotLumaSrv + parity_),
-			staging(kSlotLumaSrv + (parity_ ^ 1u)), D3D12_CPU_DESCRIPTOR_HANDLE{},
-			srv_of(prev_flow_), srv_of(global_), staging(kSlotDepth), D3D12_CPU_DESCRIPTOR_HANDLE{}
+			staging(kSlotLumaSrv + (parity_ ^ 1u)), srv_of(seed_),
+			srv_of(prev_flow_), srv_of(global_), staging(kSlotDepth), D3D12_CPU_DESCRIPTOR_HANDLE{},
+			D3D12_CPU_DESCRIPTOR_HANDLE{}, with_fit ? srv_of(theta_pub_) : D3D12_CPU_DESCRIPTOR_HANDLE{},
+			D3D12_CPU_DESCRIPTOR_HANDLE{}
 		};
 		const D3D12_CPU_DESCRIPTOR_HANDLE uavs[2] = { uav_of(l4_), D3D12_CPU_DESCRIPTOR_HANDLE{} };
-		dispatch(cmd, kCoarseTop, t, srvs, 8, uavs, 2, l4_.w, l4_.h);
+		dispatch(cmd, kCoarseTop, t, srvs, kSrvCount, uavs, 2, l4_.w, l4_.h);
 	}
 
 	level(cmd, l4_, l3_[0], l3_[1], 4u, 4u, first);
@@ -1265,13 +1450,19 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	if (cross) {
 		record_camera_model(cmd, c);
 		model_ran_ = true;
+		if (dfm_runs && dfm_valid_)
+			record_depth_from_motion(cmd, c, false);
 	} else if (!publish) {
 	} else if (camera_model && model_ok() && first == 0u) {
 		record_camera_model(cmd, c);
 		model_ran_ = true;
 		model_cold_ = false;
+		const bool dfm_measure = (c.model_flags & 2u) != 0u;
+		if (dfm_runs && (dfm_measure || dfm_valid_))
+			record_depth_from_motion(cmd, c, dfm_measure);
 	} else {
 		model_cold_ = true;
+		dfm_valid_ = false;
 		Constants e = c;
 		e.dst_w = width_;
 		e.dst_h = height_;
@@ -1312,6 +1503,10 @@ bool OpticalFlowD3D12::record(ID3D12GraphicsCommandList *cmd,
 	to_state(cmd, theta_pub_, kPublishedState);
 	to_state(cmd, alpha_q_, kPublishedState);
 	to_state(cmd, along_q_, kPublishedState);
+	to_state(cmd, dfm_epi_[0], kPublishedState);
+	to_state(cmd, dfm_epi_[1], kPublishedState);
+	to_state(cmd, dfm_acc_, kPublishedState);
+	to_state(cmd, dfm_depth_, kPublishedState);
 
 	if (theta_pub_.res != nullptr && ++landing_tick_ >= kLandingPeriod) {
 		landing_tick_ = 0;

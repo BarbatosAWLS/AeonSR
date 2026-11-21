@@ -5,6 +5,7 @@
 #include <d3dcompiler.h>
 
 #include <cstring>
+#include <mutex>
 
 namespace aeon_sr {
 namespace {
@@ -65,6 +66,33 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 
+std::mutex g_shader_lock;
+ID3DBlob *g_shader = nullptr;
+
+ID3DBlob *shared_shader()
+{
+	std::lock_guard<std::mutex> lock(g_shader_lock);
+	if (g_shader == nullptr) {
+		ID3DBlob *cs = nullptr, *cerr = nullptr;
+		if (FAILED(D3DCompile(kHlsl, std::strlen(kHlsl), "aeon_depth", nullptr, nullptr, "main",
+				"cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
+			safe_release(cs);
+			safe_release(cerr);
+			return nullptr;
+		}
+		safe_release(cerr);
+		g_shader = cs;
+	}
+	g_shader->AddRef();
+	return g_shader;
+}
+
+}
+
+void depth_normalize_warm()
+{
+	ID3DBlob *cs = shared_shader();
+	safe_release(cs);
 }
 
 DepthNormalizeD3D12::~DepthNormalizeD3D12()
@@ -149,17 +177,13 @@ bool DepthNormalizeD3D12::ensure(ID3D12Device *device, uint32_t width, uint32_t 
 	safe_release(blob);
 	safe_release(err);
 
-	ID3DBlob *cs = nullptr, *cerr = nullptr;
-	if (FAILED(D3DCompile(kHlsl, std::strlen(kHlsl), "aeon_depth", nullptr, nullptr, "main",
-			"cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &cerr))) {
-		safe_release(cs);
-		safe_release(cerr);
+	ID3DBlob *cs = shared_shader();
+	if (cs == nullptr) {
 		if (error != nullptr)
 			*error = L"depth: shader failed to compile";
 		release();
 		return false;
 	}
-	safe_release(cerr);
 	D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
 	pd.pRootSignature = root_;
 	pd.CS.pShaderBytecode = cs->GetBufferPointer();

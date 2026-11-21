@@ -8,7 +8,7 @@
 
 namespace aeon_sr::remote {
 
-constexpr uint32_t kProtocolVersion = 10;
+constexpr uint32_t kProtocolVersion = 11;
 constexpr uint32_t kMagic = 0x52535241u;
 
 constexpr uint32_t kNameChars = 96;
@@ -79,6 +79,7 @@ enum VsrStatusBit : uint32_t {
 
 constexpr uint32_t kFsrProviders = 8;
 constexpr uint32_t kFsrProviderChars = 32;
+constexpr uint32_t kNeuralModels = 8;
 constexpr uint32_t kPathChars = 260;
 
 #if defined(_MSC_VER)
@@ -179,12 +180,15 @@ struct alignas(16) Block {
 	wchar_t fsr_provider_version[64];
 	wchar_t neural_runtime_file[kPathChars];
 	wchar_t neural_capture_status[128];
+
+	uint32_t neural_model_count;
+	uint32_t neural_model_ids[kNeuralModels];
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
 
-constexpr uint32_t kBlockSize = 4896;
+constexpr uint32_t kBlockSize = 4928;
 static_assert(sizeof(PlaneDesc) == 224, "PlaneDesc changed shape; bump kProtocolVersion");
 static_assert(sizeof(UpscalerParams) == 64, "UpscalerParams crosses the wire; bump kProtocolVersion");
 static_assert(sizeof(NeuralRenderParams) == 84, "NeuralRenderParams crosses the wire; bump kProtocolVersion");
@@ -202,6 +206,7 @@ static_assert(offsetof(Block, accum_running) == 3264, "the extension moved; bump
 static_assert(offsetof(Block, neural_eval_count) == 3320, "the extension moved; bump kProtocolVersion");
 static_assert(offsetof(Block, fsr_providers) == 3336, "the extension moved; bump kProtocolVersion");
 static_assert(offsetof(Block, neural_capture_status) == 4632, "the extension moved; bump kProtocolVersion");
+static_assert(offsetof(Block, neural_model_count) == 4888, "the extension moved; bump kProtocolVersion");
 static_assert(sizeof(Block) == kBlockSize, "Block changed shape; bump kProtocolVersion and kBlockSize");
 static_assert(sizeof(wchar_t) == 2, "the name fields assume UTF-16 on both sides");
 

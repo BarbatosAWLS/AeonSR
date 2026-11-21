@@ -47,6 +47,7 @@ struct DlssD3D12Backend final : UpscalerBackend {
 	}
 
 	bool dlss_loading() const noexcept { return init_state_.load(std::memory_order_acquire) == kRunning; }
+	void join_loader() { join_init(); }
 
 	const char *name() const override;
 	reshade::api::device_api api() const override;
@@ -63,6 +64,9 @@ private:
 	std::atomic<int> init_state_{ kIdle };
 	bool init_ok_ = false;
 	void join_init();
+	static constexpr uint64_t kFeatureSettleMs = 1000, kFeatureRetryMs = 2000;
+	bool building_feature_ = false;
+	uint64_t feature_landed_ms_ = 0, feature_failed_ms_ = 0;
 	RecentLook looked_;
 	std::wstring found_layer_;
 	bool dll_found(bool may_keep);

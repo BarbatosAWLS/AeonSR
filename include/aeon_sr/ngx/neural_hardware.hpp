@@ -60,6 +60,9 @@ struct NeuralRuntimeIdentity {
 NeuralRuntimeIdentity neural_identity_in(const char *bytes, size_t size);
 
 uint32_t neural_model_to_ask(const std::vector<NeuralModelEntry> &models, uint32_t wanted) noexcept;
+uint32_t neural_model_choice(const std::vector<uint32_t> &ids, uint32_t wanted) noexcept;
+std::vector<uint32_t> neural_model_ids(const std::vector<NeuralModelEntry> &models);
+char neural_model_letter(uint32_t id) noexcept;
 const NeuralModelEntry *neural_model_named(const std::vector<NeuralModelEntry> &models, uint32_t id) noexcept;
 
 bool neural_read_runtime_file(const std::wstring &path, NeuralRuntimeKernels *out_kernels,

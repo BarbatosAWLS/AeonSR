@@ -29,7 +29,7 @@ enum class FrameGenResult : uint8_t {
 };
 
 struct FrameGenOptions {
-	OpticalFlowD3D12::Quality quality = OpticalFlowD3D12::Quality::Balanced;
+	OpticalFlowD3D12::Quality quality = OpticalFlowD3D12::Quality::High;
 	bool camera_model = false;
 	float t = 0.5f;
 
@@ -41,6 +41,7 @@ struct FrameGenOptions {
 	VendorColor color_space = VendorColor::Sdr;
 	const struct OverlayFeed *feed = nullptr;
 	uint32_t made = 0;
+	uint32_t steps = 2;
 };
 
 class FrameGenStage {
@@ -72,11 +73,19 @@ public:
 	void settings_changed(uint64_t key) noexcept;
 	uint32_t vendor_max_generated() const noexcept { return vendor_ != nullptr ? vendor_->max_generated() : 1u; }
 	uint32_t last_made() const noexcept { return last_made_; }
+	uint32_t steps() const noexcept { return steps_; }
+	uint32_t made_at_once() const noexcept { return vendor_made_ > 0 ? vendor_made_ : 1u; }
+	uint64_t own_fills() const noexcept { return own_fills_; }
+	bool last_filled() const noexcept { return last_filled_; }
+	FrameGenerator filled_for() const noexcept { return filled_for_; }
+	uint64_t memory_fills() const noexcept { return memory_fills_; }
 	static DXGI_FORMAT vendor_output_format(ID3D12Device *device, DXGI_FORMAT frame) noexcept;
 
 	OpticalFlowD3D12 &flow() noexcept { return flow_; }
 	FrameInterpolatorD3D12 &interpolator() noexcept { return interp_; }
 	ID3D12Resource *history() const noexcept { return history_; }
+	FrameGenResult record_step(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, uint32_t k, ID3D12Resource *dst,
+		D3D12_RESOURCE_STATES dst_state, const FrameGenOptions &o, std::wstring *note);
 	bool has_history() const noexcept { return have_history_; }
 
 private:
@@ -104,6 +113,15 @@ private:
 	FrameInterpolatorD3D12 interp_;
 	BlitPipelineD3D12 blit_;
 	ID3D12Resource *history_ = nullptr;
+	ID3D12Resource *prev_history_ = nullptr;
+	bool have_prev_ = false;
+	uint64_t frame_id_ = 0;
+	DXGI_FORMAT last_format_ = DXGI_FORMAT_UNKNOWN;
+	uint32_t steps_ = 2;
+	void release_history() noexcept;
+	bool write_out(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *out,
+		D3D12_RESOURCE_STATES out_state, bool copies, ID3D12Resource *dst, D3D12_RESOURCE_STATES dst_state,
+		std::wstring *note);
 	uint32_t w_ = 0, h_ = 0;
 	DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
 	bool have_history_ = false;
@@ -129,6 +147,8 @@ private:
 	bool vendor_reset_ = true;
 	ID3D12Resource *vendor_in_ = nullptr;
 	ID3D12Resource *vendor_out_ = nullptr;
+	ID3D12Resource *vendor_more_[kVendorMaxGenerated - 1] = {};
+	uint32_t vendor_made_ = 0;
 	ID3D12Resource *vendor_depth_ = nullptr;
 	ID3D12DescriptorHeap *vendor_rtv_ = nullptr;
 	ID3D12Device *vendor_tex_device_ = nullptr;
@@ -138,6 +158,13 @@ private:
 	uint32_t vendor_failures_ = 0;
 	VendorColor last_color_ = VendorColor::Sdr;
 	uint32_t last_made_ = 0;
+	uint64_t own_fills_ = 0, memory_fills_ = 0;
+	bool last_filled_ = false;
+	bool record_vendor_ = false;
+	FrameGenerator filled_for_ = FrameGenerator::AeonSR;
+	void vendor_textures_failed(FrameGenerator g);
+	uint64_t vendor_records_ = 0, stall_from_ = 0, stall_count_ = 0;
+	bool stall_read_ = false;
 	static constexpr uint32_t kVendorFailures = 30;
 };
 

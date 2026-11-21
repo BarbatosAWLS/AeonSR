@@ -44,4 +44,6 @@ private:
 	uint64_t taken_ = 0;
 };
 
+void game_jitter_warm_shaders();
+
 }

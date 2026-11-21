@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace aeon_sr {
 
@@ -16,6 +17,20 @@ inline constexpr float kSpatialScaleMax = 1.00f;
 inline constexpr float kSpatialScaleDefault = 0.88f;
 
 float clamp_spatial_scale(float scale) noexcept;
+
+inline constexpr std::string_view kFsrLiteSuffix = " Lite";
+inline bool fsr_provider_is_lite(std::string_view provider) noexcept
+{
+	return provider.size() > kFsrLiteSuffix.size() &&
+		provider.substr(provider.size() - kFsrLiteSuffix.size()) == kFsrLiteSuffix;
+}
+
+inline constexpr std::string_view kFsrProviderAuto = "Auto";
+
+inline bool fsr_provider_wants_lite(std::string_view provider, bool lite_by_default) noexcept
+{
+	return fsr_provider_is_lite(provider) || (provider.empty() && lite_by_default);
+}
 
 inline constexpr unsigned int kDebugViewCount = 5u;
 
@@ -50,6 +65,46 @@ float vsr_scale_for_mode(UpscaleMode mode) noexcept;
 #if AEONSR_FRAME_GENERATION
 inline constexpr unsigned int kFrameGenerationLimitMax = 500u;
 inline constexpr unsigned int kFrameGenerationMultiplierMax = 6u;
+enum class FrameGenExcess : unsigned int {
+	Select = 0,
+	Drop = 1,
+	Queue = 2,
+};
+inline constexpr unsigned int kFrameGenExcessCount = 3u;
+
+inline const char *frame_gen_excess_key(unsigned int e) noexcept
+{
+	switch (static_cast<FrameGenExcess>(e)) {
+	case FrameGenExcess::Drop: return "Drop";
+	case FrameGenExcess::Queue: return "Queue";
+	default: return "Select";
+	}
+}
+
+inline bool parse_frame_gen_excess(std::string_view text, unsigned int *out) noexcept
+{
+	const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+	const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+	while (!text.empty() && blank(text.front()))
+		text.remove_prefix(1);
+	while (!text.empty() && blank(text.back()))
+		text.remove_suffix(1);
+	if (text.size() == 1 && text[0] >= '0' && text[0] < static_cast<char>('0' + kFrameGenExcessCount)) {
+		*out = static_cast<unsigned int>(text[0] - '0');
+		return true;
+	}
+	for (unsigned int i = 0; i < kFrameGenExcessCount; ++i) {
+		const std::string_view key = frame_gen_excess_key(i);
+		bool same = key.size() == text.size();
+		for (size_t c = 0; c < key.size() && same; ++c)
+			same = lower(key[c]) == lower(text[c]);
+		if (same) {
+			*out = i;
+			return true;
+		}
+	}
+	return false;
+}
 #endif
 
 inline constexpr unsigned int kFunctionalRenderPresets[] = { 0u, 5u, 6u, 10u, 11u, 12u, 13u };
@@ -169,6 +224,7 @@ struct Settings {
 	bool jitter_tested_quads = true;
 	bool jitter_scene_quads = true;
 	bool depth_regrid = true;
+	bool depth_from_motion = true;
 	bool split_pairs = false;
 	bool split_catmull_rom = false;
 	bool upscaler_capture = false;
@@ -193,10 +249,13 @@ struct Settings {
 	unsigned int frame_generation_limit = 0;
 	unsigned int frame_generator = 0;
 	unsigned int frame_generation_multiplier = 0;
+	unsigned int frame_generation_excess = 0;
 	bool frame_generation_own_window = true;
 	bool frame_generation_window_host = true;
 	unsigned int frame_generation_dump = 0;
 	std::string frame_generation_dump_dir;
+	std::string frame_generation_unlocker;
+	bool frame_generation_marker = false;
 #endif
 
 	bool neural_render = false;

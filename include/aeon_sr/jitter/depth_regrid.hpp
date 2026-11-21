@@ -36,4 +36,6 @@ private:
 	uint32_t failed_w_ = 0, failed_h_ = 0;
 };
 
+void depth_regrid_warm_shaders();
+
 }

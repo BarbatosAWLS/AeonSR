@@ -1,6 +1,8 @@
 #include "aeon_sr/core/app.hpp"
 
 #include "aeon_sr/jitter/scene_snapshot.hpp"
+#include "aeon_sr/jitter/depth_regrid.hpp"
+#include "aeon_sr/core/runtime_load_scope.hpp"
 #include "aeon_sr/jitter/vulkan_constants.hpp"
 #include "aeon_sr/jitter/vulkan_viewport_hook.hpp"
 #include "aeon_sr/core/diag_report.hpp"
@@ -21,6 +23,7 @@
 #include <limits>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <psapi.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -29,9 +32,70 @@
 #include <string>
 
 namespace aeon_sr {
+
+namespace {
+
+double load_now_ms() noexcept
+{
+	static const double ms_per_tick = [] {
+		LARGE_INTEGER f{};
+		QueryPerformanceFrequency(&f);
+		return f.QuadPart != 0 ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+	}();
+	LARGE_INTEGER t{};
+	QueryPerformanceCounter(&t);
+	return static_cast<double>(t.QuadPart) * ms_per_tick;
+}
+
+class LoadScope {
+public:
+	explicit LoadScope(LoadWindow &w, bool on = true) noexcept : w_(w), on_(on), start_(load_now_ms()) {}
+	~LoadScope()
+	{
+		if (!on_)
+			return;
+		const double work = load_now_ms() - start_ - held_ - framegen_;
+		w_.add_held(held_);
+		w_.add_framegen(framegen_);
+		w_.add_work(work > 0.0 ? work : 0.0);
+	}
+	template <class F> void hold(F &&f)
+	{
+		const double t = load_now_ms();
+		f();
+		held_ += load_now_ms() - t;
+	}
+	template <class F> void framegen(F &&f)
+	{
+		const double t = load_now_ms();
+		f();
+		framegen_ += load_now_ms() - t;
+	}
+	LoadScope(const LoadScope &) = delete;
+	LoadScope &operator=(const LoadScope &) = delete;
+
+private:
+	LoadWindow &w_;
+	bool on_ = true;
+	double start_ = 0.0;
+	double held_ = 0.0, framegen_ = 0.0;
+};
+
+}
 namespace {
 
 std::unique_ptr<App> g_app;
+
+struct TurnLeave {
+	FrameOwner *owner;
+	~TurnLeave()
+	{
+		if (owner != nullptr)
+			owner->leave(GetCurrentThreadId());
+	}
+};
+
+constexpr uint64_t kEventTurnWaitMs = 2000u;
 
 std::wstring widen(const char *text)
 {
@@ -158,6 +222,9 @@ void App::keep_game_jitter_memory() noexcept
 
 void App::shutdown()
 {
+	if (shader_warm_.joinable())
+		shader_warm_.join();
+	model_peek_.join();
 	keep_game_jitter_memory();
 	reflex_.detach();
 	latency_queue_off();
@@ -184,6 +251,7 @@ void App::shutdown()
 				c.copy_ms_max);
 	}
 	engine_.wait_cpu(engine_.last_submitted());
+	release_parked(parked_claim_.load());
 	dlss11_.shutdown();
 	dlss12_.shutdown();
 	fsr11_.shutdown();
@@ -209,6 +277,7 @@ void App::shutdown()
 
 void App::shutdown_neural()
 {
+	neural_loader_.join();
 	neural12_.shutdown_device();
 	neural_last_ = 0;
 	neural_init_failed_ = false;
@@ -221,6 +290,7 @@ void App::service_neural_teardown()
 		return;
 	neural_teardown_pending_ = false;
 
+	neural_loader_.join();
 	neural12_.destroy_feature();
 	neural_last_ = 0;
 	neural_init_failed_ = false;
@@ -238,6 +308,10 @@ bool App::neural_remote_now() const noexcept
 
 void App::request_neural_capture()
 {
+	if (neural_loader_.loading()) {
+		diag_info("neural", L"capture not taken: DLSS neural rendering is still loading; press it again once it runs");
+		return;
+	}
 
 	SYSTEMTIME t{};
 	GetLocalTime(&t);
@@ -447,11 +521,14 @@ void App::run_engine_work(reshade::api::effect_runtime *runtime, const FrameInpu
 	if (observed_) {
 		hold_drawn_[observe_serial_ % kHoldDrawn].split = interface_split_;
 		const StageScope observe_end_time(stage_times_, StageTimings::Stage::ObserveEnd, inputs);
-		observer_.end(inputs.engine.device, inputs.engine.cmd, inputs.engine.color, inputs.engine.color_state,
-			hud_detected_ ? hud_restore_.mask() : nullptr, HudRestoreD3D12::kMaskState,
-			inputs.have_motion_vectors ? inputs.engine.motion : nullptr, inputs.engine.motion_state, observe_serial_);
+		if (observer_.end(inputs.engine.device, inputs.engine.cmd, inputs.engine.color, inputs.engine.color_state,
+				hud_detected_ ? hud_restore_.mask() : nullptr, HudRestoreD3D12::kMaskState,
+				inputs.have_motion_vectors ? inputs.engine.motion : nullptr, inputs.engine.motion_state, observe_serial_,
+				probe_scene_, probe_scene_state_))
+			flight_.cur().hud |= kFlightProbe;
 	}
 	observed_ = false;
+	probe_scene_ = nullptr;
 	hud_detected_ = false;
 	interface_split_ = false;
 	const FrameInputs &shown = game_scale_.active && game_scale_.done ? game_scale_shown_ : inputs;
@@ -466,8 +543,13 @@ void App::note_picture_hold()
 	FrameEdges e;
 	while (observer_.take_edges(&e)) {
 		const HoldDrawn &a = hold_drawn_[e.serial % kHoldDrawn], &b = hold_drawn_[(e.serial - 1u) % kHoldDrawn];
-		if (a.serial == e.serial && a.split && !picture_hold_.held())
-			split_cover_.feed(e.shown, e.pixels);
+		const bool mine = a.serial == e.serial;
+		split_read(split_cover_, mine && a.split, e.probe, mine ? a.held : picture_hold_.held(), e.shown,
+			e.probe_shown, e.pixels);
+		if (e.probe && e.pixels != 0u) {
+			++probes_read_;
+			probe_share_ = static_cast<uint32_t>(1000ull * e.probe_shown / e.pixels);
+		}
 		const bool moved = e.serial > 1u && a.serial == e.serial && b.serial + 1u == e.serial && a.scene && b.scene &&
 			(a.x != b.x || a.y != b.y);
 		const bool still = e.edges >= PictureHold::kMinEdges &&
@@ -539,6 +621,7 @@ void App::detect_interface(const FrameInputs &inputs)
 			barrier12(cmd, inputs.engine.color, D3D12_RESOURCE_STATE_COPY_DEST, inputs.engine.color_state);
 			interface_split_ = true;
 			flight_.cur().hud |= kFlightSplit;
+			split_cover_.used_once();
 		}
 	}
 	const SceneSnapshot::Census census = scene_snapshot().take_census();
@@ -683,15 +766,20 @@ void App::run_engine_passes(reshade::api::effect_runtime *runtime, const FrameIn
 			stage_times_.abandon_frame();
 		return;
 	}
+	if (backend != nullptr && remote_.starting() && runs_remote(backend)) {
+		backend->status = UpscalerStatus::Loading;
+		backend->last_error = L"AeonSRHost.exe, which runs it in this game, is starting";
+		backend = nullptr;
+	}
 	if (backend != nullptr && must_run_in_host(backend)) {
-		backend->status = UpscalerStatus::InitFailed;
+		backend->status = remote_.starting() ? UpscalerStatus::Loading : UpscalerStatus::InitFailed;
 		const wchar_t *const why = sizeof(void *) == 4
 			? L"a 32-bit game runs its upscaler in AeonSRHost.exe"
 			: upscaler_layer_seen()
 			? L"another program answers upscaler calls in this game (OptiScaler), so Aeon SR's upscaler runs in "
 			  L"AeonSRHost.exe, apart from it"
 			: L"the game runs its own DLSS, so Aeon SR's runs in AeonSRHost.exe";
-		backend->last_error = remote_.last_error.empty()
+		backend->last_error = remote_.starting() || remote_.last_error.empty()
 			? std::wstring(why) + L", which is starting"
 			: std::wstring(why) + L", which could not start: " + remote_.last_error;
 		backend = nullptr;
@@ -789,6 +877,8 @@ bool App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 		scope_list_lost_ = true;
 	}
 	const bool host_ran = ok && rp.backend_ran == choice && rp.upscaler_status == UpscalerStatus::Ready;
+	if (host_ran)
+		++remote_runs_;
 	if (!upscaled_here)
 		trace_cur_.set(ScopeColumn::Ran, host_ran ? 1.0 : 0.0);
 	if (host_ran && rp.list_recording && upscaler_capture_.scope_recording())
@@ -811,9 +901,15 @@ bool App::run_remote_engine_work(reshade::api::effect_runtime *runtime, const Fr
 		remote_in_width_ = rp.in_width;
 		remote_in_height_ = rp.in_height;
 	}
-	if (!neural_here && plan.neural.run && RemoteEngine::reports_neural(rp)) {
-		if (rp.neural_ran >= 0)
-			neural12_.set_status(UpscalerStatus::Ready, neural12_.text().last_error);
+	if (!neural_here && plan.neural.run && RemoteEngine::reports_neural(rp) && !neural_loader_.loading()) {
+		if (rp.neural_ran > 0) {
+			const NeuralRenderCommon::Text was = neural12_.text();
+			neural12_.set_status(UpscalerStatus::Ready,
+				was.status == UpscalerStatus::Loading ? std::wstring() : was.last_error);
+		}
+		else if (rp.neural_ran == 0)
+			neural12_.set_status(UpscalerStatus::Loading, L"DLSS neural rendering is loading in AeonSRHost.exe; "
+				L"the frame goes on without it");
 		else
 			neural12_.set_status(UpscalerStatus::EvaluateFailed, rp.message);
 		neural12_.model_width = rp.neural_model_width;
@@ -955,7 +1051,7 @@ bool App::crosses(const UpscalerBackend *backend) const noexcept
 void App::ensure_remote()
 {
 	if (!remote_wanted()) {
-		if (remote_.ready()) {
+		if (remote_.ready() || remote_.starting()) {
 			remote_.stop();
 			remote_info_ = RemoteEngine::Info{};
 			diag_info("remote", L"the engine host was closed, nothing here needs it any more");
@@ -963,14 +1059,20 @@ void App::ensure_remote()
 		remote_tried_ = false;
 		return;
 	}
+	if (remote_.starting()) {
+		const RemoteEngine::Handshake h = remote_.poll_handshake();
+		if (h == RemoteEngine::Handshake::Done)
+			diag_info("remote", remote_.describe());
+		else if (h == RemoteEngine::Handshake::Failed)
+			diag_state("remote", DiagLevel::Error, "remote", remote_.last_error);
+		return;
+	}
 	if (remote_tried_ || remote_.ready() || !engine_.ready())
 		return;
 	remote_tried_ = true;
 	remote_.host_gpu_priority_high = settings_.host_gpu_priority;
-	if (!remote_.start(engine_, module_, last_api_))
+	if (!remote_.begin_start(engine_, module_, last_api_))
 		diag_state("remote", DiagLevel::Error, "remote", remote_.last_error);
-	else
-		diag_info("remote", remote_.describe());
 }
 
 BackendChoice App::choice_of(const UpscalerBackend *backend) const noexcept
@@ -1007,7 +1109,7 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 		return;
 	const EngineRoute route = engine_route_now();
 	if (sizeof(void *) != 4 && route.dlss_to_layer && route.neural_in_host) {
-		if (remote_tried_ && !remote_.ready())
+		if (remote_tried_ && !remote_.ready() && !remote_.starting())
 			neural12_.set_status(UpscalerStatus::InitFailed, L"OptiScaler does the upscale in this game, so DLSS "
 				L"neural rendering runs in AeonSRHost.exe, which did not start: " + remote_.last_error);
 		else
@@ -1020,7 +1122,7 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 			neural12_.set_status(UpscalerStatus::InitFailed, L"another program answers DLSS calls in this game, so "
 				L"DLSS neural rendering runs in AeonSRHost.exe, after an upscaler that runs there or RTX VSR: DLSS, FSR, "
 				L"XeSS or RTX VSR. The upscaler running now writes the game's own texture.");
-		else if (remote_tried_ && !remote_.ready())
+		else if (remote_tried_ && !remote_.ready() && !remote_.starting())
 			neural12_.set_status(UpscalerStatus::InitFailed, L"another program answers DLSS calls in this game, so "
 				L"DLSS neural rendering runs in AeonSRHost.exe, which did not start: " + remote_.last_error);
 		else
@@ -1028,7 +1130,7 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 				L"DLSS neural rendering runs in AeonSRHost.exe, which is starting");
 		return;
 	}
-	if (fsr12_.fsr_device_busy() || xess12_.xess_loading() || dlss12_.dlss_loading())
+	if (fsr12_.fsr_loading() || xess12_.xess_loading() || dlss12_.dlss_loading())
 		return;
 
 	if (!gpu_.may_be_nvidia()) {
@@ -1047,21 +1149,17 @@ void App::run_neural_render(reshade::api::effect_runtime *runtime,
 	if (dev12 == nullptr)
 		return;
 
-	if (neural12_.initialized && neural12_.device != dev12)
-		neural12_.shutdown_device();
-
-	if (!neural12_.initialized) {
-		if (neural_init_failed_) {
-			neural_last_ = -1;
-			return;
-		}
-		if (!neural12_.init_device(dev12, inputs.width, inputs.height)) {
-			neural_init_failed_ = true;
-			neural_last_ = -1;
-			return;
-		}
+	switch (neural_loader_.step(neural12_, dev12, engine_.queue(), inputs.width, inputs.height,
+		inputs.engine.color, np, &neural_init_failed_)) {
+	case NeuralLoader::Step::Wait:
+		neural_last_ = 0;
+		return;
+	case NeuralLoader::Step::Failed:
+		neural_last_ = -1;
+		return;
+	case NeuralLoader::Step::Run:
+		break;
 	}
-	neural12_.set_command_queue(engine_.queue());
 
 	neural_last_ = neural12_.run(inputs.engine.cmd, inputs.engine.color, inputs.engine.color_state,
 		inputs.engine.motion, want_depth ? inputs.engine.depth : nullptr, np,
@@ -1195,6 +1293,8 @@ void App::update_ngx_layers()
 	const ULONGLONG now = GetTickCount64();
 	if (ngx_layers_scanned_ms_ != 0 && now - ngx_layers_scanned_ms_ < 1000)
 		return;
+	if (runtime_load_active())
+		return;
 	ngx_layers_scanned_ms_ = now;
 	if (!ngx_layers_.empty())
 		++ngx_layers_rescans_;
@@ -1224,6 +1324,8 @@ void App::update_ngx_layers()
 void App::update_native_dlss()
 {
 	if (native_dlss_seen_ && !(layer_dlss_started_ && !native_before_layer_))
+		return;
+	if (runtime_load_active())
 		return;
 	const ULONGLONG now = GetTickCount64();
 	const bool deciding = sizeof(void *) == 8 && settings_.enabled &&
@@ -1277,9 +1379,12 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 	if (inputs.width == 0 || inputs.height == 0)
 		return;
 
+	flow_.async_kernels = true;
 	if (!flow_.ensure(dev12, inputs.width, inputs.height, &flow_error_)) {
 		flow_failed_ = flow_.failed_permanently();
 		flow_note_ = flow_error_;
+		flow_note_benign_ = flow_.kernels_building() &&
+			flow_error_.rfind(L"warming up", 0) == 0;
 		note_flow_state();
 		return;
 	}
@@ -1290,6 +1395,8 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 	const OpticalFlowD3D12::Quality quality = OpticalFlowD3D12::Quality::High;
 
 	flow_.set_depth_logarithmic(depth_how_.logarithmic);
+	flow_.set_depth_from_motion(want_depth_from_motion(settings_.depth_from_motion,
+		active_is_dlss() ? BackendChoice::Dlss : BackendChoice::None, settings_.upscale_mode, game_scale_.active));
 	flow_.set_colour_space(static_cast<uint32_t>(color_space_));
 	stage_times_.begin(StageTimings::Stage::Flow, dev12, inputs.engine.queue, cmd12);
 	ID3D12Resource *flow_color = inputs.engine.color;
@@ -1418,10 +1525,12 @@ void App::run_internal_flow(reshade::api::effect_runtime *runtime, FrameInputs &
 					gf.color_ok ? L"fit" : L"no fit", gf.color_x, gf.color_y, gf.color_pixels, gf.motion_px, same ? 1 : 0,
 					game_jitter_.windows(), game_jitter_.last_rms(), game_jitter_.skipped());
 			if (change != GameJitterDetector::Change::None) {
-				landing_.clear_absorbed();
-				if (change != GameJitterDetector::Change::StartsJittering)
-					landing_.forget_response();
-				flow_.reset_landing();
+				if (verdict_turn_resets_landing(change, landing_.lands())) {
+					landing_.clear_absorbed();
+					if (change != GameJitterDetector::Change::StartsJittering)
+						landing_.forget_response();
+					flow_.reset_landing();
+				}
 				diag_logf(DiagLevel::Info, "jitter", change == GameJitterDetector::Change::StartsJittering
 					? L"jitter: the game jitters its own frame (%.2f px from frame to frame)"
 					: change == GameJitterDetector::Change::StopsJittering
@@ -1655,13 +1764,14 @@ void App::note_state()
 
 	const NeuralRenderCommon &nr = neural();
 	if (settings_.neural_render) {
+		const NeuralRenderCommon::Text text = nr.text();
 		std::wstring line = std::wstring(L"neural pass: ") +
 			(nr.crashed ? L"faulted"
 				: neural_last_ == 1 ? L"running"
-				: neural_last_ == -1 ? L"failed" : L"idle");
-		const std::wstring error = nr.text().last_error;
-		if (!error.empty())
-			line += L" - " + error;
+				: neural_last_ == -1 ? L"failed"
+				: text.status == UpscalerStatus::Loading ? L"loading" : L"idle");
+		if (!text.last_error.empty())
+			line += L" - " + text.last_error;
 		diag_state("neural", neural_last_ == 1 ? DiagLevel::Info : DiagLevel::Warn,
 			"neural", line);
 	}
@@ -1941,7 +2051,7 @@ bool App::active_render_size(const FrameInputs &inputs, uint32_t *w, uint32_t *h
 			*w = inputs.width;
 			*h = inputs.height;
 		}
-	} else if (active_ == &dlss12_) {
+	} else if (active_ == &dlss12_ && !dlss12_.dlss_loading()) {
 		*w = ngx12_.render_width;
 		*h = ngx12_.render_height;
 	} else if (active_ == &fsr12_) {
@@ -1957,11 +2067,113 @@ bool App::active_render_size(const FrameInputs &inputs, uint32_t *w, uint32_t *h
 	return *w != 0 && *h != 0 && inputs.width != 0 && inputs.height != 0;
 }
 
+bool App::building_bridge() const noexcept
+{
+	return building_thread_.load() == GetCurrentThreadId();
+}
+
+bool App::take_frame_turn(reshade::api::device *device)
+{
+	const uint32_t me = GetCurrentThreadId();
+	const FrameOwner::Turn turn = frame_owner_.frame(device, me);
+	if (!turn.run) {
+		release_parked(device);
+		if (device != nullptr && frame_owner_.owner() != device && !other_device_said_.exchange(true))
+			diag_logf(DiagLevel::Info, "interop", L"another device presents beside the one the add-on works on, on %hs (a "
+				L"launcher's or an interface's own window); its frames are left as it draws them",
+				api_label(device->get_api()));
+		return false;
+	}
+	drop_dying_device();
+	if (turn.taken_from != nullptr) {
+		diag_logf(DiagLevel::Info, "interop", L"the add-on's work moves to the %hs device presenting now: the device it "
+			L"was on has no swap chain on a shown window left", api_label(device->get_api()));
+		other_device_said_.store(false);
+		if (bridge_device_ != nullptr && bridge_device_ == turn.taken_from) {
+#if AEONSR_FRAME_GENERATION
+			framegen_.device_gone(bridge_device_);
+#endif
+			const bool parked = park_game_side(turn.taken_from);
+			drop_device_state(BridgeRelease::Ordinary, bridge_api_, bridge_d3d11_, !parked);
+		}
+	}
+	if (turn.became_owner) {
+		reshade::api::swapchain *const chain = latest_chain_of(device);
+		if (chain != nullptr && chain != applied_chain_)
+			apply_chain(chain, false, true);
+	}
+	return true;
+}
+
+FrameOwner::Event App::take_event_turn(const reshade::api::device *device, bool claim, uint64_t wait_ms)
+{
+	const uint32_t me = GetCurrentThreadId();
+	const uint64_t until = GetTickCount64() + wait_ms;
+	for (;;) {
+		const FrameOwner::Event e = frame_owner_.event(device, me, claim);
+		if (e == FrameOwner::Event::Yours) {
+			drop_dying_device();
+			return e;
+		}
+		if (e == FrameOwner::Event::Other)
+			return e;
+		if (GetTickCount64() >= until) {
+			diag_logf(DiagLevel::Warn, "interop", L"a device or swap chain event of the game's on thread %lu found the "
+				L"add-on's work held by thread %lu for %llu ms and went on without it", static_cast<unsigned long>(me),
+				static_cast<unsigned long>(frame_owner_.holder()), static_cast<unsigned long long>(wait_ms));
+			return e;
+		}
+		Sleep(1);
+	}
+}
+
+void App::drop_dying_device()
+{
+	const void *const dying = dying_device_.exchange(nullptr);
+	release_parked(dying);
+	if (dying == nullptr || dying != bridge_device_)
+		return;
+	diag_info("interop", L"the device the add-on worked on was destroyed during a frame on another thread; "
+		L"what was built for it goes now");
+	drop_device_state(BridgeRelease::GameDeviceGone, bridge_api_, bridge_d3d11_, true);
+}
+
+bool App::park_game_side(const void *device)
+{
+	if (bridge_api_ != reshade::api::device_api::d3d11)
+		return false;
+	const bool live = (ngx_.ngx_initialized && ngx_.device == bridge_d3d11_) || fsr11_.fsr_initialized() ||
+		vsr11_.vsr_initialized();
+	if (!live)
+		return false;
+	parked_d3d11_ = bridge_d3d11_;
+	parked_claim_.store(device);
+	parked_device_.store(device);
+	diag_info("interop", L"the Direct3D 11 upscaler of the device the work left is shut down on that device's own "
+		L"thread; the work waits for it");
+	return true;
+}
+
+void App::release_parked(const void *device)
+{
+	if (device == nullptr)
+		return;
+	const void *expected = device;
+	if (!parked_claim_.compare_exchange_strong(expected, nullptr))
+		return;
+	if (parked_d3d11_ == ngx_.device)
+		dlss11_.shutdown();
+	fsr11_.shutdown();
+	vsr11_.shutdown();
+	parked_d3d11_ = nullptr;
+	parked_device_.store(nullptr);
+}
+
 bool App::is_engine_device(reshade::api::device *device) const noexcept
 {
 	if (device == nullptr)
 		return false;
-	if (building_bridge_)
+	if (building_bridge())
 		return true;
 	return engine_.device() != nullptr && !engine_.borrowed() &&
 		device->get_api() == reshade::api::device_api::d3d12 &&
@@ -1970,19 +2182,28 @@ bool App::is_engine_device(reshade::api::device *device) const noexcept
 
 void App::ensure_bridge(reshade::api::device *device)
 {
-	if (device == nullptr || building_bridge_)
+	if (device == nullptr || building_bridge())
 		return;
 	if (bridge_ != nullptr && bridge_->ready() && bridge_device_ == device)
 		return;
-	release_bridge(BridgeRelease::Ordinary);
+	if (bridge_device_ != nullptr && bridge_device_ != device) {
+#if AEONSR_FRAME_GENERATION
+		framegen_.device_gone(bridge_device_);
+#endif
+		drop_device_state(BridgeRelease::Ordinary, bridge_api_, bridge_d3d11_, true);
+	} else {
+		release_bridge(BridgeRelease::Ordinary);
+	}
 
 	diag_logf(DiagLevel::Info, "interop", L"bridging %hs to Direct3D 12", api_label(device->get_api()));
 
-	building_bridge_ = true;
+	building_thread_.store(GetCurrentThreadId());
 	bridge_error_.clear();
 	bridge_ = make_bridge(device, engine_, &bridge_error_, settings_.force_system_memory);
-	building_bridge_ = false;
+	building_thread_.store(0u);
 	bridge_device_ = bridge_ != nullptr ? device : nullptr;
+	bridge_api_ = device->get_api();
+	bridge_d3d11_ = bridge_api_ == reshade::api::device_api::d3d11 ? native_d3d11_device(device) : nullptr;
 	if (bridge_ == nullptr) {
 		diag_error("interop", L"this graphics API could not be bridged to Direct3D 12: " +
 			(bridge_error_.empty() ? std::wstring(L"no reason given") : bridge_error_));
@@ -1995,13 +2216,13 @@ void App::ensure_bridge(reshade::api::device *device)
 
 void App::release_bridge(BridgeRelease how)
 {
-	if (building_bridge_)
+	if (building_bridge())
 		return;
-	building_bridge_ = true;
+	building_thread_.store(GetCurrentThreadId());
 	struct Done {
-		bool &flag;
-		~Done() { flag = false; }
-	} done{ building_bridge_ };
+		std::atomic<uint32_t> &thread;
+		~Done() { thread.store(0u); }
+	} done{ building_thread_ };
 	if (reflex_.attached() && reflex_.device() == static_cast<IUnknown *>(engine_.device())) {
 		reflex_.detach();
 		latency_applied_ = 0u;
@@ -2046,10 +2267,13 @@ void App::on_init_device(reshade::api::device *device)
 		}
 	}
 
-	if (!adopt_on_init(api, bridge_device_)) {
+	const uint64_t wait = api == reshade::api::device_api::d3d12 ? 0u : kEventTurnWaitMs;
+	if (!adopt_on_init(api, bridge_device_) ||
+		take_event_turn(device, true, wait) != FrameOwner::Event::Yours) {
 		pending_devices_.add(device);
 		return;
 	}
+	const TurnLeave leave{ &frame_owner_ };
 	last_api_ = api;
 	adopt_device(device);
 }
@@ -2110,14 +2334,35 @@ void App::on_destroy_device(reshade::api::device *device)
 		vulkan_constants().forget_device(device->get_native());
 	if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11)
 		GameStateGuard::release_cached();
-	const std::optional<BridgeRelease> release =
-		bridge_release_on_destroy(device, bridge_device_, device != nullptr && is_engine_device(device));
-	if (!release)
+	if (device == nullptr || is_engine_device(device))
 		return;
-	engine_.wait_cpu(engine_.last_submitted());
+	const uint64_t wait = device->get_api() == reshade::api::device_api::d3d12 ? 0u : kEventTurnWaitMs;
+	const FrameOwner::Event turn = take_event_turn(device, false, wait);
+	if (turn != FrameOwner::Event::Yours) {
+		if (turn == FrameOwner::Event::Busy) {
+			diag_logf(DiagLevel::Warn, "interop", L"the device the add-on works on was destroyed on thread %lu while "
+				L"thread %lu was in its work; what was built for it goes at the next turn",
+				static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long>(frame_owner_.holder()));
+			dying_device_.store(device);
+		}
+		frame_owner_.gone(device);
+		return;
+	}
+	const TurnLeave leave{ &frame_owner_ };
+	release_parked(device);
+	const std::optional<BridgeRelease> release = bridge_release_on_destroy(device, bridge_device_, false);
+	if (release) {
 #if AEONSR_FRAME_GENERATION
-	framegen_.device_gone(device);
+		framegen_.device_gone(device);
 #endif
+		drop_device_state(*release, device->get_api(), native_d3d11_device(device), true);
+	}
+	frame_owner_.gone(device);
+}
+
+void App::drop_device_state(BridgeRelease how, reshade::api::device_api api, ID3D11Device *d3d11, bool game_side)
+{
+	engine_.wait_cpu(engine_.last_submitted());
 	jitter_.forget();
 	scene_size_.reset();
 	depth_proof_.reset();
@@ -2131,19 +2376,21 @@ void App::on_destroy_device(reshade::api::device *device)
 	game_probe_.release();
 	depth_.release();
 
+	dlss12_.join_loader();
+	neural_loader_.join();
 	neural12_.shutdown_device();
 	dlss12_.shutdown();
 	fsr12_.shutdown();
 	xess12_.shutdown();
 
-	if (device->get_api() == reshade::api::device_api::d3d11) {
-		if (native_d3d11_device(device) == ngx_.device)
+	if (game_side && api == reshade::api::device_api::d3d11) {
+		if (d3d11 == ngx_.device)
 			dlss11_.shutdown();
 		fsr11_.shutdown();
 		vsr11_.shutdown();
 	}
 
-	release_bridge(*release);
+	release_bridge(how);
 	flow_failed_ = false;
 	depth_failed_ = false;
 	depth_how_read_ = false;
@@ -2156,9 +2403,38 @@ void App::on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 		return;
 	if (is_engine_device(swapchain->get_device()))
 		return;
-
-	flow_failed_ = false;
-	depth_failed_ = false;
+	if (!shader_warm_.joinable() && !shader_warm_started_) {
+		shader_warm_started_ = true;
+		const bool d3d11 = swapchain->get_device() != nullptr &&
+			swapchain->get_device()->get_api() == reshade::api::device_api::d3d11;
+		try {
+			shader_warm_ = std::thread([d3d11] {
+				const auto first = [] {
+					frame_observer_warm_shaders();
+					depth_normalize_warm();
+					game_jitter_warm_shaders();
+				};
+				const auto later = [d3d11] {
+					hud_restore_warm_shaders();
+					if (d3d11)
+						depth_regrid_warm_shaders();
+				};
+				std::thread a, b;
+				try { a = std::thread(first); } catch (...) {}
+				try { b = std::thread(later); } catch (...) {}
+				if (!a.joinable())
+					first();
+				blit12_warm_shaders();
+				if (!b.joinable())
+					later();
+				if (a.joinable())
+					a.join();
+				if (b.joinable())
+					b.join();
+			});
+		} catch (...) {
+		}
+	}
 
 	reshade::api::device *const device = swapchain->get_device();
 	if (device == nullptr)
@@ -2168,6 +2444,51 @@ void App::on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 	const bool have_surface = swapchain_surface_of(swapchain, &desc);
 	const uint32_t w = have_surface ? desc.texture.width : 0u;
 	const uint32_t h = have_surface ? desc.texture.height : 0u;
+
+	frame_owner_.chain(device, swapchain->get_native(), swapchain->get_hwnd(), true);
+	remember_chain(swapchain, true);
+	release_parked(device);
+	if (take_event_turn(device, false, kEventTurnWaitMs) != FrameOwner::Event::Yours) {
+		diag_logf(DiagLevel::Info, "swapchain", L"a chain of another device: %ux%u on %hs; the add-on stays on the "
+			L"device it works on", w, h, api_label(device->get_api()));
+		return;
+	}
+	const TurnLeave leave{ &frame_owner_ };
+	apply_chain(swapchain, resize, false);
+}
+
+void App::remember_chain(reshade::api::swapchain *swapchain, bool made)
+{
+	if (swapchain == nullptr)
+		return;
+	const std::lock_guard<std::mutex> lock(chains_lock_);
+	chains_.erase(std::remove(chains_.begin(), chains_.end(), swapchain), chains_.end());
+	if (made)
+		chains_.push_back(swapchain);
+}
+
+reshade::api::swapchain *App::latest_chain_of(const reshade::api::device *device)
+{
+	const std::lock_guard<std::mutex> lock(chains_lock_);
+	for (auto it = chains_.rbegin(); it != chains_.rend(); ++it)
+		if ((*it)->get_device() == device)
+			return *it;
+	return nullptr;
+}
+
+void App::apply_chain(reshade::api::swapchain *swapchain, bool resize, bool replay)
+{
+	reshade::api::device *const device = swapchain != nullptr ? swapchain->get_device() : nullptr;
+	if (device == nullptr)
+		return;
+	applied_chain_ = swapchain;
+	reshade::api::resource_desc desc;
+	const bool have_surface = swapchain_surface_of(swapchain, &desc);
+	const uint32_t w = have_surface ? desc.texture.width : 0u;
+	const uint32_t h = have_surface ? desc.texture.height : 0u;
+
+	flow_failed_ = false;
+	depth_failed_ = false;
 
 	const wchar_t *color_space_name = L"SDR";
 	switch (swapchain->get_color_space()) {
@@ -2198,16 +2519,17 @@ void App::on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 	}
 	if (have_surface)
 		diag_logf(DiagLevel::Info, "swapchain", L"chain %u%s: %ux%u %hs on %hs, %s, %u images, current index %u",
-			swapchain_inits_, resize ? L" (resized)" : L"", w, h,
+			swapchain_inits_, replay ? L" (the device now worked on)" : resize ? L" (resized)" : L"", w, h,
 			panel::format_label(static_cast<uint32_t>(desc.texture.format)),
 			api_label(last_api_), color_space_name, count, current);
 	else
 		diag_logf(DiagLevel::Warn, "swapchain", L"chain %u%s: ReShade named no image, or a zero-sized one, "
 			L"for the swap chain on %hs (%u images, current index %u); the display size is read from the "
 			L"first frame instead",
-			swapchain_inits_, resize ? L" (resized)" : L"", api_label(last_api_), count, current);
+			swapchain_inits_, replay ? L" (the device now worked on)" : resize ? L" (resized)" : L"",
+			api_label(last_api_), count, current);
 
-	if (have_surface && ngx12_.ngx_initialized && ngx12_.device == engine_.device()) {
+	if (have_surface && !dlss12_.dlss_loading() && ngx12_.ngx_initialized && ngx12_.device == engine_.device()) {
 		ngx12_.width = w;
 		ngx12_.height = h;
 	}
@@ -2225,12 +2547,33 @@ void App::on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 
 void App::on_destroy_swapchain(reshade::api::swapchain *swapchain, bool )
 {
+	reshade::api::device *const device = swapchain != nullptr ? swapchain->get_device() : nullptr;
+	const bool d3d9 = device != nullptr && device->get_api() == reshade::api::device_api::d3d9;
+	if (swapchain != nullptr)
+		frame_owner_.chain(device, swapchain->get_native(), nullptr, false);
+	remember_chain(swapchain, false);
+	if (swapchain != nullptr && swapchain == applied_chain_)
+		applied_chain_ = nullptr;
+	release_parked(device);
+	const FrameOwner::Event turn = take_event_turn(device, false, kEventTurnWaitMs);
+	if (turn != FrameOwner::Event::Yours) {
+		if (d3d9)
+			scene_snapshot().release(device);
+		if (turn == FrameOwner::Event::Busy && d3d9 && frame_owner_.owner() == device) {
+#if AEONSR_FRAME_GENERATION
+			framegen_.swapchain_gone(swapchain, engine_);
+#endif
+			if (bridge_ != nullptr && bridge_device_ == device)
+				bridge_->on_swapchain_reset();
+		}
+		return;
+	}
+	const TurnLeave leave{ &frame_owner_ };
 #if AEONSR_FRAME_GENERATION
 	framegen_.swapchain_gone(swapchain, engine_);
 #endif
-	if (swapchain != nullptr && swapchain->get_device() != nullptr &&
-		swapchain->get_device()->get_api() == reshade::api::device_api::d3d9)
-		scene_snapshot().release(swapchain->get_device());
+	if (d3d9)
+		scene_snapshot().release(device);
 	jitter_.forget();
 	if (bridge_ != nullptr)
 		bridge_->on_swapchain_reset();
@@ -2240,21 +2583,67 @@ void App::on_destroy_swapchain(reshade::api::swapchain *swapchain, bool )
 	fsr12_.on_destroy_swapchain();
 	xess12_.on_destroy_swapchain();
 	vsr11_.on_destroy_swapchain();
+	neural_loader_.join(&neural_init_failed_);
 	neural12_.destroy_feature();
 	history_.reset_pending = true;
 	invalidate_temporal_history();
 }
 
-void App::on_reloaded_effects(reshade::api::effect_runtime *)
+void App::on_reloaded_effects(reshade::api::effect_runtime *runtime)
 {
+	if (runtime != nullptr && !frame_owner_.presents_for_work(runtime->get_device()))
+		return;
 	depth_how_read_ = false;
 	history_.reset_pending = true;
 	invalidate_temporal_history();
 }
 
+void App::test_ini_reload()
+{
+	if (test_ini_reload_ == 0) {
+		wchar_t v[8]{};
+		const DWORD n = GetEnvironmentVariableW(L"AEONSR_TEST_INI_RELOAD", v, 8);
+		test_ini_reload_ = n == 1 && v[0] == L'1' ? 1 : 2;
+	}
+	if (test_ini_reload_ != 1)
+		return;
+	const uint64_t now = GetTickCount64();
+	if (now - test_ini_looked_ < 100)
+		return;
+	test_ini_looked_ = now;
+	WIN32_FILE_ATTRIBUTE_DATA a{};
+	if (!GetFileAttributesExW(ini_path_.c_str(), GetFileExInfoStandard, &a))
+		return;
+	const uint64_t written = (static_cast<uint64_t>(a.ftLastWriteTime.dwHighDateTime) << 32) |
+		a.ftLastWriteTime.dwLowDateTime;
+	const bool first = test_ini_written_ == 0;
+	if (written == test_ini_written_)
+		return;
+	test_ini_written_ = written;
+	if (first)
+		return;
+	Settings next;
+	load_settings(next, ini_path_);
+	if (next.backend >= kBackendChoiceCount)
+		next.backend = settings_.backend;
+	settings_ = next;
+	diag_set_verbose(settings_.verbose_log);
+	invalidate_temporal_history();
+	update_game_scale_hooks();
+	diag_logf(DiagLevel::Info, "settings", L"AeonSR.ini read again (AEONSR_TEST_INI_RELOAD): upscaler %u, "
+		L"mode %u", settings_.backend, settings_.upscale_mode);
+}
+
 void App::on_present(reshade::api::effect_runtime *runtime)
 {
+	reshade::api::device *const present_device = runtime != nullptr ? runtime->get_device() : nullptr;
+	if (present_device != nullptr && (is_engine_device(present_device) || !take_frame_turn(present_device)))
+		return;
+	const TurnLeave present_leave{ present_device != nullptr ? &frame_owner_ : nullptr };
+	test_ini_reload();
+	refresh_panel_snapshot();
 	clock_.tick();
+	LoadScope load_time(load_);
 	if (runtime != nullptr) {
 		const uint64_t tick = GetTickCount64();
 		if (latency_hwnd_ == nullptr || (runtime->get_hwnd() != latency_hwnd_ && tick - latency_hwnd_tick_ > 1000u)) {
@@ -2285,17 +2674,107 @@ void App::on_present(reshade::api::effect_runtime *runtime)
 			flight_commit();
 			trace_close();
 		}
+		note_load(runtime);
 	}
 	service_report();
 #if AEONSR_FRAME_GENERATION
-	run_frame_generation(runtime);
-	pace_to_display(runtime);
+	if (settings_.frame_generation)
+		load_time.framegen([&] { run_frame_generation(runtime); });
+	else
+		run_frame_generation(runtime);
+	if (settings_.pace_to_display)
+		load_time.hold([&] { pace_to_display(runtime); });
+	else
+		pace_to_display(runtime);
 #endif
 	if (runtime != nullptr) {
 		if (latency_applied_ != 0u && runtime->get_hwnd() == latency_hwnd_) {
 			latency_.sent(latency_clock_ms());
 			reflex_.marker(ReflexMarker::PresentStart, reflex_frame_);
 		}
+	}
+}
+
+LoadProcess App::read_load_process() const
+{
+	LoadProcess p;
+	HANDLE self = GetCurrentProcess();
+	FILETIME created{}, exited{}, kernel{}, user{};
+	if (GetProcessTimes(self, &created, &exited, &kernel, &user)) {
+		const auto ms = [](const FILETIME &t) {
+			return static_cast<double>((static_cast<uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime) / 10000.0;
+		};
+		p.cpu_ms = ms(kernel) + ms(user);
+	}
+	PROCESS_MEMORY_COUNTERS_EX mem{};
+	mem.cb = sizeof(mem);
+	if (GetProcessMemoryInfo(self, reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&mem), sizeof(mem)))
+		p.private_mb = static_cast<double>(mem.PrivateUsage) / (1024.0 * 1024.0);
+	DWORD handles = 0;
+	if (GetProcessHandleCount(self, &handles))
+		p.handles = static_cast<int64_t>(handles);
+	uint64_t usage = 0, budget = 0;
+	if (engine_.video_memory(&usage, &budget)) {
+		p.gpu_usage_mb = static_cast<double>(usage) / (1024.0 * 1024.0);
+		p.gpu_budget_mb = static_cast<double>(budget) / (1024.0 * 1024.0);
+	}
+	if (engine_.ready() && !engine_.borrowed()) {
+		p.engine_wait_ms = engine_.begin_stall_ms();
+		p.engine_made = engine_.stalls_epoch();
+	}
+	p.holds_on = latency_applied_ != 0u;
+#if AEONSR_FRAME_GENERATION
+	p.holds_on = p.holds_on || (settings_.pace_to_display && pace_runtime_ != 0);
+	p.framegen_on = settings_.frame_generation;
+#endif
+	return p;
+}
+
+LoadKept App::load_kept()
+{
+	const reshade::api::device_api api = last_api_;
+	const bool d3d11 = api == reshade::api::device_api::d3d11;
+	const SceneJitterLoad hooks = scene_jitter_load();
+	LoadKept kept;
+	kept.add("pipelines with facts", hooks.pipelines);
+	if (!d3d11)
+		kept.add("pipelines untested", hooks.untested);
+	if (api == reshade::api::device_api::d3d12 || api == reshade::api::device_api::vulkan ||
+		api == reshade::api::device_api::opengl)
+		kept.add("vertex classes (emptied at 8192)", hooks.vertex_classes);
+	if (api == reshade::api::device_api::d3d12)
+		kept.add("w terms (emptied at 8192)", hooks.w_terms);
+	if (d3d11 || api == reshade::api::device_api::d3d10)
+		kept.add("constant reads", hooks.constant_reads);
+	kept.add("context stores", hooks.contexts);
+	if (d3d11)
+		kept.add("command list stores", hooks.lists);
+	{
+		const std::lock_guard<std::mutex> lock(runtimes_lock_);
+		kept.add("ReShade runtimes", runtimes_.size());
+	}
+	return kept;
+}
+
+void App::note_load(reshade::api::effect_runtime *runtime)
+{
+	const uintptr_t key = reinterpret_cast<uintptr_t>(runtime);
+	if (key == 0 || key != (load_runtime_ != 0 ? load_runtime_ : trace_runtime_))
+		return;
+	const double now_ms = load_now_ms();
+	const double frame_ms = load_last_ms_ >= 0.0 ? now_ms - load_last_ms_ : 0.0;
+	load_last_ms_ = now_ms;
+	const uint64_t now = GetTickCount64();
+	switch (load_.present(now, frame_ms)) {
+	case LoadWindow::Step::Baseline:
+		load_runtime_ = key;
+		load_.baseline(read_load_process());
+		break;
+	case LoadWindow::Step::Counted:
+		break;
+	case LoadWindow::Step::Due:
+		diag_info("load", load_.take(now, read_load_process(), load_kept()));
+		break;
 	}
 }
 
@@ -2458,6 +2937,8 @@ void App::latency_wait_until(double t_ms)
 
 void App::on_finish_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
 {
+	reshade::api::device *const finish_device = swapchain != nullptr ? swapchain->get_device() : nullptr;
+	LoadScope load_time(load_, finish_device != nullptr && frame_owner_.presents_for_work(finish_device));
 #if AEONSR_FRAME_GENERATION
 	if (swapchain != nullptr && pace_runtime_ != 0 && settings_.pace_to_display && !settings_.frame_generation &&
 		swapchain->get_hwnd() == reinterpret_cast<reshade::api::effect_runtime *>(pace_runtime_)->get_hwnd())
@@ -2491,9 +2972,9 @@ void App::on_finish_present(reshade::api::command_queue *queue, reshade::api::sw
 #endif
 	if (latency_applied_ == 2u) {
 		reflex_.marker(ReflexMarker::PresentEnd, reflex_frame_);
-		reflex_.sleep();
+		load_time.hold([&] { reflex_.sleep(); });
 		if (slot >= 0.0)
-			latency_wait_until(latency_.frame_start(latency_clock_ms(), slot));
+			load_time.hold([&] { latency_wait_until(latency_.frame_start(latency_clock_ms(), slot)); });
 		++reflex_frame_;
 		reflex_.marker(ReflexMarker::SimulationStart, reflex_frame_);
 		reflex_.marker(ReflexMarker::SimulationEnd, reflex_frame_);
@@ -2505,7 +2986,7 @@ void App::on_finish_present(reshade::api::command_queue *queue, reshade::api::sw
 		paced_elsewhere = !drained && display_pacer_.engaged();
 #endif
 		if (!paced_elsewhere)
-			latency_wait_until(latency_.frame_start(latency_clock_ms(), slot));
+			load_time.hold([&] { latency_wait_until(latency_.frame_start(latency_clock_ms(), slot)); });
 	}
 	const double started = latency_clock_ms();
 	latency_.started(started);
@@ -2721,13 +3202,27 @@ void App::pace_to_display(reshade::api::effect_runtime *runtime)
 #if AEONSR_FRAME_GENERATION
 void App::run_frame_generation(reshade::api::effect_runtime *runtime)
 {
+	run_frame_generation_once(runtime);
+	const FrameGeneration::LastCall c = framegen_.last_call();
+	FlightRecord &fr = flight_.cur();
+	fr.fg = c.route < static_cast<uint8_t>(FlightFg::Count) ? static_cast<FlightFg>(c.route) : FlightFg::Off;
+	fr.fg_round_ms = c.round_ms >= 0.0f ? c.round_ms : kFlightNone;
+	fr.fg_wait_ms = c.wait_ms >= 0.0f ? c.wait_ms : kFlightNone;
+}
+
+void App::run_frame_generation_once(reshade::api::effect_runtime *runtime)
+{
+	reshade::api::device *const device = runtime != nullptr ? runtime->get_device() : nullptr;
+	if (device == nullptr || is_engine_device(device) || !take_frame_turn(device))
+		return;
+	const TurnLeave leave{ &frame_owner_ };
+	if (parked_device_.load() != nullptr)
+		return;
 	if (!settings_.frame_generation) {
+		framegen_.follow_fullscreen(runtime, false);
 		framegen_.off();
 		return;
 	}
-	reshade::api::device *const device = runtime != nullptr ? runtime->get_device() : nullptr;
-	if (device == nullptr || is_engine_device(device))
-		return;
 	if (pending_devices_.take(device))
 		adopt_device(device);
 	ensure_bridge(device);
@@ -2875,6 +3370,11 @@ void App::on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 
 void App::on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+	if (runtime != nullptr && reinterpret_cast<uintptr_t>(runtime) == load_runtime_) {
+		load_ = LoadWindow{};
+		load_runtime_ = 0;
+		load_last_ms_ = -1.0;
+	}
 	if (runtime != nullptr && runtime->get_hwnd() == latency_hwnd_) {
 		reflex_.detach();
 		latency_queue_off();
@@ -2933,6 +3433,9 @@ void App::on_game_present(reshade::api::command_queue *queue, reshade::api::swap
 		return;
 	if (game_scale_.attempted || game_scale_holds_present())
 		return;
+	if (!take_frame_turn(device))
+		return;
+	const TurnLeave leave{ &frame_owner_ };
 	const GameStateGuard keep(device, cmd_list);
 	const reshade::api::resource back_buffer = current_back_buffer_of(swapchain);
 	if (back_buffer.handle != 0)
@@ -2950,6 +3453,13 @@ void App::run_frame(
 {
 	if (runtime == nullptr)
 		return;
+	reshade::api::device *const frame_device = runtime->get_device();
+	if (frame_device == nullptr || is_engine_device(frame_device) || !take_frame_turn(frame_device))
+		return;
+	const TurnLeave leave{ &frame_owner_ };
+	if (parked_device_.load() != nullptr)
+		return;
+	const LoadScope load_time(load_);
 
 	{
 		RuntimeJitterCounts counts(runtime);
@@ -3038,7 +3548,8 @@ void App::run_frame(
 	service_neural_teardown();
 
 	if (!settings_.neural_render) {
-		neural12_.accum.stop();
+		if (!neural_loader_.loading())
+			neural12_.accum.stop();
 		if (remote_extras_.accum_target != 0) {
 			++remote_extras_.accum_epoch;
 			remote_extras_.accum_target = 0;
@@ -3067,7 +3578,8 @@ void App::run_frame(
 			b->last_error = why;
 		}
 		ngx_.status = UpscalerStatus::UnsupportedApi;
-		ngx12_.status = UpscalerStatus::UnsupportedApi;
+		if (!dlss12_.dlss_loading())
+			ngx12_.status = UpscalerStatus::UnsupportedApi;
 		flight_.cur().blocked = FlightBlocked::NoBridge;
 		note_frame_blocked(why);
 		return;
@@ -3117,21 +3629,36 @@ void App::run_frame(
 
 	BridgeInputs bin = bridge_inputs_of(inputs, after_effects);
 	SceneSnapshotTaken snap;
+	split_plan_ = SplitPlan{};
+	probe_scene_ = nullptr;
 	if (settings_.keep_interface)
 		scene_snapshot().prepare(runtime->get_device());
 	if (settings_.keep_interface) {
 		scene_snapshot().end_frame_at_present();
 		const bool took = scene_snapshot().take(jitter_.drawn().serial, &snap);
-		const bool covered = split_cover_.present();
+		split_plan_ = split_plan(split_cover_, split_gate_, jitter_.drawn().valid, took, game_scale_.active);
 		if (split_cover_.started) {
 			split_cover_.started = false;
-			diag_logf(DiagLevel::Info, "interface", L"interface: the window before the interface left out for the next "
-				L"%u frames: what it leaves to the restore covered more than half the window on %u of the last %u frames "
-				L"that used it, a pass over the whole picture after the copy rather than an interface; the restore puts "
-				L"back what holds still meanwhile", SplitCover::kRefuse, SplitCover::kOver, SplitCover::kWindow);
+			probes_read_ = 0;
+			diag_logf(DiagLevel::Info, "interface", L"interface: the window before the interface left out: what it "
+				L"leaves to the restore covered more than half the window on %u of the last %u frames that used it, a "
+				L"pass over the whole picture after the copy rather than an interface; the restore puts back what holds "
+				L"still meanwhile, and about one frame in %u carries the copy without using it to tell when it may come "
+				L"back (%u in a row with %u%% of the window or less, after at least %u frames)", SplitCover::kOver,
+				SplitCover::kWindow, SplitCover::kProbeEvery, split_cover_.needed(), SplitCover::kBackShare,
+				split_cover_.hold);
 		}
-		if (split_gate_present(split_gate_, jitter_.drawn().valid, took) && covered &&
-			!game_scale_.active) {
+		if (split_cover_.returned) {
+			split_cover_.returned = false;
+			if (split_cover_.blind_back)
+				diag_logf(DiagLevel::Info, "interface", L"interface: the window before the interface tried again: no "
+					L"frame carrying it without using it was read back in %u", split_cover_.blind_limit());
+			else
+				diag_logf(DiagLevel::Info, "interface", L"interface: the window before the interface back: it would "
+					L"have left %.1f%% of the window to the restore on the last of %u frames that carried it in a row "
+					L"(%u read since it was left out)", 0.1 * probe_share_, split_cover_.needed(), probes_read_);
+		}
+		if (split_plan_.carry) {
 			bin.scene = snap.resource;
 			bin.scene_state = snap.state;
 		}
@@ -3164,8 +3691,12 @@ void App::run_frame(
 	inputs.engine.color_state = bframe.color_state;
 	inputs.engine.depth_state = bframe.depth_state;
 	inputs.engine.motion_state = bframe.motion_state;
-	inputs.engine.scene = bframe.scene;
+	split_carried(split_cover_, split_plan_, bframe.scene != nullptr);
+	const SplitRoute<ID3D12Resource> route = split_route(split_plan_, bframe.scene);
+	inputs.engine.scene = route.scene;
 	inputs.engine.scene_state = bframe.scene_state;
+	probe_scene_ = route.probe;
+	probe_scene_state_ = bframe.scene_state;
 	inputs.engine.native = bframe.native;
 	if (bframe.width != 0)
 		inputs.width = bframe.width;
@@ -3205,6 +3736,7 @@ void App::run_frame(
 			HoldDrawn &h = hold_drawn_[++observe_serial_ % kHoldDrawn];
 			h.serial = observe_serial_;
 			h.split = false;
+			h.held = picture_hold_.held();
 			h.scene = drawn.valid && drawn.moved != 0;
 			h.x = drawn.x;
 			h.y = drawn.y;
@@ -3767,6 +4299,7 @@ PanelState App::panel_state(bool for_overlay)
 		if (!fsr_is_11) {
 			if (!fsr12_.fsr_loading()) {
 				s.fsr_provider_version = fsr12_.provider_version;
+				s.fsr_lite_default_failed = fsr12_.lite_default_failed();
 				for (const auto &pv : fsr12_.providers)
 					s.fsr_providers.push_back(pv.name);
 			}
@@ -3845,7 +4378,10 @@ PanelState App::panel_state(bool for_overlay)
 			s.neural_runtime_version = nt.identity.file_version;
 			s.neural_runtime_certificate = nt.identity.has_certificate;
 			s.neural_runtime_sha256 = nt.sha256;
+			s.neural_models = neural_model_ids(nt.identity.models);
 		}
+		if (s.neural_models.empty())
+			s.neural_models = model_peek_.models();
 		s.neural_runtime_candidates = nt.candidates;
 		s.neural_runtime_minimum = nr.runtime_minimum_architecture;
 		s.neural_reported_architecture = nr.reported_architecture;
@@ -3861,7 +4397,8 @@ PanelState App::panel_state(bool for_overlay)
 		s.neural_gpu_ms = static_cast<float>(nr12.timer.last_ms);
 		s.neural_eval_rows = nr12.last_eval_rows;
 		s.neural_area_share = nr12.last_area_share;
-		s.neural_capture_status = nr12.capture.last;
+		if (!neural_loader_.loading())
+			s.neural_capture_status = nr12.capture.last;
 		s.accum_running = nr12.accum.running;
 		s.accum_holding = nr12.accum.step() == AccumStep::Hold;
 		s.accum_done = nr12.accum.done;
@@ -3974,7 +4511,7 @@ PanelState App::panel_state(bool for_overlay)
 	s.upscalers_remote = true;
 #endif
 	s.host_ready = remote_.ready();
-	if (!s.host_ready && remote_tried_ && remote_wanted())
+	if (!s.host_ready && remote_tried_ && remote_wanted() && !remote_.starting())
 		s.host_error = remote_.last_error.empty() ? std::wstring(L"it did not start") : remote_.last_error;
 
 	if (s.upscalers_remote && !s.host_ready) {
@@ -3992,6 +4529,21 @@ PanelState App::panel_state(bool for_overlay)
 		if (remote_in_width_ != 0) {
 			s.upscaler_render_width = remote_in_width_;
 			s.upscaler_render_height = remote_in_height_;
+		}
+		if (s.active_is_dlss) {
+			if (remote_out_width_ != 0) {
+				s.ngx_width = remote_out_width_;
+				s.ngx_height = remote_out_height_;
+			}
+			if (remote_in_width_ != 0) {
+				s.ngx_render_width = remote_in_width_;
+				s.ngx_render_height = remote_in_height_;
+			}
+			s.ngx_eval_count = remote_runs_;
+			if (remote_runs_ != 0) {
+				s.ngx_dll_present = true;
+				s.ngx_initialized = true;
+			}
 		}
 		if (remote_info_.valid && active_ == static_cast<const UpscalerBackend *>(&fsr12_)) {
 			s.fsr_providers = remote_info_.fsr_providers;
@@ -4030,6 +4582,7 @@ PanelState App::panel_state(bool for_overlay)
 			s.neural_runtime_certificate = has(remote::kNeuralCertificate);
 			s.neural_runtime_sha256 = i.neural_runtime_sha256;
 		}
+		s.neural_models = i.neural_models;
 		s.neural_area_share = i.neural_area_share;
 		if (!i.neural_capture_status.empty())
 			s.neural_capture_status = i.neural_capture_status;
@@ -4074,7 +4627,9 @@ void App::apply_panel_actions(const PanelActions &actions)
 	if (actions.neural_capture)
 		request_neural_capture();
 
-	if (actions.accum_start || actions.accum_stop) {
+	if ((actions.accum_start || actions.accum_stop) && neural_loader_.loading()) {
+		diag_info("neural", L"screenshot accumulation not changed: DLSS neural rendering is still loading");
+	} else if (actions.accum_start || actions.accum_stop) {
 		NeuralRenderD3D12 &nr = neural12_;
 		++remote_extras_.accum_epoch;
 		remote_extras_.accum_target = actions.accum_start ? clamp_accum_iterations(settings_.accum_iterations) : 0u;
@@ -4107,14 +4662,37 @@ void App::apply_panel_actions(const PanelActions &actions)
 
 void App::draw_overlay(reshade::api::effect_runtime *runtime)
 {
+	reshade::api::device *const overlay_device = runtime != nullptr ? runtime->get_device() : nullptr;
+	const LoadScope load_time(load_, overlay_device != nullptr && frame_owner_.presents_for_work(overlay_device));
 	i18n::follow_reshade(runtime);
-	neural_runtime_present();
-	const PanelState state = panel_state(true);
-	PanelActions actions;
-	panel::draw_overlay(state, settings_, actions);
-	if (actions.save_report || actions.copy_report)
-		write_report(state, actions.copy_report);
-	apply_panel_actions(actions);
+	reshade::api::device *const device = runtime != nullptr ? runtime->get_device() : nullptr;
+	if (device != nullptr && frame_owner_.presents_for_work(device) && take_frame_turn(device)) {
+		const TurnLeave leave{ &frame_owner_ };
+		neural_runtime_present();
+		{
+			const NeuralRenderCommon::Text t = neural12_.text();
+			if (!t.targets_known && !t.candidates.empty())
+				model_peek_.start(t.candidates.front());
+		}
+		const PanelState state = panel_state(true);
+		PanelActions actions;
+		panel::draw_overlay(state, settings_, actions);
+		if (actions.save_report || actions.copy_report)
+			write_report(state, actions.copy_report);
+		apply_panel_actions(actions);
+		return;
+	}
+	panel_wanted_overlay_.store(true);
+	panel_wanted_until_.store(GetTickCount64() + 1000u);
+	PanelSnapshot snap = panel_snapshot_copy();
+	ImGui::TextWrapped("%s", "Aeon SR works on the game's own window; open this menu there to change its settings.");
+	if (!panel_foreign_said_.exchange(true))
+		diag_info("panel", L"the menu was opened over another device's window: it shows the game's state and "
+			L"changes nothing there");
+	if (!snap.valid)
+		return;
+	PanelActions ignored;
+	panel::draw_overlay(snap.state, snap.settings, ignored);
 }
 
 void App::write_report(const PanelState &state, bool to_clipboard)
@@ -4322,6 +4900,7 @@ void App::service_report()
 		{ "AeonSR.log", diag_log_path() },
 		{ "AeonSRHost.log", join_path(dir, L"AeonSRHost.log") },
 		{ "AeonSRHost-window.log", join_path(dir, L"AeonSRHost-window.log") },
+		{ "AeonSRHost-framegen.log", join_path(dir, L"AeonSRHost-framegen.log") },
 		{ "ReShade.log", join_path(base, L"ReShade.log") },
 		{ "AeonSR.ini", ini_path_ },
 		{ "ReShade.ini", join_path(base, L"ReShade.ini") },
@@ -4366,10 +4945,44 @@ void App::service_report()
 
 void App::draw_osd(reshade::api::effect_runtime *runtime)
 {
+	reshade::api::device *const device = runtime != nullptr ? runtime->get_device() : nullptr;
+	if (device != nullptr && frame_owner_.presents_for_work(device) && take_frame_turn(device)) {
+		const TurnLeave leave{ &frame_owner_ };
+		const LoadScope load_time(load_);
+		if (!settings_.show_osd)
+			return;
+		i18n::follow_reshade(runtime);
+		panel::draw_osd(panel_state(false), settings_);
+		return;
+	}
 	if (!settings_.show_osd)
 		return;
+	panel_wanted_until_.store(GetTickCount64() + 1000u);
+	PanelSnapshot snap = panel_snapshot_copy();
+	if (!snap.valid || !snap.settings.show_osd)
+		return;
+	if (!osd_foreign_said_.exchange(true))
+		diag_info("panel", L"the OSD over another device's window shows the game's state as the game's thread last saw it");
 	i18n::follow_reshade(runtime);
-	panel::draw_osd(panel_state(false), settings_);
+	panel::draw_osd(snap.state, snap.settings);
+}
+
+void App::refresh_panel_snapshot()
+{
+	if (GetTickCount64() > panel_wanted_until_.load())
+		return;
+	PanelSnapshot snap;
+	snap.valid = true;
+	snap.state = panel_state(panel_wanted_overlay_.exchange(false));
+	snap.settings = settings_;
+	const std::lock_guard<std::mutex> lock(panel_snapshot_lock_);
+	panel_snapshot_ = std::move(snap);
+}
+
+App::PanelSnapshot App::panel_snapshot_copy()
+{
+	const std::lock_guard<std::mutex> lock(panel_snapshot_lock_);
+	return panel_snapshot_;
 }
 
 App *app() noexcept

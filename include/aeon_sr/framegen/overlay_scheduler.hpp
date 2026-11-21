@@ -131,6 +131,10 @@ public:
 
 	OverlayChoice choose(double display_ms, double period_ms) noexcept;
 
+	void set_queue(bool on) noexcept { queue_ = on; }
+	bool queue() const noexcept { return queue_; }
+	uint32_t unshown() const noexcept;
+
 	double latency_ms() const noexcept { return latency_; }
 	double usable_lag_ms() const noexcept { return lag_stat(); }
 	uint64_t reals_shown() const noexcept { return reals_shown_; }
@@ -180,6 +184,10 @@ private:
 	uint64_t last_index_of_ = 0;
 	uint64_t plan_b_ = 0;
 	double plan_at_ = 0.0, plan_from_ = 0.0, plan_t0_ = 0.0, plan_t_ = 0.0;
+	bool queue_ = false;
+	uint32_t q_index_ = 0;
+	uint64_t q_of_ = 0;
+	OverlayChoice choose_queue(double display_ms) noexcept;
 };
 
 }

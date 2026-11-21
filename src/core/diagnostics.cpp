@@ -65,9 +65,12 @@ float elapsed_locked(LogState &s)
 		static_cast<double>(now.QuadPart - s.start) / static_cast<double>(s.freq));
 }
 
+constexpr size_t kLineChars = 4096;
+
 std::wstring wformat(const wchar_t *fmt, ...)
 {
-	wchar_t buf[1024]{};
+	static thread_local wchar_t buf[kLineChars];
+	buf[0] = L'\0';
 	va_list args;
 	va_start(args, fmt);
 	_vsnwprintf_s(buf, _TRUNCATE, fmt, args);
@@ -424,7 +427,8 @@ void diag_logf(DiagLevel level, const char *tag, const wchar_t *fmt, ...)
 		return;
 	if (level == DiagLevel::Trace && !diag_verbose())
 		return;
-	wchar_t buf[1024]{};
+	static thread_local wchar_t buf[kLineChars];
+	buf[0] = L'\0';
 	va_list args;
 	va_start(args, fmt);
 	_vsnwprintf_s(buf, _TRUNCATE, fmt, args);

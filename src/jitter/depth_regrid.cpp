@@ -2,6 +2,7 @@
 #include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/interop/shader_cache.hpp"
 
 #include <d3dcompiler.h>
 
@@ -102,9 +103,10 @@ bool DepthRegridD3D11::ensure(ID3D11Device *device, uint32_t w, uint32_t h)
 	if (failed_)
 		return false;
 	if (cs_ == nullptr) {
-		ID3DBlob *blob = nullptr, *err = nullptr;
-		if (FAILED(D3DCompile(kDepthRegridHlsl, std::strlen(kDepthRegridHlsl), "aeon_depth_regrid", nullptr, nullptr,
-				"CSRegrid", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err)) ||
+		ID3DBlob *err = nullptr;
+		ID3DBlob *blob = shader_cache_compile(kDepthRegridHlsl, std::strlen(kDepthRegridHlsl), "aeon_depth_regrid",
+			"CSRegrid", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, &err);
+		if (blob == nullptr ||
 			FAILED(device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &cs_))) {
 			std::wstring what = L"depth regrid: the compute shader did not build";
 			if (err != nullptr) {
@@ -229,6 +231,12 @@ ID3D11ShaderResourceView *DepthRegridD3D11::regrid(ID3D11DeviceContext *ctx, ID3
 	safe_release(old_uav);
 	safe_release(old_cb);
 	return srv_;
+}
+
+void depth_regrid_warm_shaders()
+{
+	shader_cache_warm(kDepthRegridHlsl, std::strlen(kDepthRegridHlsl), "aeon_depth_regrid", "CSRegrid", "cs_5_0",
+		D3DCOMPILE_OPTIMIZATION_LEVEL3);
 }
 
 }

@@ -3,8 +3,10 @@
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/framegen/fg_host_protocol.hpp"
 #include "aeon_sr/framegen/vendor_frame_gen.hpp"
+#include "aeon_sr/framegen/vendor_frame_gen_impl.hpp"
 #include "aeon_sr/interop/blit_d3d12.hpp"
 #include "aeon_sr/interop/interop.hpp"
+#include "aeon_sr/ngx/ngx_dlssg_unlocker.hpp"
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -58,6 +60,22 @@ double qpc_ms() noexcept
 	LARGE_INTEGER t{};
 	QueryPerformanceCounter(&t);
 	return static_cast<double>(t.QuadPart) * inv;
+}
+
+std::wstring game_folder(uint32_t pid)
+{
+	const HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (p == nullptr)
+		return std::wstring();
+	wchar_t b[MAX_PATH * 2]{};
+	DWORD n = MAX_PATH * 2;
+	const BOOL ok = QueryFullProcessImageNameW(p, 0, b, &n);
+	CloseHandle(p);
+	if (!ok || n == 0)
+		return std::wstring();
+	std::wstring path(b, n);
+	const size_t slash = path.find_last_of(L"\\/");
+	return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
 }
 
 void copy_text(volatile wchar_t *dst, uint32_t chars, const std::wstring &text) noexcept
@@ -340,6 +358,15 @@ int run_framegen_host(uint64_t block_handle)
 	}
 	diag_logf(DiagLevel::Info, "framegen", L"AeonSRHost running frame generation for game %u",
 		static_cast<unsigned>(block->game_pid));
+	{
+		UnlockerConfig unlocker;
+		unlocker.mode = UnlockerMode::Load;
+		unlocker.game_dir = game_folder(block->game_pid);
+		configure_dlssg_unlocker(unlocker);
+		if (block->magic == kMagic && block->version == kVersion &&
+				block->generator == static_cast<uint32_t>(FrameGenerator::Dlss))
+			prepare_dlssg_unlocker(vendor_module_directory());
+	}
 	int code = ExitOk;
 	{
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);

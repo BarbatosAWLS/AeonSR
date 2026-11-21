@@ -7,6 +7,7 @@
 #include "aeon_sr/interop/interop.hpp"
 #include "aeon_sr/interop/gpu12.hpp"
 #include "aeon_sr/ngx/ngx_dlssnr.hpp"
+#include "aeon_sr/ngx/neural_loader.hpp"
 #include "aeon_sr/ngx/ngx_runtime_d3d12.hpp"
 #include "aeon_sr/interop/remote_protocol.hpp"
 
@@ -80,6 +81,8 @@ private:
 	XessD3D12Backend xess_;
 	VsrD3D11Backend vsr_;
 	NeuralRenderD3D12 neural_;
+	NeuralLoader neural_loader_;
+	NeuralModelPeek model_peek_;
 	bool neural_init_failed_ = false;
 	void take_extras();
 	void write_info() noexcept;

@@ -5,8 +5,11 @@
 #include "aeon_sr/core/present_drive.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
+#include <thread>
 #include <vector>
+#include "aeon_sr/ngx/neural_loader.hpp"
 #include "aeon_sr/upscalers/backend_dlss.hpp"
 #include "aeon_sr/upscalers/backend_fsr.hpp"
 #include "aeon_sr/upscalers/backend_vsr.hpp"
@@ -16,6 +19,7 @@
 #include "aeon_sr/core/frame_inputs.hpp"
 #include "aeon_sr/core/frame_plan.hpp"
 #include "aeon_sr/core/flight_recorder.hpp"
+#include "aeon_sr/core/load_report.hpp"
 #include "aeon_sr/core/report_bundle.hpp"
 #include "aeon_sr/jitter/scene_snapshot.hpp"
 #include "aeon_sr/jitter/frame_shift.hpp"
@@ -59,6 +63,12 @@ namespace aeon_sr {
 class App {
 public:
 	explicit App(HMODULE module);
+	~App()
+	{
+		if (shader_warm_.joinable())
+			shader_warm_.detach();
+		model_peek_.abandon();
+	}
 
 	void on_init_device(reshade::api::device *device);
 	void on_destroy_device(reshade::api::device *device);
@@ -110,10 +120,17 @@ public:
 private:
 	HMODULE module_ = nullptr;
 	std::wstring ini_path_;
+	std::thread shader_warm_;
+	bool shader_warm_started_ = false;
+	int test_ini_reload_ = 0;
+	uint64_t test_ini_written_ = 0, test_ini_looked_ = 0;
+	void test_ini_reload();
 	Settings settings_;
 	NgxRuntime ngx_;
 	NgxRuntimeD3D12 ngx12_;
 	NeuralRenderD3D12 neural12_;
+	NeuralLoader neural_loader_;
+	NeuralModelPeek model_peek_;
 	DlssD3D11Backend dlss11_;
 	DlssD3D12Backend dlss12_;
 	Fsr31D3D11Backend fsr11_;
@@ -186,6 +203,7 @@ private:
 	bool remote_tried_ = false;
 	uint32_t remote_out_width_ = 0, remote_out_height_ = 0;
 	uint32_t remote_in_width_ = 0, remote_in_height_ = 0;
+	uint64_t remote_runs_ = 0;
 	RemoteEngine::Extras remote_extras_;
 	RemoteEngine::Info remote_info_;
 	bool neural_remote_now() const noexcept;
@@ -212,7 +230,41 @@ private:
 	FrameBridge *bridge_ = nullptr;
 	std::wstring bridge_error_;
 	reshade::api::device *bridge_device_ = nullptr;
-	bool building_bridge_ = false;
+	reshade::api::device_api bridge_api_ = reshade::api::device_api::d3d11;
+	ID3D11Device *bridge_d3d11_ = nullptr;
+	std::atomic<uint32_t> building_thread_{ 0 };
+	bool building_bridge() const noexcept;
+	FrameOwner frame_owner_;
+	std::atomic<bool> other_device_said_{ false };
+	bool take_frame_turn(reshade::api::device *device);
+	FrameOwner::Event take_event_turn(const reshade::api::device *device, bool claim, uint64_t wait_ms);
+	std::atomic<const void *> dying_device_{ nullptr };
+	void drop_dying_device();
+	void drop_device_state(BridgeRelease how, reshade::api::device_api api, ID3D11Device *d3d11, bool game_side);
+	bool park_game_side(const void *device);
+	void release_parked(const void *device);
+	std::atomic<const void *> parked_device_{ nullptr };
+	std::atomic<const void *> parked_claim_{ nullptr };
+	ID3D11Device *parked_d3d11_ = nullptr;
+	void apply_chain(reshade::api::swapchain *swapchain, bool resize, bool replay);
+	std::atomic<reshade::api::swapchain *> applied_chain_{ nullptr };
+	std::mutex chains_lock_;
+	std::vector<reshade::api::swapchain *> chains_;
+	void remember_chain(reshade::api::swapchain *swapchain, bool made);
+	reshade::api::swapchain *latest_chain_of(const reshade::api::device *device);
+	struct PanelSnapshot {
+		bool valid = false;
+		PanelState state;
+		Settings settings;
+	};
+	std::mutex panel_snapshot_lock_;
+	PanelSnapshot panel_snapshot_;
+	std::atomic<uint64_t> panel_wanted_until_{ 0 };
+	std::atomic<bool> panel_wanted_overlay_{ false };
+	std::atomic<bool> panel_foreign_said_{ false };
+	std::atomic<bool> osd_foreign_said_{ false };
+	void refresh_panel_snapshot();
+	PanelSnapshot panel_snapshot_copy();
 	PendingDevices pending_devices_;
 	uint32_t swapchain_inits_ = 0;
 	bool is_engine_device(reshade::api::device *device) const noexcept;
@@ -294,6 +346,7 @@ private:
 		float x = 0.0f, y = 0.0f;
 		bool scene = false;
 		bool split = false;
+		bool held = false;
 	};
 	static constexpr uint32_t kHoldDrawn = 16u;
 	HoldDrawn hold_drawn_[kHoldDrawn]{};
@@ -307,6 +360,10 @@ private:
 	unsigned long long census_logged_at_ = 0;
 	SplitGate split_gate_;
 	SplitCover split_cover_;
+	SplitPlan split_plan_{};
+	ID3D12Resource *probe_scene_ = nullptr;
+	D3D12_RESOURCE_STATES probe_scene_state_ = D3D12_RESOURCE_STATE_COMMON;
+	uint32_t probes_read_ = 0, probe_share_ = 0;
 	uint32_t seen_drawn_ = 0, seen_empty_ = 0, seen_other_ = 0, seen_changes_ = 0, seen_split_ = 0;
 	int seen_last_ = -1;
 	void detect_interface(const FrameInputs &inputs);
@@ -322,6 +379,7 @@ private:
 #if AEONSR_FRAME_GENERATION
 	FrameGeneration framegen_;
 	void run_frame_generation(reshade::api::effect_runtime *runtime);
+	void run_frame_generation_once(reshade::api::effect_runtime *runtime);
 #endif
 	UpscalerCaptureD3D12 upscaler_capture_;
 	std::wstring upscaler_capture_logged_;
@@ -456,6 +514,12 @@ private:
 	PanelState panel_state(bool for_overlay);
 	void apply_panel_actions(const PanelActions &actions);
 	void note_state();
+	void note_load(reshade::api::effect_runtime *runtime);
+	LoadProcess read_load_process() const;
+	LoadKept load_kept();
+	LoadWindow load_;
+	uintptr_t load_runtime_ = 0;
+	double load_last_ms_ = -1.0;
 	void write_report(const PanelState &state, bool to_clipboard);
 	std::wstring report_path_;
 	std::wstring report_error_;

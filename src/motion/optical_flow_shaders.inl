@@ -28,8 +28,13 @@ cbuffer Params : register(b0)
 
 float2 on_grid(float2 uv) { return uv + dejitter; }
 
-static const float kFlowMax = 0.25;
+#ifndef AEON_FLOW_MAX
+	#define AEON_FLOW_MAX 0.5
+#endif
+static const float kFlowMax = AEON_FLOW_MAX;
 bool invalid_flow(float2 f) { return any(f != f) || any(abs(f) > kFlowMax); }
+static const float kModelMax = 4.0;
+bool invalid_model(float2 m) { return any(m != m) || any(abs(m) > kModelMax); }
 
 static const float kFastPx = 8.0;
 bool camera_fast(float2 g, float2 size)
@@ -87,10 +92,12 @@ float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 float depth_at(float2 uv)
 {
-	return (has_depth != 0u) ? Depth.SampleLevel(LinearClamp, on_grid(uv), 0) : 0.5;
+	return (has_depth == 1u) ? Depth.SampleLevel(LinearClamp, on_grid(uv), 0) : 0.5;
 }
 
 bool out_of_bounds(float2 uv) { return any(uv < 0.0) || any(uv > 1.0); }
+
+float2 depth_uv(float2 uv) { return (has_depth == 2u) ? uv : on_grid(uv); }
 
 float depth_tap(float2 uv) { return Depth.SampleLevel(LinearClamp, saturate(on_grid(uv)), 0); }
 
@@ -167,7 +174,54 @@ float zad(float2 pos_a, float2 pos_b, float2 texel, uint mip)
 }
 )HLSL"
 R"HLSL(
+static const float kTurnFocal2 = 2.6;
+
+float4 turn_rotation(float2 h, float f2)
+{
+	const float f = sqrt(f2);
+	const float tb = h.y / f;
+	const float cb = rsqrt(1.0 + tb * tb);
+	const float ta = h.x * cb / f;
+	const float ca = rsqrt(1.0 + ta * ta);
+	return float4(ta * ca, ca, tb * cb, cb);
+}
+
+float3 turn_apply(float4 r, float f, float2 x)
+{
+	const float x1 = x.x * r.y + f * r.x;
+	const float z1 = f * r.y - x.x * r.x;
+	const float y2 = x.y * r.w + z1 * r.z;
+	const float z2 = z1 * r.w - x.y * r.z;
+	const float iz = f / max(z2, 1e-4 * f);
+	return float3(x1 * iz, y2 * iz, (z2 > 0.2 * f) ? 1.0 : 0.0);
+}
+
+float2 turn_vector(float2 s, float2 uv, float f2)
+{
+	const float2 k = float2(2.0 * inv_full.y / inv_full.x, 2.0);
+	const float2 x = (uv - 0.5) * k;
+	const float3 q = turn_apply(turn_rotation(s * k, f2), sqrt(f2), x);
+	return (q.z > 0.5) ? (q.xy - x) / k : float2(8.0, 8.0);
+}
+
 int ring8(int x) { return x & 7; }
+
+#ifndef AEON_FLOW_SEED_LEVELS
+	#define AEON_FLOW_SEED_LEVELS 1
+#endif
+static const float kSeedLevelApart = 2.0;
+bool seed_guess(float2 uv, float2 global_p, float2 texel, out float2 guess)
+{
+	guess = float2(0.0, 0.0);
+	if (AEON_FLOW_SEED_LEVELS == 0)
+		return false;
+	const float2 su = StructQ.Load(int3(1, 0, 0)).xy;
+	const float2 ss = StructQ.Load(int3(0, 0, 0)).xy;
+	if (!(su.x > 0.5) || invalid_flow(ss))
+		return false;
+	guess = turn_vector(ss, uv, (su.y >= 0.5 && su.y <= 16.0) ? su.y : kTurnFocal2);
+	return !invalid_flow(guess) && any(abs(guess - global_p) > kSeedLevelApart * texel);
+}
 
 float2 compute_flow(float2 uv)
 {
@@ -206,6 +260,14 @@ float2 compute_flow(float2 uv)
 		if (cost < min_cost) {
 			min_cost = cost;
 			prediction = cand[i];
+		}
+	}
+	float2 seeded;
+	if (seed_guess(uv, cand[9], texel1, seeded)) {
+		const float cost = zad(uv, uv + seeded, texel1, mip1);
+		if (cost < min_cost) {
+			min_cost = cost;
+			prediction = seeded;
 		}
 	}
 	if (camera_fast(cand[9], 1.0 / inv_full) && all(inv_src < 1.0 / 9.0)) {
@@ -348,7 +410,7 @@ static const float kWideGain = 0.8;
 static const float kWideMargin = 0.003;
 static const float kWideFloor = 0.01;
 static const float kWideFail = 0.5;
-
+static const float kSeedApart = 2.0;
 float window_spread(float2 pos, float2 texel, uint mip)
 {
 	float a[25];
@@ -412,6 +474,9 @@ void top_least(uint gi, inout float cost, inout uint order)
 	GroupMemoryBarrierWithGroupSync();
 }
 
+#ifndef AEON_FLOW_TOP_FIT
+	#define AEON_FLOW_TOP_FIT 1
+#endif
 [numthreads(64, 1, 1)]
 void CSCoarseTop(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
@@ -424,8 +489,45 @@ void CSCoarseTop(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 	const float lc = zad(uv, uv + local_p, texel1, mip1);
 	const float sc = zad(uv, uv + static_p, texel1, mip1);
 
-	const float2 prediction = (sc < lc) ? ((sc < gc) ? static_p : global_p)
-	                                    : ((lc < gc) ? local_p : global_p);
+	float2 prediction = (sc < lc) ? ((sc < gc) ? static_p : global_p)
+	                              : ((lc < gc) ? local_p : global_p);
+	const float2 seed_s = SrcFlow.Load(int3(0, 0, 0));
+	const float2 seed_u = SrcFlow.Load(int3(1, 0, 0));
+	const float seed_f2 = (seed_u.y >= 0.5 && seed_u.y <= 16.0) ? seed_u.y : kTurnFocal2;
+	const float2 seed_p = turn_vector(seed_s, uv, seed_f2);
+	const bool seed_ok = seed_u.x > 0.5 && !invalid_flow(seed_s) && !invalid_flow(seed_p);
+	const float2 seed_t = seed_p / texel1;
+	const bool seed_far = seed_ok && any(abs(seed_t - global_p / texel1) > kSeedApart) &&
+		any(abs(seed_t - local_p / texel1) > kSeedApart) && any(abs(seed_t) > kSeedApart);
+	const float dc = seed_ok ? zad(uv, uv + seed_p, texel1, mip1) : 1e30;
+	if (seed_far && dc < min(sc, min(lc, gc)))
+		prediction = seed_p;
+	if (AEON_FLOW_TOP_FIT != 0 && Theta.Load(int3(0, 1, 0)) > 0.5) {
+		float th[11];
+		bool th_ok = true;
+		[unroll]
+		for (int q = 0; q < 11; ++q) {
+			th[q] = Theta.Load(int3(q, 0, 0));
+			th_ok = th_ok && th[q] == th[q] && abs(th[q]) < 1e4;
+		}
+		const float2 k = float2(2.0 * inv_full.y / inv_full.x, 2.0);
+		const float2 x = (uv - 0.5) * k;
+		const float den = th[6] * x.x + th[7] * x.y + 1.0;
+		if (th_ok && den > 0.25) {
+			const float2 prev_m = (float2(th[0] * x.x + th[1] * x.y + th[2], th[3] * x.x + th[4] * x.y + th[5]) / den - x) / k;
+			const float2 pm_t = prev_m / texel1;
+			const bool pm_far = !invalid_flow(prev_m) && any(abs(pm_t - global_p / texel1) > kSeedApart) &&
+				any(abs(pm_t - local_p / texel1) > kSeedApart) && any(abs(pm_t) > kSeedApart) &&
+				(!seed_far || any(abs(pm_t - seed_t) > kSeedApart));
+			if (pm_far) {
+				const float mc = zad(uv, uv + prev_m, texel1, mip1);
+				if (mc < min(min(sc, min(lc, gc)), seed_far ? dc : 1e30))
+					prediction = prev_m;
+			}
+		}
+	}
+	const float2 wide_centre = (seed_ok && any(abs(seed_t) > 0.5 * float(kWideRadius)) && dc < sc) ? seed_p
+		: float2(0.0, 0.0);
 
 	const int side = 2 * SEARCH_RADIUS + 1;
 	float near_cost = 1e30;
@@ -454,7 +556,7 @@ void CSCoarseTop(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 	if (ask) {
 		[loop]
 		for (int k = int(gi); k < wide * wide; k += 64) {
-			const float2 c = float2(k % wide - kWideRadius, k / wide - kWideRadius) * texel1;
+			const float2 c = wide_centre + float2(k % wide - kWideRadius, k / wide - kWideRadius) * texel1;
 			const float cost = zad_dense(uv, uv + c, texel1, mip1);
 			if (cost < wide_cost) {
 				wide_cost = cost;
@@ -464,7 +566,7 @@ void CSCoarseTop(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 	}
 	top_least(gi, wide_cost, wide_order);
 	if (ask && wide_cost < kWideGain * dense_near - kWideMargin)
-		best = float2(int(wide_order) % wide - kWideRadius, int(wide_order) / wide - kWideRadius) * texel1;
+		best = wide_centre + float2(int(wide_order) % wide - kWideRadius, int(wide_order) / wide - kWideRadius) * texel1;
 	if (gi == 0u)
 		OutV[gid.xy] = (first != 0u) ? float2(0.0, 0.0) : best;
 }
@@ -538,7 +640,7 @@ groupshared float gsRefConf[kRefTile * kRefTile];
 [numthreads(8, 8, 1)]
 void CSRefine(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
-	const bool gate_on = (filters != 0u && has_depth != 0u);
+	const bool gate_on = (filters != 0u && has_depth == 1u);
 	const int2 corner = int2(gid.xy) * 8 - REFINE_RADIUS;
 	[loop]
 	for (uint t = gi; t < uint(kRefTile * kRefTile); t += 64u) {
@@ -675,7 +777,371 @@ void CSGlobal(uint gi : SV_GroupIndex)
 	}
 	OutV[uint2(0, 0)] = m;
 }
+)HLSL"
+R"HLSL(
+static const uint kSeedCols = 48u;
+static const uint kSeedMaxRows = 40u;
+static const int kSeedReach = 12;
+static const uint kSeedFocals = 5u;
+static const float kSeedFocal2[5] = { 1.0, 1.7, 2.9, 4.9, 8.3 };
+static const float kSeedGain = 0.7;
+static const float kSeedFloor = 0.004;
+static const float kSeedOverlap = 0.25;
+#ifndef AEON_FLOW_SEED_SKIP
+	#define AEON_FLOW_SEED_SKIP 1
+#endif
+static const float kSeedSkipGain = 0.5;
+static const float kSeedSkipContrast = 0.1;
+static const uint kSkipContrastParts = 64u;
+static const uint kSkipCands = 10u;
+static const uint kSkipSlices = 25u;
+groupshared float gsSeedA[kSeedCols * kSeedMaxRows];
+groupshared float gsSeedB[kSeedCols * kSeedMaxRows];
+groupshared float gsSeedCost[256];
+groupshared uint gsSeedOrder[256];
+groupshared float gsSeedP[256 * 3];
+groupshared float gsSeedOut[4];
+groupshared float gsSeedContrast[kSkipContrastParts];
+static const int kFineSide = 7;
+static const float kFineStep = 0.25;
+static const uint kFineCols = 64u;
+static const uint kFineSlices = 5u;
 
+uint seed_rows() { return clamp(uint(round(float(kSeedCols) * inv_full.x / inv_full.y)), 8u, kSeedMaxRows); }
+
+float seed_prev(float u, float v, uint rows)
+{
+	const float iu = min(floor(u), float(kSeedCols - 2u)), iv = min(floor(v), float(rows - 2u));
+	const float fu = u - iu, fv = v - iv;
+	const uint at = uint(iv) * kSeedCols + uint(iu);
+	return lerp(lerp(gsSeedB[at], gsSeedB[at + 1u], fu), lerp(gsSeedB[at + kSeedCols], gsSeedB[at + kSeedCols + 1u], fu), fv);
+}
+
+float3 seed_turn(int dx, int dy, float f2, uint step, uint rows, uint phase, float shift)
+{
+	const float2 k = float2(2.0 * inv_full.y / inv_full.x, 2.0);
+	const float2 cell = k / float2(float(kSeedCols), float(rows));
+	const float4 r = turn_rotation(float2(float(dx), float(dy)) * cell, f2);
+	const float f = sqrt(f2);
+	float3 s = float3(0.0, 0.0, 0.0);
+	[loop]
+	for (uint y = 0u; y < rows; y += step) {
+		[loop]
+		for (uint x = 0u; x < kSeedCols; x += step) {
+			const float2 xc = (float2(float(x), float(y)) + 0.5) * cell - 0.5 * k;
+			const float3 p = turn_apply(r, f, xc);
+			const float2 uv = (p.xy + 0.5 * k) / cell - 0.5;
+			if (!(p.z > 0.5) || uv.x < 0.0 || uv.y < 0.0 || uv.x > float(kSeedCols - 1u) || uv.y > float(rows - 1u))
+				continue;
+			const float a = gsSeedA[y * kSeedCols + x], b = seed_prev(uv.x, uv.y, rows);
+			s += (phase == 0u) ? float3(a, b, 1.0) : float3(abs(a - b - shift), 0.0, 0.0);
+		}
+	}
+	return s;
+}
+
+float3 seed_turn_slice(int dx, int dy, float f2, uint rows, uint phase, float shift, uint slice, uint slices)
+{
+	const float2 k = float2(2.0 * inv_full.y / inv_full.x, 2.0);
+	const float2 cell = k / float2(float(kSeedCols), float(rows));
+	const float4 r = turn_rotation(float2(float(dx), float(dy)) * cell, f2);
+	const float f = sqrt(f2);
+	float3 s = float3(0.0, 0.0, 0.0);
+	[loop]
+	for (uint c = slice; c < kSeedCols * rows; c += slices) {
+		const uint x = c % kSeedCols, y = c / kSeedCols;
+		const float2 xc = (float2(float(x), float(y)) + 0.5) * cell - 0.5 * k;
+		const float3 p = turn_apply(r, f, xc);
+		const float2 uv = (p.xy + 0.5 * k) / cell - 0.5;
+		if (!(p.z > 0.5) || uv.x < 0.0 || uv.y < 0.0 || uv.x > float(kSeedCols - 1u) || uv.y > float(rows - 1u))
+			continue;
+		const float a = gsSeedA[c], b = seed_prev(uv.x, uv.y, rows);
+		s += (phase == 0u) ? float3(a, b, 1.0) : float3(abs(a - b - shift), 0.0, 0.0);
+	}
+	return s;
+}
+
+float seed_cost(int dx, int dy, float f2, uint step, uint rows, float need)
+{
+	const float3 m = seed_turn(dx, dy, f2, step, rows, 0u, 0.0);
+	if (!(m.z >= need))
+		return 1e30;
+	return seed_turn(dx, dy, f2, step, rows, 1u, (m.x - m.y) / m.z).x / m.z;
+}
+)HLSL"
+R"HLSL(
+float3 seed_fine(float2 h, float f2, uint slice, uint slices, uint mip, uint phase, float shift)
+{
+	const float2 k = float2(2.0 * inv_full.y / inv_full.x, 2.0);
+	const uint fr = clamp(uint(round(float(kFineCols) * inv_full.x / inv_full.y)), 8u, kFineCols);
+	const float4 r = turn_rotation(h, f2);
+	const float f = sqrt(f2);
+	float3 s = float3(0.0, 0.0, 0.0);
+	[loop]
+	for (uint p = slice; p < kFineCols * fr; p += slices) {
+		const float2 uv = (float2(float(p % kFineCols), float(p / kFineCols)) + 0.5) / float2(float(kFineCols), float(fr));
+		const float2 x = (uv - 0.5) * k;
+		const float3 q = turn_apply(r, f, x);
+		const float2 at = q.xy / k + 0.5;
+		if (!(q.z > 0.5) || any(at < 0.0) || any(at > 1.0))
+			continue;
+		const float a = LumaCur.SampleLevel(LinearClamp, uv, mip), b = LumaPrev.SampleLevel(LinearClamp, at, mip);
+		s += (phase == 0u) ? float3(a, b, 1.0) : float3(abs(a - b - shift), 0.0, 0.0);
+	}
+	return s;
+}
+
+[numthreads(256, 1, 1)]
+void CSSeed(uint gi : SV_GroupIndex)
+{
+	const uint rows = seed_rows();
+	const uint cells = kSeedCols * rows;
+	const float cell_px = 1.0 / (float(kSeedCols) * inv_full.x);
+	const uint mip = uint(clamp(floor(log2(max(0.5 * cell_px, 1.0))), 0.0, 5.0));
+	const float2 cell_uv = float2(1.0 / float(kSeedCols), 1.0 / float(rows));
+	[loop]
+	for (uint c = gi; c < cells; c += 256u) {
+		const float2 corner = float2(float(c % kSeedCols), float(c / kSeedCols)) * cell_uv;
+		float a = 0.0, b = 0.0;
+		[unroll]
+		for (uint t = 0u; t < 4u; ++t) {
+			const float2 uv = corner + (float2(float(t & 1u), float(t >> 1u)) * 0.5 + 0.25) * cell_uv;
+			a += LumaCur.SampleLevel(LinearClamp, uv, mip);
+			b += LumaPrev.SampleLevel(LinearClamp, uv, mip);
+		}
+		gsSeedA[c] = 0.25 * a;
+		gsSeedB[c] = 0.25 * b;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	bool skip = false;
+	if (AEON_FLOW_SEED_SKIP != 0) {
+		const float2 gp = GlobalF.Load(int3(0, 0, 0));
+		const int gx = invalid_flow(gp) ? 0 : int(round(gp.x * float(kSeedCols)));
+		const int gy = invalid_flow(gp) ? 0 : int(round(gp.y * float(rows)));
+		const uint cand = gi % kSkipCands, slice = gi / kSkipCands;
+		const bool mine = gi < kSkipCands * kSkipSlices;
+		const int sx = (cand == 0u) ? 0 : gx + int((cand - 1u) % 3u) - 1;
+		const int sy = (cand == 0u) ? 0 : gy + int((cand - 1u) / 3u) - 1;
+		const float f2s = kSeedFocal2[kSeedFocals / 2u];
+		float3 part = float3(0.0, 0.0, 0.0);
+		if (mine)
+			part = seed_turn_slice(sx, sy, f2s, rows, 0u, 0.0, slice, kSkipSlices);
+		gsSeedP[gi * 3u] = part.x;
+		gsSeedP[gi * 3u + 1u] = part.y;
+		gsSeedP[gi * 3u + 2u] = part.z;
+		GroupMemoryBarrierWithGroupSync();
+		float3 tot = float3(0.0, 0.0, 0.0);
+		[loop]
+		for (uint q = 0u; q < kSkipSlices; ++q) {
+			const uint w = (q * kSkipCands + cand) * 3u;
+			tot += float3(gsSeedP[w], gsSeedP[w + 1u], gsSeedP[w + 2u]);
+		}
+		const float sh = (tot.z > 0.0) ? (tot.x - tot.y) / tot.z : 0.0;
+		float rest_part = 0.0;
+		if (mine)
+			rest_part = seed_turn_slice(sx, sy, f2s, rows, 1u, sh, slice, kSkipSlices).x;
+		gsSeedCost[gi] = rest_part;
+		if (gi < kSkipContrastParts) {
+			float3 r0 = float3(0.0, 0.0, 0.0);
+			[loop]
+			for (uint q = 0u; q < kSkipSlices; ++q) {
+				const uint w = q * kSkipCands * 3u;
+				r0 += float3(gsSeedP[w], gsSeedP[w + 1u], gsSeedP[w + 2u]);
+			}
+			const float2 m = (r0.z > 0.0) ? r0.xy / r0.z : float2(0.0, 0.0);
+			float con = 0.0;
+			[loop]
+			for (uint c2 = gi; c2 < cells; c2 += kSkipContrastParts)
+				con += abs(gsSeedA[c2] - m.x) + abs(gsSeedB[c2] - m.y);
+			gsSeedContrast[gi] = con;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (gi == 0u) {
+			const float need = kSeedOverlap * float(cells);
+			float cost[kSkipCands];
+			[unroll]
+			for (uint i = 0u; i < kSkipCands; ++i) {
+				float sad = 0.0, n = 0.0;
+				[loop]
+				for (uint q2 = 0u; q2 < kSkipSlices; ++q2) {
+					sad += gsSeedCost[q2 * kSkipCands + i];
+					n += gsSeedP[(q2 * kSkipCands + i) * 3u + 2u];
+				}
+				cost[i] = (n >= need) ? sad / n : 1e30;
+			}
+			float near_prev = 1e30;
+			[unroll]
+			for (uint j = 1u; j < kSkipCands; ++j)
+				near_prev = min(near_prev, cost[j]);
+			const float rest = cost[0];
+			float con = 0.0;
+			[loop]
+			for (uint p = 0u; p < kSkipContrastParts; ++p)
+				con += gsSeedContrast[p];
+			con *= 0.5 / float(cells);
+			gsSeedOut[0] = (first != 0u || !(rest < 1e29) || rest <= kSeedFloor || rest < kSeedSkipContrast * con ||
+			                near_prev < kSeedSkipGain * rest) ? 1.0 : 0.0;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		skip = gsSeedOut[0] > 0.5;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	const int reach_y = int(rows / 4u);
+	const int wide_x = 2 * kSeedReach + 1, wide_y = 2 * reach_y + 1;
+	const float coarse_need = kSeedOverlap * float((kSeedCols / 2u) * ((rows + 1u) / 2u));
+	const float f2_mid = kSeedFocal2[kSeedFocals / 2u];
+	float best = 1e30;
+	uint order = 0xffffffffu;
+	const int coarse_n = skip ? 0 : wide_x * wide_y;
+	[loop]
+	for (int k = int(gi); k < coarse_n; k += 256) {
+		const int dx = 2 * (k % wide_x - kSeedReach), dy = 2 * (k / wide_x - reach_y);
+		const float cost = seed_cost(dx, dy, f2_mid, 2u, rows, coarse_need);
+		const uint o = uint(dx * dx + dy * dy) * 1024u + uint(k);
+		if (cost < 1e29 && (cost < best || (cost == best && o < order))) {
+			best = cost;
+			order = o;
+		}
+	}
+	gsSeedCost[gi] = best;
+	gsSeedOrder[gi] = order;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint span = 128u; span > 0u; span >>= 1u) {
+		if (gi < span) {
+			const float c2 = gsSeedCost[gi + span];
+			const uint o2 = gsSeedOrder[gi + span];
+			if (c2 < gsSeedCost[gi] || (c2 == gsSeedCost[gi] && o2 < gsSeedOrder[gi])) {
+				gsSeedCost[gi] = c2;
+				gsSeedOrder[gi] = o2;
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	const uint won = gsSeedOrder[0] & 1023u;
+	const bool found = gsSeedOrder[0] != 0xffffffffu;
+	const int cx = found ? 2 * (int(won) % wide_x - kSeedReach) : 0;
+	const int cy = found ? 2 * (int(won) / wide_x - reach_y) : 0;
+	GroupMemoryBarrierWithGroupSync();
+
+	const uint kCand = 25u * kSeedFocals;
+	const float fine_need = kSeedOverlap * float(cells);
+	const uint ci = min(gi, kCand);
+	const int fx = (ci < kCand) ? cx + int(ci % 25u % 5u) - 2 : 0;
+	const int fy = (ci < kCand) ? cy + int(ci % 25u / 5u) - 2 : 0;
+	const float f2 = kSeedFocal2[(ci < kCand) ? ci / 25u : kSeedFocals / 2u];
+	float cand_cost = 1e30;
+	if (!skip && gi <= kCand)
+		cand_cost = seed_cost(fx, fy, f2, 1u, rows, fine_need);
+	gsSeedCost[gi] = cand_cost;
+	GroupMemoryBarrierWithGroupSync();
+	if (gi == 0u) {
+		uint at = 12u + 25u * (kSeedFocals / 2u);
+		[loop]
+		for (uint i = 0u; i < kCand; ++i) {
+			const int ox = int(i % 25u % 5u) - 2, oy = int(i % 25u / 5u) - 2, of = int(i / 25u) - int(kSeedFocals / 2u);
+			const int ax = int(at % 25u % 5u) - 2, ay = int(at % 25u / 5u) - 2, af = int(at / 25u) - int(kSeedFocals / 2u);
+			const int on = (ox * ox + oy * oy) * 16 + of * of, an = (ax * ax + ay * ay) * 16 + af * af;
+			if (gsSeedCost[i] < gsSeedCost[at] || (gsSeedCost[i] == gsSeedCost[at] && on < an))
+				at = i;
+		}
+		float2 sub = float2(0.0, 0.0);
+		const uint ux = at % 25u % 5u, uy = at % 25u / 5u;
+		const float c0 = gsSeedCost[at];
+		if (ux >= 1u && ux <= 3u) {
+			const float l = gsSeedCost[at - 1u], r = gsSeedCost[at + 1u], d = l + r - 2.0 * c0;
+			if (d > 1e-9 && l < 1e29 && r < 1e29)
+				sub.x = clamp((l - r) / (2.0 * d), -0.5, 0.5);
+		}
+		if (uy >= 1u && uy <= 3u) {
+			const float u = gsSeedCost[at - 5u], v = gsSeedCost[at + 5u], d = u + v - 2.0 * c0;
+			if (d > 1e-9 && u < 1e29 && v < 1e29)
+				sub.y = clamp((u - v) / (2.0 * d), -0.5, 0.5);
+		}
+		const float rest = gsSeedCost[kCand];
+		const bool use = !skip && first == 0u && found && c0 < 1e29 && rest < 1e29 && rest > kSeedFloor && c0 < kSeedGain * rest;
+		gsSeedOut[0] = float(cx + int(ux) - 2) + sub.x;
+		gsSeedOut[1] = float(cy + int(uy) - 2) + sub.y;
+		gsSeedOut[2] = skip ? f2_mid : kSeedFocal2[at / 25u];
+		gsSeedOut[3] = use ? 1.0 : 0.0;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	const float2 kk = float2(2.0 * inv_full.y / inv_full.x, 2.0);
+	const float2 cell = kk / float2(float(kSeedCols), float(rows));
+	const float2 h2 = float2(gsSeedOut[0], gsSeedOut[1]) * cell;
+	const float f2b = gsSeedOut[2];
+	const bool on = gsSeedOut[3] > 0.5;
+	const float step = kFineStep * cell.x;
+	const uint fmip = uint(clamp(floor(log2(max(step * 0.5 / inv_full.y, 1.0))), 0.0, 5.0));
+	const uint fc = gi / kFineSlices, fs = gi % kFineSlices;
+	const uint kFine = uint(kFineSide * kFineSide);
+	const bool fmine = on && fc < kFine;
+	const float2 hf = h2 + float2(float(int(fc % uint(kFineSide)) - kFineSide / 2), float(int(fc / uint(kFineSide)) - kFineSide / 2)) * step;
+	float3 part = float3(0.0, 0.0, 0.0);
+	if (fmine)
+		part = seed_fine(hf, f2b, fs, kFineSlices, fmip, 0u, 0.0);
+	gsSeedP[gi * 3u] = part.x;
+	gsSeedP[gi * 3u + 1u] = part.y;
+	gsSeedP[gi * 3u + 2u] = part.z;
+	GroupMemoryBarrierWithGroupSync();
+	float3 total = float3(0.0, 0.0, 0.0);
+	[loop]
+	for (uint q = 0u; q < kFineSlices; ++q) {
+		const uint w = (min(fc, kFine - 1u) * kFineSlices + q) * 3u;
+		total += float3(gsSeedP[w], gsSeedP[w + 1u], gsSeedP[w + 2u]);
+	}
+	const float fshift = (total.z > 0.0) ? (total.x - total.y) / total.z : 0.0;
+	float fine_cost = 0.0;
+	if (fmine)
+		fine_cost = seed_fine(hf, f2b, fs, kFineSlices, fmip, 1u, fshift).x;
+	gsSeedCost[gi] = fine_cost;
+	GroupMemoryBarrierWithGroupSync();
+	if (gi != 0u)
+		return;
+	const uint fr = clamp(uint(round(float(kFineCols) * inv_full.x / inv_full.y)), 8u, kFineCols);
+	const float fneed = kSeedOverlap * float(kFineCols * fr);
+	float fcost[49];
+	[loop]
+	for (uint i3 = 0u; i3 < kFine; ++i3) {
+		float sad = 0.0, n = 0.0;
+		[loop]
+		for (uint q3 = 0u; q3 < kFineSlices; ++q3) {
+			sad += gsSeedCost[i3 * kFineSlices + q3];
+			n += gsSeedP[(i3 * kFineSlices + q3) * 3u + 2u];
+		}
+		fcost[i3] = (n >= fneed) ? sad / n : 1e30;
+	}
+	const uint mid = kFine / 2u;
+	uint fat = mid;
+	[loop]
+	for (uint i4 = 0u; i4 < kFine; ++i4) {
+		const int ox = int(i4 % uint(kFineSide)) - kFineSide / 2, oy = int(i4 / uint(kFineSide)) - kFineSide / 2;
+		const int ax = int(fat % uint(kFineSide)) - kFineSide / 2, ay = int(fat / uint(kFineSide)) - kFineSide / 2;
+		if (fcost[i4] < fcost[fat] || (fcost[i4] == fcost[fat] && ox * ox + oy * oy < ax * ax + ay * ay))
+			fat = i4;
+	}
+	float2 fsub = float2(0.0, 0.0);
+	const uint fx3 = fat % uint(kFineSide), fy3 = fat / uint(kFineSide);
+	if (fx3 >= 1u && fx3 + 1u < uint(kFineSide)) {
+		const float l = fcost[fat - 1u], r = fcost[fat + 1u], d = l + r - 2.0 * fcost[fat];
+		if (d > 1e-9 && l < 1e29 && r < 1e29)
+			fsub.x = clamp((l - r) / (2.0 * d), -0.5, 0.5);
+	}
+	if (fy3 >= 1u && fy3 + 1u < uint(kFineSide)) {
+		const float u = fcost[fat - uint(kFineSide)], v = fcost[fat + uint(kFineSide)], d = u + v - 2.0 * fcost[fat];
+		if (d > 1e-9 && u < 1e29 && v < 1e29)
+			fsub.y = clamp((u - v) / (2.0 * d), -0.5, 0.5);
+	}
+	const bool refined = on && fcost[fat] < 1e29;
+	const float2 h_out = refined ? h2 + (float2(float(int(fx3) - kFineSide / 2), float(int(fy3) - kFineSide / 2)) + fsub) * step : h2;
+	OutV[uint2(0, 0)] = on ? h_out / kk : float2(0.0, 0.0);
+	OutV[uint2(1, 0)] = float2(on ? 1.0 : 0.0, f2b);
+}
+)HLSL"
+R"HLSL(
 [numthreads(8, 8, 1)]
 void CSConfidence(uint3 id : SV_DispatchThreadID)
 {
@@ -754,8 +1220,10 @@ void CSExport(uint3 id : SV_DispatchThreadID)
 	const float2 uv = uv_of(id.xy);
 	float2 flow = SrcFlow.SampleLevel(LinearClamp, uv, 0);
 	float conf = Conf.SampleLevel(LinearClamp, uv, 0);
-	if (invalid_flow(flow))
-		flow = float2(0.0, 0.0);
+	if (invalid_flow(flow)) {
+		const float2 g = GlobalF.SampleLevel(PointClamp, float2(0.5, 0.5), 0);
+		flow = invalid_flow(g) ? float2(0.0, 0.0) : g;
+	}
 	if (conf != conf)
 		conf = 0.0;
 	OutV[id.xy] = flow;
@@ -782,12 +1250,12 @@ static const float kFarWeight = 0.02;
 
 float rho_near(float rho)
 {
-	return (has_depth != 0u) ? smoothstep(kNearLo, kNearHi, rho) : 0.0;
+	return (has_depth == 1u) ? smoothstep(kNearLo, kNearHi, rho) : 0.0;
 }
 
 bool rho_far(float rho)
 {
-	return has_depth != 0u && rho < kFarRho;
+	return has_depth == 1u && rho < kFarRho;
 }
 static const float kLineNoise = 0.6;
 static const float kTexNoise = 0.15;
@@ -987,7 +1455,7 @@ void CSStructure(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 t
 	const float strength = tr / (tr + kStructFloor);
 
 	float rho = 0.0;
-	if (has_depth != 0u) {
+	if (has_depth == 1u) {
 		float r[16];
 		[unroll]
 		for (int b = 0; b < 16; ++b) {
@@ -995,6 +1463,8 @@ void CSStructure(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 t
 			r[b] = 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv + o * inv_full), 0);
 		}
 		rho = surface_rho(r);
+	} else if (has_depth == 2u) {
+		rho = 1.0 - Depth.SampleLevel(LinearClamp, uv, 0);
 	}
 	OutS4[id.xy] = float4(angle, aniso, strength, rho);
 }
@@ -1060,7 +1530,8 @@ void store_terms(float acc[kTerms], uint gi, uint row)
 		GroupMemoryBarrierWithGroupSync();
 	}
 }
-
+)HLSL"
+R"HLSL(
 void load_fit(out float th[11], bool identity)
 {
 	[unroll]
@@ -1069,14 +1540,45 @@ void load_fit(out float th[11], bool identity)
 }
 
 static const float kColdSigma[4] = { 24.0, 8.0, 3.0, 1.5 };
+static const float kColdSpread = 1.0;
+#ifndef AEON_FLOW_COLD_SPREAD
+	#define AEON_FLOW_COLD_SPREAD 1
+#endif
+float cold_sigma(uint step, float2 g_px)
+{
+	if (AEON_FLOW_COLD_SPREAD == 0)
+		return kColdSigma[min(step, 3u)];
+	const float s0 = max(kColdSigma[0], kColdSpread * length(g_px) / kTexTol);
+	if (step >= 3u)
+		return kColdSigma[3];
+	return max(kColdSigma[step], s0 / ((step == 0u) ? 1.0 : ((step == 1u) ? 3.0 : 9.0)));
+}
 static const float kWideAgree = 3.0;
 static const float kWideShare = 0.85;
+#ifndef AEON_FLOW_TURN_START
+	#define AEON_FLOW_TURN_START 1
+#endif
+float cold_start_term(uint k, float2 g)
+{
+	const float h13 = g.x * norm_x, h23 = g.y * 2.0;
+	if (k == 2u)
+		return h13;
+	if (k == 5u)
+		return h23;
+	if (AEON_FLOW_TURN_START != 0 && k == 6u)
+		return -h13 / kTurnFocal2;
+	if (AEON_FLOW_TURN_START != 0 && k == 7u)
+		return -h23 / kTurnFocal2;
+	return (k == 0u || k == 4u) ? 1.0 : 0.0;
+}
 void cold_start(inout float th[11])
 {
 	const float2 g = GlobalF.Load(int3(0, 0, 0));
 	if (!invalid_flow(g)) {
-		th[2] = g.x * norm_x;
-		th[5] = g.y * 2.0;
+		th[2] = cold_start_term(2u, g);
+		th[5] = cold_start_term(5u, g);
+		th[6] = cold_start_term(6u, g);
+		th[7] = cold_start_term(7u, g);
 	}
 }
 
@@ -1098,11 +1600,12 @@ void CSModelTerms(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi 
 	float carried[11];
 	load_fit(carried, false);
 	const bool probe = model_iter == 0u && !cold;
+	const float2 g_px = GlobalF.Load(int3(0, 0, 0)) * float2(norm_x, 2.0) * px_per_unit;
 	float sigma;
 	if (fast && model_iter == 0u)
-		sigma = kColdSigma[0];
+		sigma = cold_sigma(0u, g_px);
 	else if (fast && cold)
-		sigma = kColdSigma[model_iter];
+		sigma = cold_sigma(model_iter, g_px);
 	else if (model_iter == 0u)
 		sigma = 0.0;
 	else if (cold)
@@ -1217,7 +1720,7 @@ void CSPhotoTerms(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi 
 		if (any(q >= dst))
 			continue;
 		const float2 uv = (float2(q) + 0.5) * inv_dst;
-		const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
+		const float rho = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, depth_uv(uv), 0) : 0.0;
 		const float keep = 1.0 - rho_near(rho);
 		if (!(keep > 1e-3))
 			continue;
@@ -1316,10 +1819,8 @@ void CSModelSolve(uint3 tid : SV_GroupThreadID)
 		if (model_iter == 0u || !(cur == cur) || !(abs(cur) < 1e4))
 			cur = (t == 0u || t == 4u) ? 1.0 : 0.0;
 		if (model_iter == 0u && camera_fast(GlobalF.Load(int3(0, 0, 0)), float2(norm_x, 2.0) * px_per_unit) &&
-			(t == 2u || t == 5u)) {
-			const float2 g = GlobalF.Load(int3(0, 0, 0));
-			cur = (t == 2u) ? g.x * norm_x : g.y * 2.0;
-		}
+			(t == 2u || t == 5u || t == 6u || t == 7u))
+			cur = cold_start_term(t, GlobalF.Load(int3(0, 0, 0)));
 		gsP[t] = cur;
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -1384,8 +1885,8 @@ void CSModelSolve(uint3 tid : SV_GroupThreadID)
 			ok = ok && (th[i] == th[i]) && gsPivot[i] > 1e-12;
 		}
 		ok = ok && abs(th[0] - 1.0) < 0.5 && abs(th[4] - 1.0) < 0.5 &&
-			abs(th[1]) < 0.5 && abs(th[3]) < 0.5 && abs(th[6]) < 0.5 && abs(th[7]) < 0.5 &&
-			abs(th[2]) < 0.3 * norm_x && abs(th[5]) < 0.6;
+			abs(th[1]) < 0.5 && abs(th[3]) < 0.5 && abs(th[6]) < 1.0 && abs(th[7]) < 1.0 &&
+			abs(th[2]) < (kFlowMax + 0.1) * norm_x && abs(th[5]) < 2.0 * (kFlowMax + 0.1);
 		const float take = (model_iter >= 6u) ? kExtraPhotoTake : 1.0;
 		float carried[11];
 		bool warm = model_iter == 0u && !cold && gsSum[76] > 0.0 && gsSum[77] >= kWarmAgree * gsSum[76];
@@ -1421,8 +1922,18 @@ R"HLSL(
 static const float kPublishSnapPx = 0.35;
 
 static const float kCrossSwitchPx = 0.20;
+static const float kCrossRestPx = 0.50;
+static const float kRestPubPx = 0.25;
+static const float kRestHoldStill = 0.65;
+static const float kScaleShare = 0.35;
+static const float kScaleMin = 0.2;
+static const float kScaleMax = 5.0;
+static const float kScaleMovePx = 0.25;
+static const float kScaleReachPx = 16.0;
+static const float kScaleLeftPx = 0.15;
 static const float kCrossQuality = 0.5;
 static const float kCrossFarPx = 4.0;
+static const float kCrossSeedPx = 8.0;
 static const float kCrossFarShare = 0.1;
 static const float kCrossDistrust = 2.0;
 static const float kVerdictShare = 0.25;
@@ -1492,7 +2003,7 @@ void CSThetaPublish(uint gi : SV_GroupIndex)
 			ident0[k0] = (k0 == 0 || k0 == 4) ? 1.0 : 0.0;
 		}
 		const float2 uv = (float2(gi % 16u, gi / 16u) + 0.5) / float2(16.0, 9.0);
-		const float rho_g = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0) : 0.0;
+		const float rho_g = (has_depth != 0u) ? 1.0 - Depth.SampleLevel(PointClamp, depth_uv(uv), 0) : 0.0;
 		const float rho = (rho_near(rho_g) > 0.0) ? 0.0 : rho_g;
 		const float2 x = norm_of(uv);
 		const float2 at_raw = model_at(raw, x, rho);
@@ -1533,6 +2044,7 @@ void CSThetaPublish(uint gi : SV_GroupIndex)
 	}
 	float apart = -1.0;
 	bool keep = false;
+	OutS[uint2(11, 0)] = 1.0;
 	if ((model_flags & 4u) != 0u) {
 		float pub[11];
 		[unroll]
@@ -1540,7 +2052,13 @@ void CSThetaPublish(uint gi : SV_GroupIndex)
 			pub[k8] = OutS[uint2(k8, 0)];
 		apart = (n > 0u) ? frame_apart(kPairPub) : 0.0;
 		const bool supported = model_support() > kCrossQuality;
-		const bool asks = apart > kCrossSwitchPx && supported;
+		float pub_len = 0.0;
+		[loop]
+		for (uint rp = 0u; rp < 144u; ++rp)
+			pub_len += length(gsPubShift[kShiftPubIdent][rp]);
+		pub_len *= 1.0 / 144.0;
+		const float switch_px = (pub_len < kRestPubPx) ? kCrossRestPx : kCrossSwitchPx;
+		const bool asks = apart > switch_px && supported;
 		if (n > 0u && supported) {
 			const float2 moved = (dejitter - prev_dejitter) * float2(norm_x, 2.0) * px_per_unit;
 			const float2 left = frame_shift(kShiftPub);
@@ -1592,7 +2110,44 @@ void CSThetaPublish(uint gi : SV_GroupIndex)
 			const float jump = length(g * float2(norm_x, 2.0) * px_per_unit - pub_shift);
 			far = usable && !invalid_flow(g) && jump > max(kCrossFarPx, kCrossFarShare * length(pub_shift));
 		}
-		keep = (!asks && !far) || (distrust >= kCrossDistrust && mislands);
+		{
+			const float2 su = SrcFlow.Load(int3(1, 0, 0));
+			const float2 ss = SrcFlow.Load(int3(0, 0, 0));
+			if (usable && !supported && su.x > 0.5 && !invalid_flow(ss)) {
+				const float2 pub_c = model_at(pub, float2(0.0, 0.0), 0.0) * px_per_unit;
+				const float sj = length(ss * float2(norm_x, 2.0) * px_per_unit - pub_c);
+				far = far || sj > max(kCrossSeedPx, kCrossFarShare * length(pub_c));
+			}
+		}
+		const float before_still = OutS[uint2(6, 1)];
+		const bool rest_hold = !far && ((before_still == before_still && before_still >= kRestHoldStill) ||
+			(pub_len < kRestPubPx && distrust >= kCrossDistrust));
+		const bool plain = (!asks && !far) || (distrust >= kCrossDistrust && mislands) || rest_hold;
+		bool scaled = false;
+		if (!plain && supported && n > 0u) {
+			float num = 0.0, den = 0.0;
+			[loop]
+			for (uint sp = 0u; sp < 144u; ++sp) {
+				const float2 pd = gsPubShift[kShiftPubIdent][sp];
+				const float2 rd = pd + gsPubShift[kShiftPub][sp];
+				num += dot(rd, pd);
+				den += dot(pd, pd);
+			}
+			const float s = (den > 0.0) ? num / den : 1.0;
+			float left = 0.0;
+			[loop]
+			for (uint sp2 = 0u; sp2 < 144u; ++sp2) {
+				const float2 pd = gsPubShift[kShiftPubIdent][sp2];
+				left += length(pd + gsPubShift[kShiftPub][sp2] - s * pd);
+			}
+			left *= 1.0 / 144.0;
+			const float reach = 144.0 * kScaleReachPx * kScaleReachPx;
+			scaled = den >= 144.0 * kScaleMovePx * kScaleMovePx && s >= kScaleMin && s <= kScaleMax &&
+				den <= reach && s * s * den <= reach && left <= min(kScaleShare * frame_apart(kPairPub), kScaleLeftPx);
+			if (scaled)
+				OutS[uint2(11, 0)] = s;
+		}
+		keep = plain || scaled;
 		n = 0u;
 	}
 	OutS[uint2(12, 7)] = distrust;
@@ -1655,7 +2210,7 @@ float arbiter_veto(float2 uv, float4 sc, float2 f, float2 model_uv)
 {
 	if ((model_flags & 2u) == 0u)
 		return 0.0;
-	if (has_depth != 0u) {
+	if (has_depth == 1u) {
 		const float own_rho = 1.0 - Depth.SampleLevel(PointClamp, on_grid(uv), 0);
 		float lo = own_rho, hi = own_rho;
 		[unroll]
@@ -1695,7 +2250,8 @@ float arbiter_veto(float2 uv, float4 sc, float2 f, float2 model_uv)
 	return open * smoothstep(kArbRatioLo, kArbRatioHi, ep / max(em, kArbNoise)) *
 		(1.0 - smoothstep(kArbFloorLo, kArbFloorHi, em));
 }
-
+)HLSL"
+R"HLSL(
 static const float kLostRatioLo = 1.25;
 static const float kLostRatioHi = 2.0;
 float block_error(float2 uvc, float2 v)
@@ -1717,7 +2273,7 @@ float lost_match(uint2 id, float4 sc, float th[11], float alpha, float quality)
 	const float2 uvc = uv_of(id);
 	const float2 xc = norm_of(uvc);
 	const float2 mv = (model_at(th, xc, (has_depth != 0u) ? sc.w : 0.0) - xc) / float2(norm_x, 2.0);
-	if (invalid_flow(mv))
+	if (invalid_model(mv))
 		return alpha;
 	const float2 fc = SrcFlow.Load(int3(id, 0));
 	const float2 prev_uv = uvc + mv;
@@ -1755,12 +2311,55 @@ float far_refuses(uint2 id, float4 sc, float th[11])
 	const float2 uvc = uv_of(id);
 	const float2 xc = norm_of(uvc);
 	const float2 mv = (model_at(th, xc, 0.0) - xc) / float2(norm_x, 2.0);
-	if (invalid_flow(mv) || length((mv - fc) * float2(norm_x, 2.0) * px_per_unit) < kTexTol)
+	if (invalid_model(mv) || length((mv - fc) * float2(norm_x, 2.0) * px_per_unit) < kTexTol)
 		return 0.0;
 	const float em = block_error(uvc, fc), ep = block_error(uvc, mv);
 	if (!(em == em) || !(ep == ep))
 		return 0.0;
 	return textured * smoothstep(kArbRatioLo, kArbRatioHi, max(ep, kArbNoise) / max(em, kArbNoise));
+}
+
+static const float kEarnAwayLo = 0.25;
+static const float kEarnAwayHi = 0.4;
+static const float kEarnLo = 1.5;
+static const float kEarnHi = 2.0;
+static const float kEarnSeenLo = 0.0008;
+static const float kEarnSeenHi = 0.0016;
+static const float kEarnFarLo = 0.10;
+static const float kEarnFarHi = 0.20;
+static const float kEarnFarRatioLo = 2.0;
+static const float kEarnFarRatioHi = 3.0;
+static const float kRestSnapLo = 0.6;
+static const float kRestSnapHi = 0.7;
+
+float rest_snap(float still)
+{
+	return (still == still) ? smoothstep(kRestSnapLo, kRestSnapHi, still) : 0.0;
+}
+
+float unearned(uint2 id, float4 sc, float th[11])
+{
+	const float2 fc = SrcFlow.Load(int3(id, 0));
+	if (invalid_flow(fc))
+		return 0.0;
+	const float2 uvc = uv_of(id);
+	const float2 xc = norm_of(uvc);
+	const float2 mv = (model_at(th, xc, (has_depth != 0u) ? sc.w : 0.0) - xc) / float2(norm_x, 2.0) *
+		(1.0 - rest_snap(Theta.Load(int3(6, 1, 0))));
+	if (invalid_model(mv))
+		return 0.0;
+	const float apart = length((mv - fc) * float2(norm_x, 2.0) * px_per_unit);
+	const bool far = rho_far(sc.w);
+	const float open = (far ? smoothstep(kEarnFarLo, kEarnFarHi, apart) : smoothstep(kEarnAwayLo, kEarnAwayHi, apart)) *
+		(1.0 - smoothstep(kArbMaxPx, kArbMaxPxHi, apart));
+	if (!(open > 0.0))
+		return 0.0;
+	const float em = block_error(uvc, fc), ep = block_error(uvc, mv);
+	if (!(em == em) || !(ep == ep))
+		return 0.0;
+	const float seen = far ? 1.0 : smoothstep(kEarnSeenLo, kEarnSeenHi, ep);
+	const float r = max(ep, kArbNoise) / max(em, kArbNoise);
+	return open * seen * (1.0 - (far ? smoothstep(kEarnFarRatioLo, kEarnFarRatioHi, r) : smoothstep(kEarnLo, kEarnHi, r)));
 }
 
 float near_alpha(uint2 id, float rho, float alpha)
@@ -1834,7 +2433,7 @@ float along_kept(int2 q, float th[11])
 		return 1.0;
 	const float2 x = norm_of(uv_of(uint2(q)));
 	const float2 m = (model_at(th, x, (has_depth != 0u) ? st.w : 0.0) - x) / float2(norm_x, 2.0);
-	if (invalid_flow(m))
+	if (invalid_model(m))
 		return 1.0;
 	const float2 n = float2(cos(st.x), sin(st.x));
 	if (abs(dot(float2(-n.y, n.x), (f - m) * float2(norm_x, 2.0))) * px_per_unit < kAlongPx)
@@ -1882,7 +2481,7 @@ void CSDecision(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi 
 		th[k] = Theta.Load(int3(k, 0, 0));
 	const float rest_share = Theta.Load(int3(6, 1, 0));
 	const float resting = smoothstep(0.5, 0.7, (rest_share == rest_share) ? rest_share : 0.0);
-	const int reach = (has_depth != 0u) ? kSurfaceReach : 2;
+	const int reach = (has_depth == 1u) ? kSurfaceReach : 2;
 	const int side = 8 + 2 * reach;
 	const int2 corner = int2(gid.xy) * 8 - reach;
 	[loop]
@@ -1916,7 +2515,7 @@ void CSDecision(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi 
 	}
 	if (!(quality > 0.0)) {
 		const float4 s0 = StructQ.Load(int3(id.xy, 0));
-		OutS[id.xy] = near_alpha(id.xy, s0.w, solved ? lost_match(id.xy, s0, th, 0.0, 0.0) : 0.0);
+		OutS[id.xy] = near_alpha(id.xy, s0.w, solved ? max(lost_match(id.xy, s0, th, 0.0, 0.0), unearned(id.xy, s0, th)) : 0.0);
 		return;
 	}
 	const float4 sc = StructQ.Load(int3(id.xy, 0));
@@ -1936,7 +2535,7 @@ void CSDecision(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi 
 			if (dx == 0 && dy == 0)
 				own = a;
 			float w = stz * exp(-0.22 * float(dx * dx + dy * dy));
-			if (has_depth != 0u)
+			if (has_depth == 1u)
 				w *= (abs(stw - sc.w) <= 0.1 * max(stw, sc.w) + 1e-5) ? 1.0 : 0.05;
 			num += w * a;
 			wsum += w;
@@ -1944,7 +2543,7 @@ void CSDecision(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi 
 	}
 	const float prop = (wsum > 0.05) ? num / wsum : own;
 	float alpha = saturate(lerp(prop, own, saturate(sc.z))) * quality;
-	if (has_depth != 0u && alpha < 0.999) {
+	if (has_depth == 1u && alpha < 0.999) {
 		float agree = 0.0, count = 0.0;
 		[loop]
 		for (int oy = -kSurfaceReach; oy <= kSurfaceReach; oy += 2) {
@@ -1972,15 +2571,17 @@ void CSDecision(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi 
 			const float2 xc = norm_of(uvc);
 			const float2 mv = (model_at(th, xc, (has_depth != 0u) ? sc.w : 0.0) - xc) /
 				float2(norm_x, 2.0);
-			if (!invalid_flow(mv))
+			if (!invalid_model(mv))
 				alpha *= 1.0 - arbiter_veto(uvc, sc, fc, mv);
 		}
 	}
+	alpha = max(alpha, unearned(id.xy, sc, th));
 	alpha = near_alpha(id.xy, sc.w, alpha);
 	OutS[id.xy] = alpha;
 }
-
-groupshared float gsFuseTh[12];
+)HLSL"
+R"HLSL(
+groupshared float gsFuseTh[14];
 groupshared float gsFuseRho[10 * 10];
 
 float pixel_rho(int2 home)
@@ -2011,38 +2612,49 @@ float pixel_rho(int2 home)
 
 void fuse_kept(uint2 p, float2 uv, int2 home)
 {
-	if ((model_flags & 4u) == 0u || has_depth == 0u)
+	if ((model_flags & 4u) == 0u)
 		return;
+	const float scale = (gsFuseTh[12] == gsFuseTh[12]) ? gsFuseTh[12] : 1.0;
 	const float2 old = PrevFlow.Load(int3(p, 0));
 	if (invalid_flow(old))
 		return;
+	if (has_depth != 1u) {
+		if (scale != 1.0)
+			OutV[p] = old * scale;
+		return;
+	}
 	float alpha = Aux.SampleLevel(LinearClamp, uv, 0);
 	alpha = (alpha == alpha) ? saturate(alpha) : 0.0;
-	if (!(alpha > 0.0))
+	if (!(alpha > 0.0)) {
+		if (scale != 1.0)
+			OutV[p] = old * scale;
 		return;
+	}
 	float th[11];
 	[unroll]
 	for (int k = 0; k < 11; ++k)
 		th[k] = gsFuseTh[k];
 	const float2 x = norm_of(uv);
 	const float rho = pixel_rho(home);
-	const float2 m = (model_at(th, x, rho) - x) / float2(norm_x, 2.0) * (1.0 - rho_near(rho));
-	const float2 flow = lerp(old, m, alpha);
-	if (!invalid_flow(m) && !invalid_flow(flow))
+	const float2 m = (model_at(th, x, rho) - x) / float2(norm_x, 2.0) * (1.0 - rho_near(rho)) *
+		(1.0 - rest_snap(gsFuseTh[13]));
+	const float2 flow = lerp(old, m, alpha) * scale;
+	if (!invalid_model(m) && !invalid_model(flow))
 		OutV[p] = flow;
 }
 
 [numthreads(8, 8, 1)]
 void CSFuse(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
-	if (gi < 12u)
-		gsFuseTh[gi] = (gi < 11u) ? Theta.Load(int3(gi, 0, 0)) : Theta.Load(int3(1, 6, 0));
+	if (gi < 14u)
+		gsFuseTh[gi] = (gi < 11u) ? Theta.Load(int3(gi, 0, 0)) : (gi == 11u) ? Theta.Load(int3(1, 6, 0)) :
+			(gi == 12u) ? Theta.Load(int3(11, 0, 0)) : Theta.Load(int3(6, 1, 0));
 	const int2 corner = int2(gid.xy) * 8 - 1;
 	if (has_depth != 0u) {
 		[loop]
 		for (uint t = gi; t < 100u; t += 64u) {
 			const float2 puv = (float2(corner + int2(t % 10u, t / 10u)) + 0.5) * inv_dst;
-			gsFuseRho[t] = 1.0 - Depth.SampleLevel(PointClamp, on_grid(puv), 0);
+			gsFuseRho[t] = 1.0 - Depth.SampleLevel(PointClamp, depth_uv(puv), 0);
 		}
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -2056,7 +2668,8 @@ void CSFuse(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV
 	const float2 uv = uv_of(id.xy);
 	float2 flow = SrcFlow.SampleLevel(LinearClamp, uv, 0);
 	float conf = Conf.SampleLevel(LinearClamp, uv, 0);
-	if (invalid_flow(flow))
+	const bool lost = invalid_flow(flow);
+	if (lost)
 		flow = float2(0.0, 0.0);
 	if (conf != conf)
 		conf = 0.0;
@@ -2065,17 +2678,20 @@ void CSFuse(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV
 	alpha = (alpha == alpha) ? saturate(alpha) : 0.0;
 	float trust = (AEON_FLOW_APERTURE != 0) ? GlobalF.SampleLevel(PointClamp, uv, 0).x : 0.0;
 	trust = (trust == trust) ? saturate(trust) : 0.0;
-	if (alpha > 0.0 || trust > 0.0) {
+	if (alpha > 0.0 || trust > 0.0 || lost) {
+		if (lost)
+			alpha = 1.0;
 		float th[11];
 		[unroll]
 		for (int k = 0; k < 11; ++k)
 			th[k] = gsFuseTh[k];
-		const float rho = (has_depth != 0u) ? pixel_rho(home) : 0.0;
+		const float rho = (has_depth == 1u) ? pixel_rho(home) : ((has_depth == 2u) ? gsFuseRho[home.y * 10 + home.x] : 0.0);
 		const float off_near = 1.0 - rho_near(rho);
 		trust *= off_near;
 		const float2 x = norm_of(uv);
-		const float2 m = (model_at(th, x, rho) - x) / float2(norm_x, 2.0) * off_near;
-		if (!invalid_flow(m)) {
+		const float2 m = (model_at(th, x, rho) - x) / float2(norm_x, 2.0) * off_near *
+			(1.0 - rest_snap(gsFuseTh[13]));
+		if (!invalid_model(m)) {
 			const float4 st = StructQ.SampleLevel(PointClamp, uv, 0);
 			const float2 n = float2(cos(st.x), sin(st.x));
 			const float2 t = float2(-n.y, n.x);
@@ -2084,9 +2700,382 @@ void CSFuse(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV
 			flow = m + (1.0 - alpha) * kept / float2(norm_x, 2.0);
 		}
 	}
-	if (invalid_flow(flow))
+	if (invalid_model(flow))
 		flow = matched;
 	OutV[id.xy] = flow;
 	OutS[id.xy] = saturate(conf);
+}
+)HLSL"
+R"HLSL(
+static const float kDfmRhoMax = 0.58;
+static const float kDfmBootMean = 0.3;
+static const float kDfmBootSpread = 0.12;
+static const float kDfmHistCap = 8.0;
+static const float kDfmDecay = 0.985;
+static const float kDfmMinPx = 0.15;
+static const float kDfmMaxPx = 6.0;
+static const float kDfmBootPx = 0.35;
+static const float kDfmBootVary = 0.1;
+static const float kDfmBootShare = 0.25;
+static const float kDfmBootFrames = 3.0;
+static const float kDfmFitAgree = 0.35;
+static const float kDfmEstablished = 0.05;
+static const uint kDfmSums = 12u;
+static const uint kDfmEpiStep = 4u;
+static const float kDfmEpiMin = 100.0;
+static const float kDfmPhotoGain = 0.25;
+static const float kDfmPhotoStep = 0.1;
+
+groupshared float gsDfm[256 * 12];
+groupshared float gsDfmT[4];
+groupshared float gsDfmRatio;
+
+void dfm_reduce(uint gi)
+{
+	[unroll]
+	for (uint s = 128u; s > 0u; s >>= 1u) {
+		GroupMemoryBarrierWithGroupSync();
+		if (gi < s) {
+			[unroll]
+			for (uint k = 0u; k < kDfmSums; ++k)
+				gsDfm[gi * kDfmSums + k] += gsDfm[(gi + s) * kDfmSums + k];
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+}
+
+float4 dfm_smallest(float a00, float a01, float a02, float a11, float a12, float a22)
+{
+	float A[3][3] = { { a00, a01, a02 }, { a01, a11, a12 }, { a02, a12, a22 } };
+	float V[3][3] = { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
+	[loop]
+	for (int sweep = 0; sweep < 8; ++sweep) {
+		[unroll]
+		for (int pq = 0; pq < 3; ++pq) {
+			const int p = (pq == 2) ? 1 : 0;
+			const int q = (pq == 0) ? 1 : 2;
+			if (!(abs(A[p][q]) > 1e-30))
+				continue;
+			const float theta = 0.5 * (A[q][q] - A[p][p]) / A[p][q];
+			const float t = ((theta >= 0.0) ? 1.0 : -1.0) / (abs(theta) + sqrt(theta * theta + 1.0));
+			const float c = rsqrt(t * t + 1.0), s = t * c;
+			[unroll]
+			for (int k = 0; k < 3; ++k) {
+				const float akp = A[k][p], akq = A[k][q];
+				A[k][p] = c * akp - s * akq;
+				A[k][q] = s * akp + c * akq;
+			}
+			[unroll]
+			for (int k2 = 0; k2 < 3; ++k2) {
+				const float apk = A[p][k2], aqk = A[q][k2];
+				A[p][k2] = c * apk - s * aqk;
+				A[q][k2] = s * apk + c * aqk;
+			}
+			[unroll]
+			for (int k3 = 0; k3 < 3; ++k3) {
+				const float vkp = V[k3][p], vkq = V[k3][q];
+				V[k3][p] = c * vkp - s * vkq;
+				V[k3][q] = s * vkp + c * vkq;
+			}
+		}
+	}
+	const float e0 = A[0][0], e1 = A[1][1], e2 = A[2][2];
+	int lo = 0;
+	float mid = min(e1, e2);
+	if (e1 < e0 && e1 <= e2) {
+		lo = 1;
+		mid = min(e0, e2);
+	} else if (e2 < e0 && e2 < e1) {
+		lo = 2;
+		mid = min(e0, e1);
+	}
+	const float elo = (lo == 0) ? e0 : ((lo == 1) ? e1 : e2);
+	const float3 v = (lo == 0) ? float3(V[0][0], V[1][0], V[2][0])
+		: ((lo == 1) ? float3(V[0][1], V[1][1], V[2][1]) : float3(V[0][2], V[1][2], V[2][2]));
+	return float4(v, (mid > 1e-30) ? max(elo, 0.0) / mid : 1.0);
+}
+
+bool dfm_sample(uint2 q, float th[11], out float2 x, out float2 xm, out float2 r, out float3 I, out float w,
+	out float rho0, out float c0)
+{
+	x = float2(0.0, 0.0);
+	xm = x;
+	r = x;
+	I = float3(0.0, 0.0, 0.0);
+	w = 0.0;
+	rho0 = 0.0;
+	c0 = 0.0;
+	const float2 f = SrcFlow.Load(int3(q, 0));
+	const float4 st = StructQ.Load(int3(q, 0));
+	if (invalid_flow(f) || !(st.z > 0.05) || any(st != st))
+		return false;
+	if (has_depth == 2u) {
+		rho0 = clamp(st.w, 0.0, kDfmRhoMax);
+		const float c = PrevFlow.Load(int3(q, 0)).y;
+		c0 = (c == c) ? max(c, 0.0) : 0.0;
+	}
+	float conf = Conf.Load(int3(q, 0));
+	conf = (conf == conf) ? saturate(conf) : 0.0;
+	x = norm_of((float2(q) + 0.5) * inv_dst);
+	xm = model_at(th, x, rho0);
+	r = (x + f * float2(norm_x, 2.0) - xm) * px_per_unit;
+	if (!(length(r) < kDfmMaxPx))
+		return false;
+	const float l = line_like(st);
+	const float2 n = float2(cos(st.x), sin(st.x));
+	const float2 tg = float2(-n.y, n.x);
+	const float sn = lerp(kTexNoise, kLineNoise, l);
+	const float an = 1.0 / (sn * sn);
+	const float at = (1.0 - l) / (kTexNoise * kTexNoise);
+	I = float3(an * n.x * n.x + at * tg.x * tg.x, an * n.x * n.y + at * tg.x * tg.y,
+		an * n.y * n.y + at * tg.y * tg.y);
+	w = st.z * (0.25 + 0.75 * conf);
+	return true;
+}
+
+float dfm_quad(float3 I, float2 a, float2 b) { return a.x * (I.x * b.x + I.y * b.y) + a.y * (I.y * b.x + I.z * b.y); }
+
+[numthreads(256, 1, 1)]
+void CSDfmEpipole(uint gi : SV_GroupIndex)
+{
+	float th[11];
+	load_fit(th, false);
+	const uint2 grid = (dst + kDfmEpiStep - 1u) / kDfmEpiStep;
+	const uint count = grid.x * grid.y;
+	float s[kDfmSums];
+	[unroll]
+	for (uint z = 0u; z < kDfmSums; ++z)
+		s[z] = 0.0;
+	[loop]
+	for (uint i = gi; i < count; i += 256u) {
+		float2 x, xm, r;
+		float3 I;
+		float w, rho0, c0;
+		if (!dfm_sample(min(uint2(i % grid.x, i / grid.x) * kDfmEpiStep + kDfmEpiStep / 2u, dst - 1u), th, x, xm, r, I, w, rho0, c0))
+			continue;
+		const float rl = length(r);
+		const float tr = I.x + I.z;
+		if (!(rl > kDfmMinPx) || !(tr > 0.0))
+			continue;
+		const float iso = saturate(4.0 * (I.x * I.z - I.y * I.y) / (tr * tr));
+		const float3 a = float3(-r.y, r.x, r.y * xm.x - r.x * xm.y) / rl;
+		const float wa = w * iso * saturate(rl * rl / 0.25);
+		s[0] += wa * a.x * a.x;
+		s[1] += wa * a.x * a.y;
+		s[2] += wa * a.x * a.z;
+		s[3] += wa * a.y * a.y;
+		s[4] += wa * a.y * a.z;
+		s[5] += wa * a.z * a.z;
+		s[6] += wa;
+		s[7] += 1.0;
+		s[8] += wa * rl;
+	}
+	[unroll]
+	for (uint k = 0u; k < kDfmSums; ++k)
+		gsDfm[gi * kDfmSums + k] = s[k];
+	dfm_reduce(gi);
+	if (gi == 0u) {
+		const float4 e = dfm_smallest(gsDfm[0], gsDfm[1], gsDfm[2], gsDfm[3], gsDfm[4], gsDfm[5]);
+		gsDfmT[0] = e.x;
+		gsDfmT[1] = e.y;
+		gsDfmT[2] = e.z;
+		const bool fitted = Theta.Load(int3(0, 1, 0)) > 0.5 && Theta.Load(int3(1, 1, 0)) > kDfmFitAgree;
+		const bool held = fitted && gsDfm[7] >= kDfmEpiMin && gsDfm[6] > 0.0 && e.w < 0.5 && all(e.xyz == e.xyz) &&
+			gsDfm[8] > kDfmBootPx * gsDfm[6];
+		const float4 before = Color.Load(int3(0, 0, 0));
+		float streak = Color.Load(int3(2, 0, 0)).x;
+		streak = (streak == streak && streak >= 0.0 && streak < 1e4) ? streak : 0.0;
+		const bool fresh = (model_flags & 16u) != 0u;
+		streak = fresh ? 0.0 : streak;
+		const bool same = !fresh && all(before.xyz == before.xyz) && abs(dot(normalize(e.xyz), normalize(before.xyz + 1e-20))) > 0.95;
+		streak = held ? (same ? min(streak + 1.0, kDfmBootFrames) : 1.0) : 0.0;
+		gsDfmT[3] = (held && streak >= kDfmBootFrames) ? 1.0 : 0.0;
+		OutS4[uint2(2, 0)] = float4(streak, 0.0, 0.0, 0.0);
+		gsDfmRatio = e.w;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	const float3 te = float3(gsDfmT[0], gsDfmT[1], gsDfmT[2]);
+	[unroll]
+	for (uint z2 = 0u; z2 < kDfmSums; ++z2)
+		s[z2] = 0.0;
+	[loop]
+	for (uint j = gi; j < count; j += 256u) {
+		float2 x, xm, r;
+		float3 I;
+		float w, rho0, c0;
+		if (!dfm_sample(min(uint2(j % grid.x, j / grid.x) * kDfmEpiStep + kDfmEpiStep / 2u, dst - 1u), th, x, xm, r, I, w, rho0, c0))
+			continue;
+		const bool measured = c0 > kDfmEstablished;
+		if (measured) {
+			s[8] += c0;
+			s[9] += c0 * rho0;
+		}
+		const float2 d = float2(te.x - te.z * xm.x, te.y - te.z * xm.y);
+		const float dd = dfm_quad(I, d, d);
+		if (!(dd > 1e-12) || !(length(r) > kDfmMinPx))
+			continue;
+		const float qv = dfm_quad(I, d, r) / dd;
+		if (!(abs(qv) < 1e6))
+			continue;
+		s[0] += w;
+		s[1] += w * qv;
+		s[2] += w * qv * qv;
+		if (measured) {
+			const float v = w * c0;
+			s[3] += v;
+			s[4] += v * qv;
+			s[5] += v * qv * qv;
+			s[6] += v * rho0;
+			s[7] += v * qv * rho0;
+			s[11] += v * rho0 * rho0;
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint k2 = 0u; k2 < kDfmSums; ++k2)
+		gsDfm[gi * kDfmSums + k2] = s[k2];
+	dfm_reduce(gi);
+	if (gi == 0u) {
+		const float sw = gsDfm[0];
+		const float mq = gsDfm[1] / max(sw, 1e-12);
+		const float vq = max(gsDfm[2] / max(sw, 1e-12) - mq * mq, 0.0);
+		const float fill = (gsDfm[8] > 0.0) ? gsDfm[9] / gsDfm[8] : 0.0;
+		bool ok = gsDfmT[3] > 0.5 && sw > 0.0 && vq > kDfmBootVary * kDfmBootVary &&
+			vq > kDfmBootShare * (vq + mq * mq);
+		float a = 0.0, b = 0.0;
+		const float sv = gsDfm[3];
+		if (ok && !(sv > 0.02 * sw)) {
+			a = kDfmBootSpread * rsqrt(vq);
+			b = kDfmBootMean - a * mq;
+		} else if (ok) {
+			const float mqv = gsDfm[4] / sv;
+			const float vqv = gsDfm[5] / sv - mqv * mqv;
+			const float mrv = gsDfm[6] / sv;
+			const float vrv = gsDfm[11] / sv - mrv * mrv;
+			const float cov = gsDfm[7] / sv - mqv * mrv;
+			ok = vqv > 1e-12 && vrv > 1e-8 && abs(cov) > 0.3 * sqrt(vqv * vrv);
+			a = ok ? cov / vqv : 0.0;
+			b = ok ? mrv - a * mqv : 0.0;
+		}
+		OutS4[uint2(0, 0)] = float4(te, ok ? 1.0 : 0.0);
+		OutS4[uint2(1, 0)] = float4(a, b, fill, gsDfmRatio);
+	}
+}
+)HLSL"
+R"HLSL(
+[numthreads(8, 8, 1)]
+void CSDfmMeasure(uint3 id : SV_DispatchThreadID)
+{
+	if (any(id.xy >= dst))
+		return;
+	float th[11];
+	load_fit(th, false);
+	float2 x, xm, r;
+	float3 I;
+	float w, rho0, c0;
+	const bool have = dfm_sample(id.xy, th, x, xm, r, I, w, rho0, c0);
+	if (!have && has_depth == 2u) {
+		rho0 = StructQ.Load(int3(id.xy, 0)).w;
+		const float c = PrevFlow.Load(int3(id.xy, 0)).y;
+		c0 = (c == c) ? max(c, 0.0) : 0.0;
+	}
+	rho0 = (rho0 == rho0) ? clamp(rho0, 0.0, kDfmRhoMax) : 0.0;
+	float meas = rho0, wm = 0.0;
+	const bool fitted = Theta.Load(int3(0, 1, 0)) > 0.5 && Theta.Load(int3(1, 1, 0)) > kDfmFitAgree;
+	bool gn = false;
+	if (have && fitted && (model_flags & 4u) == 0u) {
+		const float2 J = (model_at(th, x, rho0 + 0.05) - xm) * (px_per_unit / 0.05);
+		const float4 e0 = Color.Load(int3(0, 0, 0));
+		const float4 e1 = Color.Load(int3(1, 0, 0));
+		if (has_depth == 2u && dot(J, J) > 4.0) {
+			const float2 Jn = J / px_per_unit;
+			const float2 texel = 2.0 * inv_full;
+			const float to_unit = 0.5 * px_per_unit;
+			float num = 0.0, den = 0.0;
+			[unroll]
+			for (int sp = 0; sp < 4; ++sp) {
+				const float2 u = (float2(id.xy) * 4.0 + float2(1.0 + 2.0 * float(sp & 1), 1.0 + 2.0 * float(sp >> 1))) * inv_full;
+				const float2 xs = norm_of(u);
+				const float2 xms = model_at(th, xs, rho0);
+				const float2 uvp = xms / float2(norm_x, 2.0) + 0.5;
+				if (any(uvp < texel) || any(uvp > 1.0 - texel))
+					continue;
+				const float lc = LumaCur.SampleLevel(LinearClamp, u, 1);
+				const float lp = LumaPrev.SampleLevel(LinearClamp, uvp, 1);
+				const float2 g = 0.5 * float2(
+					LumaPrev.SampleLevel(LinearClamp, uvp + float2(texel.x, 0.0), 1) -
+						LumaPrev.SampleLevel(LinearClamp, uvp - float2(texel.x, 0.0), 1),
+					LumaPrev.SampleLevel(LinearClamp, uvp + float2(0.0, texel.y), 1) -
+						LumaPrev.SampleLevel(LinearClamp, uvp - float2(0.0, texel.y), 1)) * to_unit;
+				const float gg = dot(g, g);
+				if (!(gg > 1e-6))
+					continue;
+				const float rr = lp - lc;
+				const float e = (rr / sqrt(gg)) * px_per_unit / kPhotoSigma;
+				const float tk = saturate(1.0 - e * e);
+				const float gj = dot(g, Jn);
+				num += tk * tk * rr * gj;
+				den += tk * tk * gj * gj;
+			}
+			if (den > 1e-9) {
+				meas = rho0 - clamp(num / den, -kDfmPhotoStep, kDfmPhotoStep);
+				wm = w * saturate(den * kDfmPhotoGain);
+				gn = true;
+			}
+		} else if (e0.w > 0.5 && length(r) > kDfmMinPx) {
+			const float2 d = float2(e0.x - e0.z * xm.x, e0.y - e0.z * xm.y);
+			const float dd = dfm_quad(I, d, d);
+			if (dd > 1e-12) {
+				meas = e1.x * (dfm_quad(I, d, r) / dd) + e1.y;
+				wm = w;
+			}
+		}
+		if (!(meas == meas) || !(wm == wm) || !(abs(meas) < 1e4)) {
+			meas = rho0;
+			wm = 0.0;
+		}
+		meas = clamp(meas, 0.0, kDfmRhoMax);
+	}
+	const float ch = min(c0, kDfmHistCap);
+	const float tot = ch + wm;
+	const float rho = (tot > 1e-6) ? (rho0 * ch + meas * wm) / tot : rho0;
+	OutS4[id.xy] = float4(clamp(rho, 0.0, kDfmRhoMax), tot, meas, gn ? wm : -wm);
+}
+
+[numthreads(8, 8, 1)]
+void CSDfmWarp(uint3 id : SV_DispatchThreadID)
+{
+	if (any(id.xy >= dst))
+		return;
+	const float2 uv = uv_of(id.xy);
+	float2 v = SrcFlow.SampleLevel(LinearClamp, uv, 0);
+	if (invalid_model(v))
+		v = float2(0.0, 0.0);
+	float fill = Color.Load(int3(1, 0, 0)).z;
+	fill = (fill == fill) ? clamp(fill, 0.0, kDfmRhoMax) : 0.0;
+	const float2 src = uv + v;
+	float num = 0.0, den = 0.0, gs = 0.0;
+	if (!out_of_bounds(src)) {
+		const float2 base = src * float2(dst) - 0.5;
+		const int2 b0 = int2(floor(base));
+		[unroll]
+		for (int dy = -1; dy <= 2; ++dy) {
+			[unroll]
+			for (int dx = -1; dx <= 2; ++dx) {
+				const int2 p = clamp(b0 + int2(dx, dy), int2(0, 0), int2(dst) - 1);
+				const float2 o = float2(b0 + int2(dx, dy)) - base;
+				const float g = exp(-0.5 * dot(o, o));
+				const float4 a = StructQ.Load(int3(p, 0));
+				const float c = (a.y == a.y) ? max(a.y, 0.0) : 0.0;
+				const float rr = (a.x == a.x) ? a.x : 0.0;
+				num += g * c * rr;
+				den += g * c;
+				gs += g;
+			}
+		}
+	}
+	const float c = (gs > 0.0) ? kDfmDecay * den / gs : 0.0;
+	const float rho = (den > 1e-4) ? num / den : fill;
+	OutS4[id.xy] = float4(1.0 - clamp(rho, 0.0, kDfmRhoMax), c, 0.0, 0.0);
 }
 )HLSL";

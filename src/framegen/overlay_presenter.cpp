@@ -31,6 +31,22 @@ DXGI_FORMAT swap_format_for(DXGI_FORMAT family) noexcept
 	}
 }
 
+bool window_above(HWND ours, HWND game) noexcept
+{
+	const HWND root = game != nullptr ? GetAncestor(game, GA_ROOT) : nullptr;
+	if (ours == nullptr || root == nullptr || !IsWindow(ours))
+		return true;
+	HWND h = root;
+	for (int i = 0; i < 4096; ++i) {
+		h = GetWindow(h, GW_HWNDPREV);
+		if (h == nullptr)
+			return false;
+		if (h == ours)
+			return true;
+	}
+	return true;
+}
+
 void barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res, D3D12_RESOURCE_STATES before,
 	D3D12_RESOURCE_STATES after)
 {
@@ -244,6 +260,9 @@ bool OverlayPresenter::ensure(ID3D12Device *device, HWND game_window, uint32_t w
 	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: family = DXGI_FORMAT_R8G8B8A8_TYPELESS; break;
 	case DXGI_FORMAT_B8G8R8A8_UNORM:
 	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: family = DXGI_FORMAT_B8G8R8A8_TYPELESS; break;
+	case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8X8_UNORM:
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: family = DXGI_FORMAT_B8G8R8A8_TYPELESS; break;
 	case DXGI_FORMAT_R10G10B10A2_UNORM: family = DXGI_FORMAT_R10G10B10A2_TYPELESS; break;
 	case DXGI_FORMAT_R16G16B16A16_FLOAT: family = DXGI_FORMAT_R16G16B16A16_TYPELESS; break;
 	default: break;
@@ -294,12 +313,21 @@ bool OverlayPresenter::ensure(ID3D12Device *device, HWND game_window, uint32_t w
 	feed_value_ = 0;
 	read_value_ = 0;
 	next_id_ = 1;
+	shown_real_id_.store(0, std::memory_order_relaxed);
 	feed_open_ = false;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		pending_.clear();
 		reset_pending_ = false;
+		const uint64_t reals = stats_.shown_reals, made = stats_.shown_made;
 		stats_ = OverlayStats{};
+		stats_.shown_reals = reals;
+		stats_.shown_made = made;
+		stats_.starts = ++starts_;
+	}
+	{
+		std::lock_guard<std::mutex> lock(trace_mutex_);
+		work_seen_ = work_found_ = work_untimed_ = 0;
 	}
 	quit_.store(false);
 	init_done_.store(false);
@@ -352,8 +380,12 @@ bool OverlayPresenter::begin_feed(ID3D12CommandQueue *queue, OverlayFeed *slot, 
 		if (!other_format && s.made[have] != nullptr)
 			continue;
 		if (made_backoff_ > 0 || !make_tex(device_, w_, h_, made_format, &fresh[have], true)) {
-			if (made_backoff_ == 0)
+			if (made_backoff_ == 0) {
 				made_backoff_ = kMadeBackoff;
+				diag_logf(DiagLevel::Warn, "framegen", L"frame generation: the window could not make a texture for a "
+					L"vendor's made frame (%u of %u, out of video memory?); the add-on's own generator makes those pairs",
+					have + 1, made);
+			}
 			break;
 		}
 	}
@@ -419,11 +451,19 @@ void OverlayPresenter::abandon_feed(ID3D12CommandQueue *queue, bool made_dirty) 
 	}
 }
 
+void OverlayPresenter::note_shown_real(uint64_t id) noexcept
+{
+	uint64_t was = shown_real_id_.load(std::memory_order_relaxed);
+	while (id > was && !shown_real_id_.compare_exchange_weak(was, id, std::memory_order_release))
+		;
+}
+
 void OverlayPresenter::reset_frames() noexcept
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	reset_pending_ = true;
 	pending_.clear();
+	note_shown_real(next_id_ - 1u);
 }
 
 void OverlayPresenter::stop() noexcept
@@ -914,6 +954,7 @@ bool OverlayPresenter::switch_to_local()
 		idle = read_fence_->GetCompletedValue() >= read_value_;
 	}
 	release_sink(idle);
+	cover_.reset();
 	std::wstring why;
 	if (init_local(&why))
 		return true;
@@ -954,6 +995,7 @@ void OverlayPresenter::thread_shutdown() noexcept
 		WaitForSingleObject(fence_event_, 1000);
 	interp_.release();
 	blit_.release();
+	marker_.release();
 	wait_sink_done();
 	release_sink();
 	host_lost_ = false;
@@ -979,6 +1021,7 @@ void OverlayPresenter::thread_shutdown() noexcept
 		CloseHandle(timer_);
 	timer_ = nullptr;
 	shown_ = had_content_ = false;
+	cover_.reset();
 	wake_n_ = wake_at_ = 0;
 	last_wake_ = next_display_ = 0.0;
 }
@@ -1139,7 +1182,7 @@ void OverlayPresenter::follow_window()
 		return GetEnvironmentVariableW(L"AEONSR_FG_OVERLAY_ALWAYS", v, 8) != 0 && v[0] == L'1';
 	}();
 	const bool game_in_front = IsWindow(game_window_) && !IsIconic(game_window_) &&
-		(always || pid == GetCurrentProcessId());
+		(always || pid == GetCurrentProcessId()) && !aside_.load(std::memory_order_relaxed);
 	if (!game_in_front || !had_content_) {
 		if (shown_) {
 			if (host_ != nullptr) {
@@ -1178,6 +1221,20 @@ void OverlayPresenter::follow_window()
 			SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
 		shown_rect_ = r;
 		shown_ = true;
+		return;
+	}
+	const double now = qpc_ms();
+	if (!cover_.due(now))
+		return;
+	const HWND ours = host_ != nullptr ? host_->window() : window_;
+	if (cover_.checked(now, window_above(ours, game_window_))) {
+		SetWindowPos(ours, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+			(host_ != nullptr ? SWP_ASYNCWINDOWPOS : 0u));
+		diag_logf(DiagLevel::Info, "framegen", L"frame generation: the game's window had come over its own window; "
+			L"put back on top (%llu times so far)", static_cast<unsigned long long>(cover_.raised()));
+	} else if (cover_.covered()) {
+		diag_logf(DiagLevel::Warn, "framegen", L"frame generation: the game keeps its own window over every other, so "
+			L"its own window's pictures cannot be seen");
 	}
 }
 
@@ -1277,6 +1334,8 @@ bool OverlayPresenter::render(const OverlayChoice &c)
 		in.global_flow = b.global;
 		in.global_state = OverlayFeed::kRestState;
 		in.t = c.t;
+		in.previous_id = c.a;
+		in.current_id = c.b;
 		std::wstring err;
 		if (!interp_.record(list_, in, &err)) {
 			list_->Close();
@@ -1308,7 +1367,11 @@ bool OverlayPresenter::render(const OverlayChoice &c)
 		barrier(list_, back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
 		barrier(list_, src, read, src_state);
 	}
+	if (marker_on_.load(std::memory_order_relaxed) && (last_ == Last::Generated || last_ == Last::Made))
+		marker_.stamp(native_, list_, back, D3D12_RESOURCE_STATE_COMMON);
 	if (FAILED(list_->Close())) {
+		if (from_interp)
+			interp_.discard_prepared();
 		signal();
 		return false;
 	}
@@ -1429,6 +1492,8 @@ void OverlayPresenter::run()
 	}
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
+		for (const Pending &p : pending_)
+			note_shown_real(p.id);
 		pending_.clear();
 		stats_.running = true;
 		stats_.in_host = host_ != nullptr;
@@ -1442,6 +1507,11 @@ void OverlayPresenter::run()
 	trace_thread_ = std::thread([this] { trace_run(); });
 	second_start_ = qpc_ms();
 	second_reals_ = second_generated_ = 0;
+	{
+		bool building = false;
+		std::wstring err;
+		(void)interp_.ensure(native_, w_, h_, family_, &building, &err);
+	}
 	kicks_left_ = 16;
 	next_kick_ = 0.0;
 	bool armed = true;
@@ -1561,20 +1631,30 @@ void OverlayPresenter::run()
 			++taken;
 		}
 		waiting_.erase(waiting_.begin(), waiting_.begin() + static_cast<long>(taken));
+		scheduler_.set_queue(queue_on_.load(std::memory_order_relaxed));
 		const OverlayChoice c = scheduler_.choose(display, period);
+		if (c.kind == OverlayChoice::Kind::Real)
+			note_shown_real(c.b);
 		const double render_from = qpc_ms();
-		const bool presented = (shown_ || !had_content_) && render(c);
+		const bool presented = (shown_ || !had_content_) && !aside_.load(std::memory_order_relaxed) && render(c);
 		if (presented)
 			t_render_.push_back(qpc_ms() - render_from);
+		if (pace_csv_ != nullptr)
+			std::fprintf(pace_csv_, "pick,%.3f,%d,%llu,%llu,%u,%d,%d\n", display, static_cast<int>(c.kind),
+				static_cast<unsigned long long>(c.a), static_cast<unsigned long long>(c.b), c.index, c.made ? 1 : 0,
+				presented ? (shown_new_ || c.kind == OverlayChoice::Kind::Real ? 1 : 2) : 0);
 		armed = presented;
 		if (presented && by_compositor)
 			pace_.presented();
 		if (presented) {
 			had_content_ = true;
-			if (c.kind == OverlayChoice::Kind::Real)
+			if (c.kind == OverlayChoice::Kind::Real) {
 				++second_reals_;
-			else if (shown_new_)
+				++shown_reals_;
+			} else if (shown_new_) {
 				++second_generated_;
+				++shown_made_;
+			}
 		} else {
 			Sleep(1);
 		}
@@ -1613,6 +1693,8 @@ void OverlayPresenter::run()
 			stats_.held = scheduler_.held();
 			stats_.repeated = scheduler_.repeated();
 			stats_.made_shown = made_shown_;
+			stats_.interp_full = interp_.full_records();
+			stats_.interp_reused = interp_.reused_records();
 			const auto pct = [](std::vector<double> &v, double q) {
 				if (v.empty())
 					return 0.0;
@@ -1650,6 +1732,8 @@ void OverlayPresenter::run()
 			}
 			stats_.lead_ms = pace_.lead_ms();
 			stats_.work_ms = pace_.work_ms();
+			stats_.raised = cover_.raised();
+			stats_.covered = cover_.covered();
 			stats_.missed = pace_.misses();
 			stats_.missed_late_work = pace_.late_work();
 			if (offset_n_ > 0) {
@@ -1672,10 +1756,17 @@ void OverlayPresenter::run()
 			stats_.host_pid = host_ != nullptr ? host_->host_pid() : 0u;
 			stats_.host_gpu_class = host_ != nullptr ? host_->gpu_class() : -1;
 			stats_.real_per_s = second_reals_ / secs;
+			stats_.shown_reals = shown_reals_;
+			stats_.shown_made = shown_made_;
 			stats_.generated_per_s = second_generated_ / secs;
 			second_start_ = now;
 			second_reals_ = second_generated_ = 0;
 		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		stats_.shown_reals = shown_reals_;
+		stats_.shown_made = shown_made_;
 	}
 	thread_shutdown();
 	std::lock_guard<std::mutex> lock(mutex_);

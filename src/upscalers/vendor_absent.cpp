@@ -39,6 +39,7 @@ reshade::api::device_api DlssD3D12Backend::api() const { return reshade::api::de
 bool DlssD3D12Backend::runtime_present() { return false; }
 void DlssD3D12Backend::on_destroy_swapchain() {}
 void DlssD3D12Backend::shutdown() {}
+void DlssD3D12Backend::join_init() {}
 bool DlssD3D12Backend::run(reshade::api::effect_runtime *, const FrameInputs &, const UpscalerParams &)
 {
 	return refuse(*this);
@@ -97,6 +98,11 @@ bool NeuralRenderD3D12::init_device(ID3D12Device *, uint32_t, uint32_t)
 void NeuralRenderD3D12::shutdown_device() {}
 void NeuralRenderD3D12::set_command_queue(ID3D12CommandQueue *) {}
 void NeuralRenderD3D12::destroy_feature() {}
+bool NeuralRenderD3D12::feature_ready(uint32_t, uint32_t, DXGI_FORMAT, const NeuralRenderParams &) const
+{
+	return false;
+}
+bool NeuralRenderD3D12::build_feature(uint32_t, uint32_t, DXGI_FORMAT, const NeuralRenderParams &) { return false; }
 void NeuralRenderD3D12::request_capture(std::wstring, uint32_t) {}
 bool NeuralRenderD3D12::run(ID3D12GraphicsCommandList *, ID3D12Resource *,
 	D3D12_RESOURCE_STATES, ID3D12Resource *, ID3D12Resource *, const NeuralRenderParams &,

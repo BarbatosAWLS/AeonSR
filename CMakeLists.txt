@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AeonSR VERSION 1.3.2 LANGUAGES C CXX)
+project(AeonSR VERSION 1.4.0 LANGUAGES C CXX)
 
 set(AEONSR_VERSION_STR "${PROJECT_VERSION}")
 
@@ -153,6 +153,7 @@ set(AEONSR_SOURCES
   src/core/report_bundle.cpp
   src/upscalers/ffx_dx11_loader.cpp
   src/upscalers/ffx_loader.cpp
+  src/upscalers/ffx_driver_lite.cpp
   src/motion/flow_probe.cpp
   src/core/frame_clock.cpp
   src/core/display_pacer.cpp
@@ -163,11 +164,14 @@ set(AEONSR_SOURCES
   src/framegen/display_clock.cpp
   src/framegen/frame_gen_stage.cpp
   src/framegen/frame_generation.cpp
+  src/framegen/keep_borderless.cpp
   src/framegen/frame_interpolator.cpp
   src/framegen/frame_pacer.cpp
   src/framegen/frame_presenter.cpp
   src/framegen/present_sync.cpp
   src/framegen/overlay_scheduler.cpp
+  src/framegen/overlay_cover.cpp
+  src/framegen/frame_marker.cpp
   src/framegen/overlay_presenter.cpp
   src/framegen/window_host_link.cpp
   src/framegen/window_host_protocol.cpp
@@ -200,6 +204,7 @@ set(AEONSR_SOURCES
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
   src/ngx/ngx_dlssg_files.cpp
+  src/ngx/ngx_dlssg_unlocker.cpp
   src/ngx/ngx_api12.cpp
   src/ngx/ngx_session.cpp
   src/motion/optical_flow.cpp
@@ -250,6 +255,7 @@ set(AEONSR_VENDOR_SOURCES
   src/upscalers/backend_xess.cpp
   src/upscalers/ffx_dx11_loader.cpp
   src/upscalers/ffx_loader.cpp
+  src/upscalers/ffx_driver_lite.cpp
   src/ngx/neural_arch_hook.cpp
   src/ngx/ngx_dlssnr.cpp
   src/depth/depth_on_grid.cpp
@@ -257,6 +263,7 @@ set(AEONSR_VENDOR_SOURCES
   src/ngx/ngx_runtime_d3d12.cpp
   src/ngx/ngx_shared_d3d12.cpp
   src/ngx/ngx_dlssg_files.cpp
+  src/ngx/ngx_dlssg_unlocker.cpp
   src/ngx/ngx_api12.cpp
   src/ngx/ngx_session.cpp
   src/upscalers/xess_loader.cpp
@@ -354,6 +361,8 @@ if(AEONSR_X64)
     src/ngx/ngx_dlssg_files.cpp
     src/upscalers/backend_vsr.cpp
     src/interop/blit_d3d11.cpp
+    src/ngx/ngx_dlssg_unlocker.cpp
+    src/upscalers/ffx_driver_lite.cpp
   )
   if(AEONSR_FRAME_GENERATION)
     target_sources(AeonSRHost PRIVATE
@@ -389,6 +398,7 @@ if(AEONSR_X64)
     prebuild/prebuild_main.cpp
     src/upscalers/fsr_warmup.cpp
     src/upscalers/ffx_loader.cpp
+    src/upscalers/ffx_driver_lite.cpp
   )
   target_include_directories(AeonSRPrebuild PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include" "${FFX_INCLUDE_DIR}")

@@ -139,4 +139,6 @@ private:
 
 inline constexpr float kHudMaskHeld = 128.0f / 255.0f;
 
+void hud_restore_warm_shaders();
+
 }

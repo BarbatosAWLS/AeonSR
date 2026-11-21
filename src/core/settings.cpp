@@ -16,6 +16,18 @@
 namespace aeon_sr {
 namespace {
 
+[[maybe_unused]] std::string trim_ini(const std::string &s)
+{
+	const size_t a = s.find_first_not_of(" \t\r\n");
+	if (a == std::string::npos)
+		return std::string();
+	const size_t b = s.find_last_not_of(" \t\r\n");
+	std::string v = s.substr(a, b - a + 1);
+	if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+		v = v.substr(1, v.size() - 2);
+	return v;
+}
+
 std::string narrow(const std::wstring &ws)
 {
 	if (ws.empty())
@@ -430,6 +442,7 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 		else if (key == "JitterTestedQuads") out.jitter_tested_quads = parse_bool(val);
 		else if (key == "JitterSceneQuads") out.jitter_scene_quads = parse_bool(val);
 		else if (key == "DepthRegrid") out.depth_regrid = parse_bool(val);
+		else if (key == "DepthFromMotion") out.depth_from_motion = parse_bool(val);
 		else if (key == "UpscalerCapture") out.upscaler_capture = parse_bool(val);
 		else if (key == "ScopeCapture") out.scope_capture = parse_bool(val);
 		else if (key == "ScopeFrames") {
@@ -475,6 +488,10 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.frame_generation_multiplier = !v.empty() && end != nullptr && *end == '\0' && n >= 2 &&
 				n <= kFrameGenerationMultiplierMax ? static_cast<unsigned int>(n) : 0u;
 		}
+		else if (key == "FrameGenerationExcess") {
+			unsigned int e = 0;
+			out.frame_generation_excess = parse_frame_gen_excess(val, &e) ? e : 0u;
+		}
 		else if (key == "FrameGenerator") {
 			FrameGenerator g = FrameGenerator::AeonSR;
 			out.frame_generator = parse_frame_generator(val, &g) ? static_cast<unsigned int>(g) : 0u;
@@ -484,6 +501,8 @@ void load_settings(Settings &out, const std::wstring &ini_path)
 			out.frame_generation_dump = v <= 100000ul ? static_cast<unsigned int>(v) : 0u;
 		}
 		else if (key == "FrameGenerationDumpDir") out.frame_generation_dump_dir = val;
+		else if (trim_ini(key) == "FrameGenerationUnlocker") out.frame_generation_unlocker = trim_ini(val);
+		else if (key == "FrameGenerationMarker") out.frame_generation_marker = parse_bool(val);
 #endif
 		else if (key == "DebugInfo") out.debug_info = parse_bool(val);
 		else if (key == "VerboseLog") out.verbose_log = parse_bool(val);
@@ -562,6 +581,8 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		out << "JitterSceneQuads=0\n";
 	if (!in.depth_regrid)
 		out << "DepthRegrid=0\n";
+	if (!in.depth_from_motion)
+		out << "DepthFromMotion=0\n";
 	out << "UpscalerCapture=" << (in.upscaler_capture ? 1 : 0) << "\n";
 	out << "ScopeCapture=" << (in.scope_capture ? 1 : 0) << "\n";
 	out << "ScopeFrames=" << (in.scope_frames >= 1u && in.scope_frames <= kScopeFramesMax
@@ -601,12 +622,17 @@ void save_settings(const Settings &in, const std::wstring &ini_path)
 		out << "FrameGenerationMultiplier=" << in.frame_generation_multiplier << "\n";
 	else
 		out << "FrameGenerationMultiplier=Auto\n";
+	out << "FrameGenerationExcess=" << frame_gen_excess_key(in.frame_generation_excess) << "\n";
 	out << "FrameGenerator=" << frame_generator_key(in.frame_generator < kFrameGeneratorCount
 		? static_cast<FrameGenerator>(in.frame_generator) : FrameGenerator::AeonSR) << "\n";
 	if (in.frame_generation_dump != 0)
 		out << "FrameGenerationDump=" << in.frame_generation_dump << "\n";
 	if (!in.frame_generation_dump_dir.empty())
 		out << "FrameGenerationDumpDir=" << in.frame_generation_dump_dir << "\n";
+	if (!in.frame_generation_unlocker.empty())
+		out << "FrameGenerationUnlocker=" << in.frame_generation_unlocker << "\n";
+	if (in.frame_generation_marker)
+		out << "FrameGenerationMarker=1\n";
 #endif
 	out << "MvProbe=" << (in.mv_probe ? 1 : 0) << "\n";
 	if (in.gpu_timings)

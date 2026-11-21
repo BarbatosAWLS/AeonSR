@@ -1,4 +1,5 @@
 #include "aeon_sr/interop/agility_core.hpp"
+#include "aeon_sr/upscalers/ffx_driver_lite.hpp"
 #include "aeon_sr/upscalers/ffx_loader.hpp"
 #include "aeon_sr/upscalers/fsr_warmup.hpp"
 
@@ -197,7 +198,8 @@ int run(const Args &a)
 
 	FfxApi api{};
 	std::wstring error;
-	if (!ffx_load(api, a.dll, error)) {
+	const bool lite = is_ffx_driver_path(a.dll);
+	if (lite ? !ffx_load_driver_lite(api, a.dll, nullptr, error) : !ffx_load(api, a.dll, error)) {
 		note(a, L"FAIL %s", error.c_str());
 		device->Release();
 		return ExitRuntime;
@@ -207,7 +209,7 @@ int run(const Args &a)
 	backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
 	backend.device = device;
 	ffxOverrideVersion pin{};
-	const uint64_t pin_id = provider_id(api, device, a.provider);
+	const uint64_t pin_id = lite ? 0 : provider_id(api, device, a.provider);
 	if (pin_id != 0) {
 		pin.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
 		pin.versionId = pin_id;

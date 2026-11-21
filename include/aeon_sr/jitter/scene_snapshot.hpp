@@ -2,6 +2,7 @@
 
 #include <reshade.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -215,38 +216,175 @@ struct SplitGate {
 struct SplitCover {
 	static constexpr uint32_t kWindow = 32u;
 	static constexpr uint32_t kOver = 24u;
-	static constexpr uint32_t kRefuse = 600u;
+	static constexpr uint32_t kProbeEvery = 30u;
+	static constexpr uint32_t kProbeSpread = 3u;
+	static constexpr uint32_t kBack = 4u;
+	static constexpr uint32_t kBackShare = 30u;
+	static constexpr uint32_t kMaxStrikes = 5u;
+	static constexpr uint32_t kSettle = 600u;
+	static constexpr uint32_t kMaxHoldShift = 2u;
+	static constexpr uint32_t kBlind = 20u;
 	uint32_t seen = 0;
 	uint32_t over = 0;
-	uint32_t refuse = 0;
+	bool out = false;
+	uint32_t wait = 0;
+	uint32_t clean = 0;
+	uint32_t blind = 0;
+	uint32_t strikes = 0;
+	uint32_t used = 0;
+	uint32_t credit = 0;
+	uint32_t hold = 0;
+	bool back = false;
 	bool started = false;
+	bool returned = false;
+	bool blind_back = false;
+	uint32_t rng = 0x9E3779B9u;
+
+	static bool over_half(uint32_t shown, uint32_t pixels) noexcept
+	{
+		return 2u * static_cast<uint64_t>(shown) > pixels;
+	}
+	static bool back_share(uint32_t shown, uint32_t pixels) noexcept
+	{
+		return 100u * static_cast<uint64_t>(shown) <= static_cast<uint64_t>(kBackShare) * pixels;
+	}
+	uint32_t needed() const noexcept { return kBack << strikes; }
+	uint32_t blind_limit() const noexcept { return kBlind << strikes; }
+
 	void feed(uint32_t shown, uint32_t pixels) noexcept
 	{
-		if (pixels == 0u)
+		if (pixels == 0u || out)
 			return;
 		seen = (seen << 1) | 1u;
-		over = (over << 1) | (2u * static_cast<uint64_t>(shown) > pixels ? 1u : 0u);
+		over = (over << 1) | (over_half(shown, pixels) ? 1u : 0u);
 		uint32_t n = 0;
 		for (uint32_t m = over; m != 0; m &= m - 1u)
 			++n;
-		if (refuse == 0u && n >= kOver) {
-			refuse = kRefuse;
-			started = true;
-			seen = over = 0;
-		}
+		if (n >= kOver)
+			leave_out();
 	}
 	bool present() noexcept
 	{
-		if (refuse == 0u)
-			return true;
-		--refuse;
-		return false;
+		if (out && wait > 0u)
+			--wait;
+		if (out && hold > 0u)
+			--hold;
+		return !out;
+	}
+	bool probe_due() const noexcept { return out && wait == 0u; }
+	void used_once() noexcept
+	{
+		if (out)
+			return;
+		if (back && ++used >= kSettle)
+			back = false;
+		if (strikes > 0u && ++credit >= kSettle) {
+			--strikes;
+			credit = 0;
+		}
+	}
+	void sent() noexcept
+	{
+		if (!out)
+			return;
+		rng = rng * 1664525u + 1013904223u;
+		wait = kProbeEvery - kProbeSpread + (rng >> 16) % (2u * kProbeSpread + 1u);
+		if (++blind >= blind_limit()) {
+			blind_back = true;
+			come_back();
+		}
+	}
+	void probe(uint32_t shown, uint32_t pixels, bool judged) noexcept
+	{
+		if (!out || pixels == 0u)
+			return;
+		blind = 0;
+		if (!judged)
+			return;
+		if (!back_share(shown, pixels)) {
+			clean = 0;
+			return;
+		}
+		if (clean < needed())
+			++clean;
+		if (clean >= needed() && hold == 0u) {
+			blind_back = false;
+			come_back();
+		}
+	}
+
+private:
+	void leave_out() noexcept
+	{
+		if (back && used < kSettle) {
+			strikes = strikes < kMaxStrikes ? strikes + 1u : strikes;
+			credit = 0;
+			hold = kSettle << std::min(strikes - 1u, kMaxHoldShift);
+		}
+		back = false;
+		out = true;
+		started = true;
+		seen = over = 0;
+		clean = blind = 0;
+		wait = 0;
+	}
+	void come_back() noexcept
+	{
+		out = false;
+		back = true;
+		returned = true;
+		used = 0;
+		hold = 0;
+		seen = over = 0;
+		clean = blind = 0;
+		wait = 0;
 	}
 };
 
 inline bool split_gate_present(SplitGate &gate, bool drawn, bool took) noexcept
 {
 	return drawn && gate.step(took);
+}
+
+struct SplitPlan {
+	bool carry = false;
+	bool probe = false;
+};
+inline SplitPlan split_plan(SplitCover &cover, SplitGate &gate, bool drawn, bool took, bool scaled) noexcept
+{
+	const bool covered = cover.present();
+	SplitPlan p;
+	if (split_gate_present(gate, drawn, took) && !scaled && (covered || cover.probe_due())) {
+		p.carry = true;
+		p.probe = !covered;
+	}
+	return p;
+}
+inline void split_carried(SplitCover &cover, const SplitPlan &plan, bool arrived) noexcept
+{
+	if (plan.carry && plan.probe && arrived)
+		cover.sent();
+}
+template <typename T>
+struct SplitRoute {
+	T *scene = nullptr;
+	T *probe = nullptr;
+};
+template <typename T>
+SplitRoute<T> split_route(const SplitPlan &plan, T *carried) noexcept
+{
+	SplitRoute<T> r;
+	if (plan.carry)
+		(plan.probe ? r.probe : r.scene) = carried;
+	return r;
+}
+inline void split_read(SplitCover &cover, bool split, bool probe, bool held, uint32_t shown, uint32_t probe_shown,
+	uint32_t pixels) noexcept
+{
+	if (split && !held)
+		cover.feed(shown, pixels);
+	if (probe)
+		cover.probe(probe_shown, pixels, !held);
 }
 
 bool vulkan_rendering_hook_install(void *device, void *get_device_proc) noexcept;

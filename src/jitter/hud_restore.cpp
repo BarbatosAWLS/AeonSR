@@ -2,6 +2,7 @@
 #include "aeon_sr/core/com_release.hpp"
 
 #include "aeon_sr/interop/blit_d3d12.hpp"
+#include "aeon_sr/interop/shader_cache.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/dxgi_format_util.hpp"
 
@@ -329,10 +330,10 @@ const char *const kEntry[] = { "PSComposite", "PSRegister", "PSClear", "PSFill" 
 
 ID3DBlob *compile(const char *entry, const char *target)
 {
-	ID3DBlob *blob = nullptr, *err = nullptr;
-	const HRESULT hr = D3DCompile(kHudHlsl, sizeof(kHudHlsl) - 1, "aeon_hud_restore", nullptr, nullptr, entry, target,
-		D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err);
-	if (FAILED(hr)) {
+	ID3DBlob *err = nullptr;
+	ID3DBlob *const blob = shader_cache_compile(kHudHlsl, sizeof(kHudHlsl) - 1, "aeon_hud_restore", entry, target,
+		D3DCOMPILE_OPTIMIZATION_LEVEL3, &err);
+	if (blob == nullptr) {
 		std::wstring what = L"interface restore: shader " + std::wstring(entry, entry + std::strlen(entry)) +
 			L" did not compile";
 		if (err != nullptr) {
@@ -996,6 +997,18 @@ void HudRestoreD3D12::release() noexcept
 	ring_ = rtv_next_ = 0;
 	cur_ = 0;
 	reset();
+}
+
+void hud_restore_warm_shaders()
+{
+	const struct { const char *entry, *target; } shaders[] = {
+		{ "CSEvidence", "cs_5_0" }, { "CSMask", "cs_5_0" }, { "CSClear", "cs_5_0" }, { "CSTrans", "cs_5_0" },
+		{ "CSHeld", "cs_5_0" }, { "VSMain", "vs_5_0" },
+		{ kEntry[0], "ps_5_0" }, { kEntry[1], "ps_5_0" }, { kEntry[2], "ps_5_0" }, { kEntry[3], "ps_5_0" },
+	};
+	for (const auto &s : shaders)
+		shader_cache_warm(kHudHlsl, sizeof(kHudHlsl) - 1, "aeon_hud_restore", s.entry, s.target,
+			D3DCOMPILE_OPTIMIZATION_LEVEL3);
 }
 
 }

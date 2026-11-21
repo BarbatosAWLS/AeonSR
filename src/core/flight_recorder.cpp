@@ -120,6 +120,13 @@ const char *flight_game_jitter_name(FlightGameJitter g) noexcept
 	return name_in(n, g);
 }
 
+const char *flight_fg_name(FlightFg f) noexcept
+{
+	static const char *const n[] = { "", "window", "present", "present_none", "blocked" };
+	static_assert(std::size(n) == static_cast<size_t>(FlightFg::Count));
+	return name_in(n, f);
+}
+
 const char *flight_trigger_name(FlightTrigger t) noexcept
 {
 	static const char *const n[] = { "jitter_flap", "jitter_pause", "landing_low", "game_jitter", "host_slow",
@@ -313,7 +320,7 @@ std::string flight_csv_header()
 	return "frame,time_ms,frame_ms,api,width,height,upscaler,status,ran,render_w,render_h,neural,neural_ms,"
 		"jitter,plan,note,pause_reason,drawn_index,drawn_x,drawn_y,told_x,told_y,moved,plain,landing_x,landing_y,"
 		"game_jitter,game_depth_x,game_depth_y,game_color_x,game_color_y,game_rms,scene,depth_id,depth_w,depth_h,"
-		"interface,host,host_ms,blocked,triggers\n";
+		"interface,host,host_ms,blocked,triggers,fg,fg_round_ms,fg_wait_ms\n";
 }
 
 void flight_csv_row(std::string &out, const FlightRecord &r, const FlightNotes &notes)
@@ -384,6 +391,8 @@ void flight_csv_row(std::string &out, const FlightRecord &r, const FlightNotes &
 			hud += hud.empty() ? "alone" : "+alone";
 		if (r.hud & kFlightHeld)
 			hud += hud.empty() ? "held" : "+held";
+		if (r.hud & kFlightProbe)
+			hud += hud.empty() ? "probe" : "+probe";
 		put_text(out, hud.c_str());
 	}
 	put_text(out, flight_host_name(r.host));
@@ -395,7 +404,11 @@ void flight_csv_row(std::string &out, const FlightRecord &r, const FlightNotes &
 			fired += std::string(fired.empty() ? "" : "+") + flight_trigger_name(static_cast<FlightTrigger>(k));
 	}
 	out += fired;
-	out += '\n';
+	out += ',';
+	put_text(out, flight_fg_name(r.fg));
+	put_float(out, r.fg_round_ms);
+	put_float(out, r.fg_wait_ms);
+	out.back() = '\n';
 }
 
 uint16_t FlightFault::at(uint64_t f) const noexcept

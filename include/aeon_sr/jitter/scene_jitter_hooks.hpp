@@ -13,6 +13,17 @@ void scene_jitter_device_coming(reshade::api::device_api api) noexcept;
 
 JitterFrame take_scene_jitter_frame(reshade::api::effect_runtime *runtime) noexcept;
 
+struct SceneJitterLoad {
+	uint64_t pipelines = 0;
+	uint64_t untested = 0;
+	uint64_t vertex_classes = 0;
+	uint64_t w_terms = 0;
+	uint64_t constant_reads = 0;
+	uint64_t contexts = 0;
+	uint64_t lists = 0;
+};
+SceneJitterLoad scene_jitter_load() noexcept;
+
 void discard_scene_jitter_counts(reshade::api::effect_runtime *runtime) noexcept;
 
 class RuntimeJitterCounts final : public JitterCounts {

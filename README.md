@@ -15,6 +15,8 @@ Author: **Barbatos AWLS**
 
 - **Temporal anti-aliasing** through NVIDIA DLSS, AMD FSR (FSR 4 where the GPU
   supports it, FSR 3.1 otherwise) and Intel XeSS
+- **FSR 4.1.2 Lite**: AMD's lighter FSR 4 model, on any Direct3D 12 GPU with Shader
+  Model 6.6, with a library from AMD's driver you supply
 - **Built-in optical flow** that produces the motion vectors DLSS, FSR and XeSS need
 - **No native motion vectors required** from the game
 - **Sub-pixel jitter** drawn into the game's own rendering
@@ -68,6 +70,7 @@ Direct3D 12 core comes from its NuGet package through `tools/fetch_agility_sdk.p
 | Intel XeSS Frame Generation | `libxess_fg.dll`, `libxell.dll` | [Intel XeSS SDK](https://github.com/intel/xess) v3.0.2 | yes |
 | Microsoft Direct3D 12 Agility SDK core | `D3D12Core.dll` | [Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.0) 1.619.0, Microsoft-signed | yes |
 | NVIDIA DLSS Neural Rendering | `nvngx_dlssnr.dll` | none official | **no**, see below |
+| AMD FSR 4.1.2 Lite | `amdxcffx64.dll` | AMD's graphics driver (FidelityFX 2.4.0), AMD-signed | **no**, see below |
 
 ### DLSS Neural Rendering
 
@@ -76,6 +79,14 @@ redistribute it, so neither the repository nor the releases carry it. Everything
 else works without it; the neural rendering pass stays off until the file is
 present. To enable it, place a copy you obtained yourself in `runtime/` next to
 the add-on (or in `runtime/dlss5-allgpu/`, which is searched first).
+
+### FSR 4.1.2 Lite
+
+`amdxcffx64.dll` is part of AMD's graphics driver, not of the FidelityFX SDK, so
+neither the repository nor the releases carry it. With a copy you obtained yourself
+in `runtime/` next to the add-on, FSR's version row offers 4.1.2 Lite and FSR runs it
+by default; without it, FSR runs as before. Only version 2.4.0 of the library
+(FSR 4.1.2) is accepted.
 
 ## Community runtimes (at your own risk)
 

@@ -173,6 +173,18 @@ std::wstring RemoteEngine::describe() const
 
 bool RemoteEngine::start(EngineDevice &engine, HMODULE module, reshade::api::device_api game_api)
 {
+	if (!begin_start(engine, module, game_api))
+		return false;
+	for (;;) {
+		const Handshake h = poll_handshake();
+		if (h != Handshake::Waiting)
+			return h == Handshake::Done;
+		WaitForSingleObject(host_process_, 1);
+	}
+}
+
+bool RemoteEngine::begin_start(EngineDevice &engine, HMODULE module, reshade::api::device_api game_api)
+{
 	stop();
 	last_error.clear();
 
@@ -283,30 +295,42 @@ bool RemoteEngine::start(EngineDevice &engine, HMODULE module, reshade::api::dev
 	host_process_ = pi.hProcess;
 	safe_close(pi.hThread);
 
-	const ULONGLONG deadline = GetTickCount64() + remote::kHandshakeTimeoutMs;
-	for (;;) {
-		if (WaitForSingleObject(host_process_, 0) == WAIT_OBJECT_0) {
-			DWORD code = 0;
-			GetExitCodeProcess(host_process_, &code);
-			wchar_t why[192];
-			swprintf(why, 192, L"AeonSRHost.exe started and closed again straight away, with "
-				L"exit code %lu. AeonSR.log beside the add-on says what it could not do.", code);
-			last_error = why;
-			diag_logf(DiagLevel::Error, "remote", L"the host exited during the handshake, code %lu",
-				code);
-			stop();
-			return false;
-		}
-		if (load32(block_->host_ready) != 0)
-			break;
-		if (GetTickCount64() >= deadline) {
-			last_error = L"AeonSRHost.exe started but never answered. AeonSR.log beside the "
-				L"add-on says how far it got.";
-			stop();
-			return false;
-		}
-		WaitForSingleObject(host_process_, 1);
+	handshake_deadline_ = GetTickCount64() + remote::kHandshakeTimeoutMs;
+	starting_ = true;
+	return true;
+}
+
+RemoteEngine::Handshake RemoteEngine::poll_handshake()
+{
+	if (!starting_)
+		return handshaked_ ? Handshake::Done : Handshake::Failed;
+	if (WaitForSingleObject(host_process_, 0) == WAIT_OBJECT_0) {
+		DWORD code = 0;
+		GetExitCodeProcess(host_process_, &code);
+		wchar_t why[192];
+		swprintf(why, 192, L"AeonSRHost.exe started and closed again straight away, with "
+			L"exit code %lu. AeonSR.log beside the add-on says what it could not do.", code);
+		last_error = why;
+		diag_logf(DiagLevel::Error, "remote", L"the host exited during the handshake, code %lu",
+			code);
+		stop();
+		return Handshake::Failed;
 	}
+	if (load32(block_->host_ready) != 0) {
+		starting_ = false;
+		return finish_handshake() ? Handshake::Done : Handshake::Failed;
+	}
+	if (GetTickCount64() >= handshake_deadline_) {
+		last_error = L"AeonSRHost.exe started but never answered. AeonSR.log beside the "
+			L"add-on says how far it got.";
+		stop();
+		return Handshake::Failed;
+	}
+	return Handshake::Waiting;
+}
+
+bool RemoteEngine::finish_handshake()
+{
 	if (WaitForSingleObject(host_process_, 0) == WAIT_OBJECT_0) {
 		DWORD code = 0;
 		GetExitCodeProcess(host_process_, &code);
@@ -378,6 +402,13 @@ bool RemoteEngine::backend_present(BackendChoice choice) const noexcept
 
 void RemoteEngine::stop()
 {
+	if (starting_ && host_process_ != nullptr) {
+		TerminateProcess(host_process_, 0);
+		WaitForSingleObject(host_process_, 1000);
+		diag_info("remote", L"the engine host was closed before it had answered");
+		safe_close(host_process_);
+	}
+	starting_ = false;
 	if (host_process_ != nullptr) {
 		if (block_ != nullptr)
 			store32(block_->shutdown, 1);
@@ -699,6 +730,9 @@ bool RemoteEngine::exchange(EngineDevice &engine, const Request &req,
 			i.neural_runtime_cards = copied_ascii(block_->neural_runtime_cards);
 			i.neural_runtime_file = copied_text(block_->neural_runtime_file);
 			i.neural_capture_status = copied_text(block_->neural_capture_status);
+			const uint32_t models = std::min(load32(block_->neural_model_count), remote::kNeuralModels);
+			for (uint32_t k = 0; k < models; ++k)
+				i.neural_models.push_back(load32(block_->neural_model_ids[k]));
 		}
 	}
 

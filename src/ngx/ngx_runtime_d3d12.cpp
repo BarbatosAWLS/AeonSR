@@ -214,9 +214,36 @@ NVSDK_NGX_Result evaluate_dlss_guarded(const Ngx12Api &api, ID3D12GraphicsComman
 
 }
 
+bool NgxRuntimeD3D12::feature_ready(uint32_t w, uint32_t h, DXGI_FORMAT target_format) const
+{
+	return feature_handle != nullptr && width == w && height == h && output_tex != nullptr &&
+		scratch_format == upscaler_scratch_format(target_format) && created == DlssFeatureKey::from(cfg) &&
+		created_backbuffer_format == target_format;
+}
+
+bool NgxRuntimeD3D12::build_feature(uint32_t w, uint32_t h, DXGI_FORMAT target_format)
+{
+	if (crashed || queue == nullptr)
+		return false;
+	const DXGI_FORMAT fmt = upscaler_scratch_format(target_format);
+	backbuffer_format = target_format;
+	LARGE_INTEGER freq{}, begin{}, end{};
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&begin);
+	blit_.prepare(device, { fmt, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8_UNORM, target_format });
+	const bool ok = ensure_feature(nullptr, w, h, fmt);
+	QueryPerformanceCounter(&end);
+	if (ok)
+		diag_logf(DiagLevel::Info, "dlss", L"D3D12 feature %ux%u -> %ux%u built in %.0f ms on a thread of its own, "
+			L"frames kept going", render_width, render_height, w, h, freq.QuadPart != 0
+				? 1000.0 * static_cast<double>(end.QuadPart - begin.QuadPart) / static_cast<double>(freq.QuadPart)
+				: 0.0);
+	return ok;
+}
+
 bool NgxRuntimeD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w, uint32_t h, DXGI_FORMAT color_format)
 {
-	if (!ngx_initialized || params == nullptr || cmd == nullptr || device == nullptr)
+	if (!ngx_initialized || params == nullptr || device == nullptr || (cmd == nullptr && queue == nullptr))
 		return false;
 
 	const DlssFeatureKey key = DlssFeatureKey::from(cfg);
@@ -256,6 +283,13 @@ bool NgxRuntimeD3D12::ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w,
 	const bool own_list = create_cmd != nullptr;
 	if (!own_list)
 		create_cmd = cmd;
+	if (create_cmd == nullptr) {
+		if (create_params != p && create_params != nullptr)
+			api->destroy_parameters(create_params);
+		status = UpscalerStatus::InitFailed;
+		last_error = L"D3D12 CreateFeature: no command list to record it on";
+		return false;
+	}
 
 	NVSDK_NGX_Handle *handle = nullptr;
 	unsigned long seh_code = 0;

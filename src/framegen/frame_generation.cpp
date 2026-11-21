@@ -1,5 +1,6 @@
 #include "aeon_sr/framegen/frame_generation.hpp"
 #include "aeon_sr/framegen/present_sync.hpp"
+#include "aeon_sr/framegen/keep_borderless.hpp"
 
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
@@ -35,6 +36,14 @@ double now_ms() noexcept
 }
 
 constexpr uint32_t kPresentGiveUp = 30;
+
+static_assert(kPacerMaxMade == kVendorMaxGenerated && EngineDevice::kStepRings + 1u == kPacerMaxMade,
+	"the game's-present route plans, has a vendor make and records as many made frames as each other");
+
+bool fixed_multiplier(const Settings &s) noexcept
+{
+	return s.frame_generation_multiplier >= 2 && s.frame_generation_multiplier <= kFrameGenerationMultiplierMax;
+}
 
 bool dumpable(format f) noexcept
 {
@@ -186,6 +195,7 @@ void FrameGeneration::sleep_until(double t_ms)
 void FrameGeneration::note_blocked(const std::wstring &why)
 {
 	note_ = why;
+	last_call_ = LastCall{ 4, -1.0f, -1.0f };
 	overlay_.stop();
 	overlay_active_ = false;
 	if (sync_watched_)
@@ -194,6 +204,8 @@ void FrameGeneration::note_blocked(const std::wstring &why)
 
 void FrameGeneration::off()
 {
+	present_cap_ = kPacerMaxMade;
+	short_rounds_ = 0;
 	stage_.forget_refusal();
 	if (sync_watched_)
 		present_sync::forget();
@@ -203,19 +215,22 @@ void FrameGeneration::off()
 	if (presenter_.ready() || dump_rb_[0].handle != 0)
 		runtime_->get_command_queue()->wait_idle();
 	overlay_.stop();
-	overlay_active_ = overlay_refused_ = false;
+	overlay_active_ = overlay_refused_ = refused_covered_ = false;
 	overlay_refusal_.clear();
 	release_dumps();
 	presenter_.release();
 	stage_.reset();
 	pacer_.reset();
+	fit_.reset();
 	clock_.stop();
 	present_sync::forget();
 	sync_watched_ = sync_watch_failed_ = false;
 	display_paced_ = false;
+	fit_period_ms_ = 0.0;
 	runtime_ = nullptr;
 	route_given_up_ = false;
 	note_.clear();
+	last_call_ = LastCall{};
 }
 
 void FrameGeneration::swapchain_gone(swapchain *sc, EngineDevice &engine)
@@ -223,9 +238,11 @@ void FrameGeneration::swapchain_gone(swapchain *sc, EngineDevice &engine)
 	if (runtime_ == nullptr || sc == nullptr || sc->get_native() != runtime_->get_native())
 		return;
 	overlay_.stop();
-	overlay_active_ = overlay_refused_ = false;
+	overlay_active_ = overlay_refused_ = refused_covered_ = false;
 	release_dumps();
 	presenter_.release();
+	present_cap_ = kPacerMaxMade;
+	short_rounds_ = 0;
 	if (stage_.has_vendors()) {
 		if (engine.ready())
 			engine.wait_cpu(engine.last_submitted());
@@ -233,10 +250,12 @@ void FrameGeneration::swapchain_gone(swapchain *sc, EngineDevice &engine)
 	}
 	stage_.reset();
 	pacer_.reset();
+	fit_.reset();
 	clock_.stop();
 	present_sync::forget();
 	sync_watched_ = sync_watch_failed_ = false;
 	display_paced_ = false;
+	fit_period_ms_ = 0.0;
 	runtime_ = nullptr;
 	route_given_up_ = false;
 }
@@ -250,14 +269,16 @@ void FrameGeneration::device_gone(device *dev)
 		r = { 0 };
 	prev_round_ = ~0ull;
 	overlay_.stop();
-	overlay_active_ = overlay_refused_ = false;
+	overlay_active_ = overlay_refused_ = refused_covered_ = false;
 	presenter_.forget();
 	stage_.reset();
 	pacer_.reset();
+	fit_.reset();
 	clock_.stop();
 	present_sync::forget();
 	sync_watched_ = sync_watch_failed_ = false;
 	display_paced_ = false;
+	fit_period_ms_ = 0.0;
 	runtime_ = nullptr;
 	route_given_up_ = false;
 }
@@ -267,8 +288,10 @@ void FrameGeneration::engine_gone()
 	overlay_.stop();
 	overlay_active_ = false;
 	release_timer();
+	marker_.release();
 	stage_.release();
 	pacer_.reset();
+	fit_.reset();
 }
 
 bool FrameGeneration::ensure_timer(ID3D12Device *device)
@@ -346,8 +369,26 @@ bool FrameGeneration::round(effect_runtime *runtime, FrameBridge &bridge, Engine
 	const double t0 = now_ms();
 	stage_.settings_changed(frame_gen_settings_key(settings));
 	part_begin_ = part_record_ = part_end_ = 0.0;
+	round_made_ = 0;
 	if (!presenter_.ensure(runtime, &note_))
 		return false;
+	const FrameGenerator asked = settings.frame_generator < kFrameGeneratorCount
+		? static_cast<FrameGenerator>(settings.frame_generator) : FrameGenerator::AeonSR;
+	const uint32_t asked_steps = fixed_multiplier(settings) ? settings.frame_generation_multiplier : 2u;
+	uint32_t cap = kPacerMaxMade + 1u;
+	if (asked != FrameGenerator::AeonSR && stage_.vendor_usable(asked))
+		cap = stage_.vendor_max_generated() + 1u;
+	cap = std::min(cap, present_cap_ + 1u);
+	const unsigned int excess = settings.frame_generation_excess;
+	const bool fitted = fixed_multiplier(settings) && fit_period_ms_ > 0.0 &&
+		(excess == static_cast<unsigned int>(FrameGenExcess::Select) || excess == static_cast<unsigned int>(FrameGenExcess::Drop));
+	uint32_t steps = std::clamp(std::min(asked_steps, cap), 2u, kPacerMaxMade + 1u);
+	const uint32_t fit = fitted ? std::min(steps, std::max(2u, fit_.steps())) : steps;
+	if (excess == static_cast<unsigned int>(FrameGenExcess::Select))
+		steps = fit;
+	round_steps_ = steps;
+	own_asked_ = fixed_multiplier(settings) ? settings.frame_generation_multiplier : 0u;
+	own_steps_max_ = std::max(2u, std::min(cap, kPacerMaxMade + 1u));
 	++rounds_;
 	presenter_.copy_back_buffer(runtime);
 	dump_prepare(runtime, settings);
@@ -383,8 +424,8 @@ bool FrameGeneration::round(effect_runtime *runtime, FrameBridge &bridge, Engine
 	if (timed)
 		list->EndQuery(timer_heap_, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
 	FrameGenOptions o;
-	o.generator = settings.frame_generator < kFrameGeneratorCount
-		? static_cast<FrameGenerator>(settings.frame_generator) : FrameGenerator::AeonSR;
+	o.generator = asked;
+	o.steps = steps;
 	const double real_ms = pacer_.real_interval_ms();
 	o.frame_ms = real_ms > 0.0 ? real_ms : 16.7;
 	o.window = static_cast<HWND>(runtime->get_hwnd());
@@ -407,6 +448,8 @@ bool FrameGeneration::round(effect_runtime *runtime, FrameBridge &bridge, Engine
 		part_record_ = now_ms() - t1;
 		return false;
 	}
+	if (r == FrameGenResult::Generated && settings.frame_generation_marker)
+		marker_.stamp(device, list, dst, dst_state);
 	if (timed) {
 		list->EndQuery(timer_heap_, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
 		list->ResolveQueryData(timer_heap_, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, timer_rb_, slot * 16u);
@@ -439,12 +482,57 @@ bool FrameGeneration::round(effect_runtime *runtime, FrameBridge &bridge, Engine
 			? L"building its shaders, a moment" : L"warming up");
 		return false;
 	}
+	const uint32_t made_steps = std::max(2u, std::min(steps, stage_.steps()));
+	const uint32_t shown = std::min(made_steps, fit);
+	round_made_ = shown - 1u;
+	pick_steps(made_steps, shown, round_pick_);
 	note_.clear();
 	return true;
 }
 
+bool FrameGeneration::step_round(effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
+	const Settings &settings, uint32_t k)
+{
+	command_list *const cmd = runtime->get_command_queue()->get_immediate_command_list();
+	if (!engine.use_ring(EngineDevice::step_ring(k)))
+		return false;
+	BridgeInputs in;
+	in.color = presenter_.real_copy();
+	BridgeFrame fk;
+	if (bridge.begin(runtime, cmd, in, fk) != BridgeStep::Ok) {
+		engine.abandon_list();
+		engine.use_ring(EngineDevice::Ring::Frame);
+		return false;
+	}
+	const resource target = presenter_.generated();
+	ID3D12Resource *const dk = fk.native ? reinterpret_cast<ID3D12Resource *>(static_cast<uintptr_t>(target.handle)) : fk.color;
+	const D3D12_RESOURCE_STATES dk_state = fk.native ? D3D12_RESOURCE_STATE_RENDER_TARGET : fk.color_state;
+	FrameGenOptions o;
+	o.generator = settings.frame_generator < kFrameGeneratorCount
+		? static_cast<FrameGenerator>(settings.frame_generator) : FrameGenerator::AeonSR;
+	o.steps = round_steps_;
+	o.color_space = color_space_;
+	o.queue = engine.queue();
+	std::wstring why;
+	const FrameGenResult rk = stage_.record_step(engine.device(), fk.cmd, k, dk, dk_state, o, &why);
+	if (rk == FrameGenResult::Generated && settings.frame_generation_marker)
+		marker_.stamp(engine.device(), fk.cmd, dk, dk_state);
+	const BridgeStep ek = bridge.end(runtime, cmd, target);
+	if (ek != BridgeStep::Ok)
+		engine.abandon_list();
+	engine.use_ring(EngineDevice::Ring::Frame);
+	if (ek != BridgeStep::Ok) {
+		stage_.reset();
+		last_failure_ = L"frame generation: a made frame did not come back from the engine device";
+		return false;
+	}
+	if (rk != FrameGenResult::Generated && !why.empty())
+		last_failure_ = why;
+	return rk == FrameGenResult::Generated;
+}
+
 bool FrameGeneration::own_window_ready(effect_runtime *runtime, EngineDevice &engine, std::wstring *why,
-	bool *permanent)
+	bool *permanent, bool leave_exclusive)
 {
 	*permanent = true;
 	const device_api api = runtime->get_device()->get_api();
@@ -452,14 +540,30 @@ bool FrameGeneration::own_window_ready(effect_runtime *runtime, EngineDevice &en
 		auto *const sc = reinterpret_cast<IDXGISwapChain *>(static_cast<uintptr_t>(runtime->get_native()));
 		BOOL fullscreen = FALSE;
 		if (sc != nullptr && SUCCEEDED(sc->GetFullscreenState(&fullscreen, nullptr)) && fullscreen) {
-			*why = L"the game is in exclusive fullscreen, where no window can show over it";
+			refused_exclusive_ = true;
+			const HWND hwnd = static_cast<HWND>(runtime->get_hwnd());
+			if (keep_taking_out(leave_exclusive, switch_given_up(hwnd, false))) {
+				if (!switch_pending(false))
+					switch_fullscreen_later(sc, hwnd, false);
+				*why = L"frame generation: taking the game out of exclusive fullscreen into a borderless window";
+				*permanent = false;
+				return false;
+			}
+			*why = leave_exclusive
+				? L"the game is in exclusive fullscreen and refused to leave it, where no window can show over it; it is "
+				  L"kept in a borderless window from its next own switch into fullscreen (Alt+Tab back, its own setting)"
+				: L"the game is in exclusive fullscreen, where no window can show over it";
 			return false;
 		}
 	} else if (api == device_api::d3d9) {
 		auto *const sc = reinterpret_cast<IDirect3DSwapChain9 *>(static_cast<uintptr_t>(runtime->get_native()));
 		D3DPRESENT_PARAMETERS pp{};
 		if (sc != nullptr && SUCCEEDED(sc->GetPresentParameters(&pp)) && !pp.Windowed) {
-			*why = L"the game is in exclusive fullscreen, where no window can show over it";
+			refused_exclusive_ = true;
+			*why = leave_exclusive
+				? L"the game is in exclusive fullscreen, where no window can show over it; it is kept in a borderless "
+				  L"window from its next reset into fullscreen (Alt+Tab back, its own setting, a restart)"
+				: L"the game is in exclusive fullscreen, where no window can show over it";
 			return false;
 		}
 	}
@@ -508,8 +612,7 @@ bool FrameGeneration::round_own_window(effect_runtime *runtime, FrameBridge &bri
 
 	const FrameGenerator asked = settings.frame_generator < kFrameGeneratorCount
 		? static_cast<FrameGenerator>(settings.frame_generator) : FrameGenerator::AeonSR;
-	const uint32_t multiplier = settings.frame_generation_multiplier >= 2 &&
-		settings.frame_generation_multiplier <= kFrameGenerationMultiplierMax ? settings.frame_generation_multiplier : 0u;
+	const uint32_t multiplier = fixed_multiplier(settings) ? settings.frame_generation_multiplier : 0u;
 	const bool vendor_asked = asked != FrameGenerator::AeonSR && stage_.vendor_usable(asked);
 	double vblank = 0.0, refresh = 0.0;
 	const OverlayStats paced = overlay_.stats();
@@ -521,10 +624,16 @@ bool FrameGeneration::round_own_window(effect_runtime *runtime, FrameBridge &bri
 	else if (!compositor_clock(&vblank, &refresh) || !refresh_agrees(refresh, paced.monitor_hz))
 		refresh = 0.0;
 	const double real_ms = pacer_.real_interval_ms();
-	uint32_t steps = multiplier;
+	uint32_t select = 0;
+	if (multiplier != 0 && settings.frame_generation_excess == static_cast<unsigned int>(FrameGenExcess::Select)) {
+		select = std::max(2u, auto_multiplier(real_ms, refresh, own_select_steps_ != 0 ? own_select_steps_ : multiplier,
+			multiplier));
+		own_select_steps_ = select;
+	}
+	uint32_t steps = select != 0 ? select : multiplier;
 	if (vendor_asked) {
 		own_steps_max_ = stage_.vendor_max_generated() + 1;
-		steps = multiplier != 0 ? std::min(multiplier, own_steps_max_)
+		steps = multiplier != 0 ? std::min(steps, own_steps_max_)
 			: auto_multiplier(real_ms, refresh, own_vendor_steps_, own_steps_max_);
 		own_vendor_steps_ = steps;
 	} else {
@@ -569,8 +678,13 @@ bool FrameGeneration::round_own_window(effect_runtime *runtime, FrameBridge &bri
 		return false;
 	}
 	const bool by_vendor = vendor_asked && stage_.active_generator() == asked;
+	const bool fill = stage_.last_filled() && r == FrameGenResult::Generated;
+	if (fill) {
+		++window_.filled;
+		filled_for_ = stage_.filled_for();
+	}
 	if (!by_vendor)
-		steps = multiplier;
+		steps = select != 0 ? select : multiplier;
 	else if (stage_.last_made() > 0)
 		steps = stage_.last_made() + 1;
 	own_steps_ = steps;
@@ -612,16 +726,44 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 	if (!overlay_active_) {
 		overlay_active_ = true;
 		pacer_.reset();
+		fit_.reset();
 		stage_.reset();
+		aside_ = false;
+		overlay_.set_aside(false);
 		if (sync_watched_)
 			present_sync::force_vsync(false);
 		diag_logf(DiagLevel::Info, "framegen", L"frame generation: shown through a window of its own over the game's, "
 			L"every refresh of the display getting a picture; the game runs at its own rate");
 	}
-	const bool hitched = !pacer_.begin(entry) && pacer_.state() == PacerState::Engaged;
+	{
+		const DisplayGrid grid = clock_.grid();
+		const OverlayStats s = overlay_.stats();
+		pacer_.set_refresh(grid.valid && grid.period_ms > 2.0 ? grid.period_ms
+			: s.period_ms > 2.0 ? s.period_ms : 0.0, entry);
+	}
+	const bool queue = fixed_multiplier(settings) &&
+		settings.frame_generation_excess == static_cast<unsigned int>(FrameGenExcess::Queue);
+	overlay_.set_queue(queue);
+	if (queue) {
+		const double until = entry + kQueueWaitMs;
+		while (overlay_.queued() >= kQueueAhead && overlay_.running() && now_ms() < until)
+			sleep_until(now_ms() + 0.5);
+	}
+	pacer_.set_window_route(true);
+	pacer_.set_fixed(fixed_multiplier(settings));
+	const bool want = pacer_.begin(entry);
+	note_as_fast();
+	const bool aside = pacer_.holding_off();
+	if (aside != aside_) {
+		aside_ = aside;
+		overlay_.set_aside(aside);
+		overlay_.reset_frames();
+		stage_.reset();
+	}
+	const bool hitched = !want && pacer_.state() == PacerState::Engaged && !aside;
 	if (hitched)
 		overlay_.reset_frames();
-	const bool fed = round_own_window(runtime, bridge, engine, entry, settings);
+	const bool fed = !aside && round_own_window(runtime, bridge, engine, entry, settings);
 	const double planned = now_ms();
 	window_.round.push_back(planned - entry);
 	window_.begin.push_back(part_begin_);
@@ -630,13 +772,17 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 	if (fed) {
 		++generated_;
 		++window_.generated;
+	} else if (!note_.empty()) {
+		last_failure_ = note_;
 	}
 	const PacerPlan plan = pacer_.plan(planned, false, limit_ms);
+	pacer_.note_made(fed);
 	sleep_until(plan.real_at);
 	const double ret = now_ms();
 	pacer_.returned(ret);
 	++window_.frames;
 	window_.waits.push_back(ret - planned);
+	last_call_ = LastCall{ 1, static_cast<float>(planned - entry), static_cast<float>(ret - planned) };
 	if (last_return_ >= 0.0)
 		window_.real.push_back(ret - last_return_);
 	last_return_ = ret;
@@ -651,6 +797,13 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 			return v[v.size() / 2];
 		};
 		const OverlayStats s = overlay_.stats();
+		const bool restarted = s.starts != own_logged_.starts;
+		const auto since = [restarted](uint64_t now, uint64_t then) {
+			return static_cast<unsigned long long>(!restarted && now >= then ? now - then : now);
+		};
+		const auto shown = [](uint64_t now, uint64_t then) {
+			return static_cast<unsigned long long>(now >= then ? now - then : 0u);
+		};
 		const std::string by = frame_generator_label(stage_.active_generator());
 		wchar_t steps[48];
 		if (own_steps_ >= 2)
@@ -661,38 +814,94 @@ void FrameGeneration::on_present_own_window(effect_runtime *runtime, FrameBridge
 			std::swprintf(steps, 48, L"every refresh (Auto)");
 		diag_logf(DiagLevel::Info, "framegen", L"frame generation (its own window): last %.1f s, %u real frames %.2f ms "
 			L"apart, %u handed over; made by %hs at %ls; on the screen %.1f real and %.1f made frames a second at %.1f Hz "
-			L"(%ls), %llu real frames left out, %llu refreshes held, %llu repeated by the multiplier, %.1f ms behind the "
+			L"(%ls; %llu real and %llu made frames shown since the last line), %llu real frames left out, %llu refreshes held, %llu repeated by the multiplier, %.1f ms behind the "
 			L"game (%.1f of it until a frame is usable); on the screen %.1f ms after the game's own time (real frames "
 			L"%.1f, p90 %.1f, %u seen; held %.1f ms after ready, ready to decided p90 %.1f), decided %.1f ms before its refresh, %llu missed (%llu with the GPU work late), %llu late, shown %.1f ms after the blank planned (earliest %.1f); on the game's thread, median ms: round %.2f (begin %.2f, "
 			L"estimator %.2f, end %.2f), wait %.2f; window's thread p90/most ms: swap chain wait %.1f/%.1f, late "
-			L"%.1f/%.1f, picture %.1f/%.1f, present %.1f/%.1f, GPU done p90 d3d12 %.1f d3d11 %.1f, decision to done, longest of 6 s, %.1f (%llu seen done, %llu found done, %llu not timed); window %ls", (ret - window_start_) / 1000.0, w.frames, med(w.real),
+			L"%.1f/%.1f, picture %.1f/%.1f, present %.1f/%.1f, GPU done p90 d3d12 %.1f d3d11 %.1f, decision to done, longest of 6 s, %.1f (%llu seen done, %llu found done, %llu not timed); window %ls, put back over the game's %llu times%ls%ls", (ret - window_start_) / 1000.0, w.frames, med(w.real),
 			w.generated, by.c_str(), steps, s.real_per_s, s.generated_per_s, s.period_ms > 0.0 ? 1000.0 / s.period_ms : 0.0,
 			s.paced_by == OverlayStats::kPacedByMonitor ? L"the monitor's vertical blanks"
 				: s.paced_by == OverlayStats::kPacedByCompositor ? L"the compositor's clock" : L"the swap chain's releases",
-			static_cast<unsigned long long>(s.skipped - std::min(s.skipped, own_logged_.skipped)),
-			static_cast<unsigned long long>(s.held - std::min(s.held, own_logged_.held)),
-			static_cast<unsigned long long>(s.repeated - std::min(s.repeated, own_logged_.repeated)), s.latency_ms,
+			shown(s.shown_reals, own_logged_.shown_reals),
+			shown(s.shown_made, own_logged_.shown_made),
+			since(s.skipped, own_logged_.skipped),
+			since(s.held, own_logged_.held),
+			since(s.repeated, own_logged_.repeated), s.latency_ms,
 			s.usable_lag_ms, s.screen_ms_p50, s.screen_real_ms_p50, s.screen_real_ms_p90, s.screen_samples, s.held_real_ms_p50, s.ready_wait_p90, s.lead_ms,
-			static_cast<unsigned long long>(s.missed - std::min(s.missed, own_logged_.missed)),
-			static_cast<unsigned long long>(s.missed_late_work - std::min(s.missed_late_work, own_logged_.missed_late_work)),
-			static_cast<unsigned long long>(s.late - std::min(s.late, own_logged_.late)), s.offset_p50_ms, s.offset_min_ms,
+			since(s.missed, own_logged_.missed),
+			since(s.missed_late_work, own_logged_.missed_late_work),
+			since(s.late, own_logged_.late), s.offset_p50_ms, s.offset_min_ms,
 			med(w.round), med(w.begin), med(w.record), med(w.end), med(w.waits),
 			s.thread_waitable_p90, s.thread_waitable_max, s.thread_late_p90, s.thread_late_max, s.thread_render_p90,
 			s.thread_render_max, s.thread_present_p90, s.thread_present_max, s.gpu_d3d12_p90, s.gpu_d3d11_p90, s.work_ms,
-			static_cast<unsigned long long>(s.work_seen - std::min(s.work_seen, own_logged_.work_seen)),
-			static_cast<unsigned long long>(s.work_found - std::min(s.work_found, own_logged_.work_found)),
-			static_cast<unsigned long long>(s.work_untimed - std::min(s.work_untimed, own_logged_.work_untimed)),
+			since(s.work_seen, own_logged_.work_seen),
+			since(s.work_found, own_logged_.work_found),
+			since(s.work_untimed, own_logged_.work_untimed),
 			!s.visible ? L"hidden (the game is not in front)"
-				: s.in_host ? L"shown, from AeonSRHost.exe" : L"shown, from the game's process");
+				: s.in_host ? L"shown, from AeonSRHost.exe" : L"shown, from the game's process",
+			since(s.raised, own_logged_.raised),
+			w.generated < w.frames && !last_failure_.empty() ? L"; not handed over last: " : L"",
+			w.generated < w.frames ? last_failure_.c_str() : L"");
+		if (w.filled > 0)
+			diag_logf(DiagLevel::Info, "framegen", L"frame generation (its own window): %u of the %u frames handed over "
+				L"had nothing made between them by %hs (loading, a frame it failed, or no video memory for its frames); "
+				L"they went to AeonSR's generator", w.filled, w.generated, frame_generator_label(filled_for_));
+		note_memory_fills();
 		own_logged_ = s;
 		window_ = Window{};
 		window_start_ = ret;
+		last_failure_.clear();
 	}
+}
+
+void FrameGeneration::follow_fullscreen(effect_runtime *runtime, bool keep)
+{
+	if (runtime == nullptr || !is_dxgi(runtime->get_device()->get_api()))
+		return;
+	const HWND hwnd = static_cast<HWND>(runtime->get_hwnd());
+	const bool wants = game_wants_fullscreen(hwnd);
+	auto *const sc = reinterpret_cast<IDXGISwapChain *>(static_cast<uintptr_t>(runtime->get_native()));
+	int fullscreen = -1;
+	BOOL fs = FALSE;
+	if (wants && !keep && sc != nullptr && SUCCEEDED(sc->GetFullscreenState(&fs, nullptr)))
+		fullscreen = fs ? 1 : 0;
+	const FollowStep f = follow_step(keep, switch_pending(false), switch_pending(true), wants, fullscreen);
+	if (f.cancel)
+		cancel_switch(hwnd);
+	if (f.cover) {
+		const double now = now_ms();
+		if (now - cover_checked_at_ >= 500.0) {
+			cover_checked_at_ = now;
+			if (should_cover(hwnd))
+				cover_monitor_later(hwnd);
+		}
+	}
+	if (f.forget)
+		note_game_wants_fullscreen(hwnd, false);
+	if (f.put_back)
+		switch_fullscreen_later(sc, hwnd, true);
+}
+
+static bool in_exclusive_fullscreen(effect_runtime *runtime)
+{
+	const device_api api = runtime->get_device()->get_api();
+	if (is_dxgi(api)) {
+		auto *const sc = reinterpret_cast<IDXGISwapChain *>(static_cast<uintptr_t>(runtime->get_native()));
+		BOOL fullscreen = FALSE;
+		return sc != nullptr && SUCCEEDED(sc->GetFullscreenState(&fullscreen, nullptr)) && fullscreen;
+	}
+	if (api == device_api::d3d9) {
+		auto *const sc = reinterpret_cast<IDirect3DSwapChain9 *>(static_cast<uintptr_t>(runtime->get_native()));
+		D3DPRESENT_PARAMETERS pp{};
+		return sc != nullptr && SUCCEEDED(sc->GetPresentParameters(&pp)) && !pp.Windowed;
+	}
+	return false;
 }
 
 void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
 	const Settings &settings)
 {
+	last_call_ = LastCall{};
 	if (runtime == nullptr)
 		return;
 	static thread_local bool inside = false;
@@ -710,6 +919,7 @@ void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, E
 	if (runtime_ == nullptr) {
 		runtime_ = runtime;
 		pacer_.reset();
+		fit_.reset();
 		stage_.reset();
 		cost_n_ = cost_at_ = 0;
 		route_too_slow_ = false;
@@ -718,14 +928,32 @@ void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, E
 	const double limit_ms = settings.frame_generation_limit != 0
 		? 1000.0 / static_cast<double>(settings.frame_generation_limit) : 0.0;
 	const double entry = now_ms();
+	if (overlay_refused_ && refused_covered_ && entry - overlay_refused_at_ >= kCoveredRetryMs) {
+		overlay_refused_ = refused_covered_ = false;
+		overlay_refusal_.clear();
+		diag_info("framegen", L"frame generation: trying its own window again over the game's");
+	}
+	follow_fullscreen(runtime, keep_borderless(settings));
+	if (overlay_refused_ && refused_exclusive_ && !in_exclusive_fullscreen(runtime)) {
+		overlay_refused_ = refused_exclusive_ = false;
+		overlay_refusal_.clear();
+	}
 	if (settings.frame_generation_own_window && !overlay_refused_ && !route_given_up_) {
 		static const std::wstring beside = overlay_window_host_beside_addon(), none;
 		overlay_.set_window_host(settings.frame_generation_window_host ? beside : none);
+		overlay_.set_marker(settings.frame_generation_marker);
 		std::wstring why;
 		bool permanent = false;
-		if (own_window_ready(runtime, engine, &why, &permanent)) {
-			on_present_own_window(runtime, bridge, engine, entry, limit_ms, settings);
-			return;
+		refused_exclusive_ = false;
+		if (own_window_ready(runtime, engine, &why, &permanent, keep_borderless(settings))) {
+			if (!overlay_.stats().covered) {
+				game_present_route_ = false;
+				on_present_own_window(runtime, bridge, engine, entry, limit_ms, settings);
+				return;
+			}
+			why = L"the game keeps its own window over every other, where a window of frame generation's cannot be seen";
+			permanent = true;
+			refused_covered_ = true;
 		}
 		overlay_.stop();
 		overlay_active_ = false;
@@ -735,13 +963,22 @@ void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, E
 		}
 		overlay_refused_ = true;
 		overlay_refusal_ = why;
+		overlay_refused_at_ = entry;
+		pacer_.reset();
+		fit_.reset();
 		diag_logf(DiagLevel::Warn, "framegen", L"frame generation: %ls; the frames are presented from the game's own "
-			L"present instead, one made frame per real one", why.c_str());
+			L"present instead, each made frame on a refresh of its own (Multiply by: 2x to 6x)", why.c_str());
 	}
 	if (overlay_.running())
 		overlay_.stop();
 	overlay_active_ = false;
+	game_present_route_ = true;
+	const DisplayGrid display = clock_.grid();
+	pacer_.set_refresh(display.valid && display.period_ms > 2.0 ? display.period_ms : 0.0, entry);
+	pacer_.set_window_route(false);
+	pacer_.set_fixed(fixed_multiplier(settings));
 	const bool want = !route_given_up_ && !route_too_slow_ && pacer_.begin(entry);
+	note_as_fast();
 	bool generated = false;
 	if (want)
 		generated = round(runtime, bridge, engine, settings);
@@ -755,58 +992,94 @@ void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, E
 		window_.record.push_back(part_record_);
 		window_.end.push_back(part_end_);
 	}
-	const DisplayGrid display = clock_.grid();
 	display_paced_ = display.valid && presents_wait_for_vblank(runtime);
+	fit_period_ms_ = display.valid && display.period_ms > 2.0 ? display.period_ms : 0.0;
 	if (sync_watched_)
-		present_sync::force_vsync(display_paced_ && !route_given_up_ && !route_too_slow_);
+		present_sync::force_vsync(display_paced_ && !route_given_up_ && !route_too_slow_ && !pacer_.holding_off());
 	presenter_.set_sync_interval(display_paced_ && is_dxgi(runtime->get_device()->get_api()) ? 1u : 0u);
 	PacerGrid grid;
 	if (display_paced_) {
 		grid.period_ms = display.period_ms;
 		grid.vblank_ms = display.vblank_ms;
 	}
-	const PacerPlan plan = pacer_.plan(planned, generated, limit_ms, grid);
+	const uint32_t made = generated ? std::max(1u, round_made_) : 0u;
+	PacerPlan plan = pacer_.plan(planned, generated, limit_ms, grid, made + 1u);
+	if (queue_spreads(fixed_multiplier(settings) &&
+			settings.frame_generation_excess == static_cast<unsigned int>(FrameGenExcess::Queue),
+			display_paced_, last_return_ >= 0.0))
+		queue_spread(&plan, planned, last_return_, fit_period_ms_);
 	double real_at = plan.real_at;
 	double gen_issued = -1.0;
+	uint32_t shown = 0;
 	if (plan.generate) {
-		sleep_until(plan.gen_at);
-		std::wstring why;
-		gen_issued = now_ms();
-		const bool ok = presenter_.present_generated(runtime, &why);
-		if (ok) {
-			++generated_;
-			++window_.generated;
-		} else {
-			++window_.failed;
-			note_ = why;
-			if (presenter_.failures_in_a_row() >= kPresentGiveUp) {
-				route_given_up_ = true;
-				diag_logf(DiagLevel::Warn, "framegen", L"frame generation: %u generated frames in a row could not be "
-					L"presented (%ls); given up on this swap chain", kPresentGiveUp, why.c_str());
+		double next_at = plan.made_at[0];
+		for (uint32_t m = 0; m < plan.made && m < made; ++m) {
+			if (round_pick_[m] != 1u && !step_round(runtime, bridge, engine, settings, round_pick_[m]))
+				break;
+			sleep_until(std::max(next_at, plan.made_at[m]));
+			std::wstring why;
+			const double issued = now_ms();
+			if (m == 0)
+				gen_issued = issued;
+			const bool ok = presenter_.present_generated(runtime, &why);
+			shown += ok ? 1u : 0u;
+			if (ok) {
+				++generated_;
+				++window_.generated;
+			} else {
+				++window_.failed;
+				note_ = why;
+				if (presenter_.failures_in_a_row() >= kPresentGiveUp) {
+					route_given_up_ = true;
+					diag_logf(DiagLevel::Warn, "framegen", L"frame generation: %u generated frames in a row could not be "
+						L"presented (%ls); given up on this swap chain", kPresentGiveUp, why.c_str());
+				}
 			}
-		}
-		dump_take(runtime, settings, ok);
-		if (ok && display_paced_ && blt_present_) {
-			const double before = now_ms();
-			wait_for_gpu(runtime);
-			const double done = now_ms();
-			window_.gpu_waits.push_back(done - before);
-			real_at = pacer_.after_generated(real_at, done, grid);
+			if (m == 0)
+				dump_take(runtime, settings, ok);
+			if (!ok && m > 0) {
+				if (shown == m && ++short_rounds_ >= kShortRoundsToCap && present_cap_ > m) {
+					present_cap_ = m;
+					diag_logf(DiagLevel::Info, "framegen", L"frame generation: %u rounds in a row the swap chain took "
+						L"%u made frames a real one through the game's present and no more (%ls); the multiplier is held "
+						L"to %ux until the swap chain is made again", kShortRoundsToCap, m, why.c_str(), m + 1);
+				}
+				break;
+			}
+			if (ok && m + 1 == made)
+				short_rounds_ = 0;
+			next_at = issued;
+			if (ok && display_paced_ && blt_present_) {
+				const double before = now_ms();
+				wait_for_gpu(runtime);
+				const double done = now_ms();
+				window_.gpu_waits.push_back(done - before);
+				real_at = pacer_.after_generated(real_at, done, grid);
+				if (m + 1 < plan.made)
+					next_at = pacer_.after_generated(plan.made_at[m + 1], done, grid);
+			}
+			if (route_given_up_)
+				break;
 		}
 	}
 	sleep_until(real_at);
 	const double ret = now_ms();
 	pacer_.returned(ret);
 	if (generated && last_return_ >= 0.0)
-		check_route_cost(planned - entry, entry - last_return_);
+		check_route_cost(planned - entry, entry - last_return_, route_cost_made(round_made_, stage_.made_at_once()));
 
 	++window_.frames;
 	window_.waits.push_back(ret - planned);
+	last_call_ = LastCall{ static_cast<uint8_t>(route_given_up_ || route_too_slow_ ? 4 : plan.generate ? 2 : 3),
+		static_cast<float>(planned - entry), static_cast<float>(ret - planned) };
+	if (last_return_ >= 0.0 && plan.generate)
+		fit_.next(ret - last_return_, fit_period_ms_,
+			fixed_multiplier(settings) ? settings.frame_generation_multiplier : 2u);
 	if (last_return_ >= 0.0) {
 		window_.real.push_back(ret - last_return_);
 		if (gen_issued >= 0.0) {
 			const double a = gen_issued - last_return_, b = ret - gen_issued;
-			if (!display_paced_ && a + b > 0.0) {
+			if (!display_paced_ && plan.made == 1 && a + b > 0.0) {
 				window_.uneven_sum += std::fabs(a - b) / (a + b);
 				++window_.pairs;
 			}
@@ -819,28 +1092,64 @@ void FrameGeneration::on_present(effect_runtime *runtime, FrameBridge &bridge, E
 		log_window(ret);
 }
 
-void FrameGeneration::check_route_cost(double cost, double own)
+void FrameGeneration::note_as_fast()
+{
+	const bool fast = pacer_.as_fast_as_screen(), given_up = pacer_.as_fast_given_up(), trying = pacer_.trying();
+	const bool was_fast = logged_fast_, was_given_up = logged_given_up_, was_trying = logged_trying_;
+	logged_fast_ = fast;
+	logged_given_up_ = given_up;
+	logged_trying_ = trying;
+	const bool holding = pacer_.holding_off(), was_holding = logged_holding_;
+	logged_holding_ = holding;
+	if (pacer_.fixed() && was_holding && !holding)
+		diag_info("framegen", L"frame generation: Multiply by is no longer Auto: frames are made on every real frame "
+			L"from now on, whatever the game's rate against the screen");
+	else if (trying && !was_trying)
+		diag_logf(DiagLevel::Info, "framegen", L"frame generation: trying without made frames for a moment (a refresh "
+			L"of %.1f ms, the real frames %.1f ms apart while frames were made): the game may keep up with the screen "
+			L"by itself", pacer_.refresh_ms(), pacer_.real_interval_ms());
+	else if (was_trying && !trying && !fast)
+		diag_logf(DiagLevel::Info, "framegen", L"frame generation: without made frames the game fell behind the screen "
+			L"(its real frames %.1f ms apart, a refresh of %.1f): frames are made again", pacer_.real_interval_ms(),
+			pacer_.refresh_ms());
+	if (fast != was_fast && !(pacer_.fixed() && was_holding))
+		diag_logf(DiagLevel::Info, "framegen", fast
+			? L"frame generation: the game is as fast as the screen by itself (a refresh of %.1f ms, its real frames "
+			  L"%.1f ms apart): nothing is made, and nothing of frame generation runs or holds a real frame"
+			: L"frame generation: the game no longer keeps up with the screen by itself (a refresh of %.1f ms, its "
+			  L"real frames %.1f ms apart): frames are made again", pacer_.refresh_ms(), pacer_.real_interval_ms());
+	if (given_up && !was_given_up)
+		diag_logf(DiagLevel::Info, "framegen", L"frame generation: going without made frames did not hold (the game "
+			L"fell behind the screen when none were made, or kept switching): frames are made from now on, without "
+			L"trying again");
+}
+
+void FrameGeneration::check_route_cost(double cost, double own, uint32_t made)
 {
 	cost_ring_[cost_at_] = cost;
 	own_ring_[cost_at_] = own;
+	made_ring_[cost_at_] = made;
 	cost_at_ = (cost_at_ + 1) % kCostFrames;
 	cost_n_ = std::min(cost_n_ + 1, kCostFrames);
 	if (cost_n_ < kCostFrames)
 		return;
 	double c[kCostFrames], o[kCostFrames];
+	uint32_t m[kCostFrames];
 	std::copy(cost_ring_, cost_ring_ + kCostFrames, c);
 	std::copy(own_ring_, own_ring_ + kCostFrames, o);
+	std::copy(made_ring_, made_ring_ + kCostFrames, m);
 	std::nth_element(c, c + kCostFrames / 2, c + kCostFrames);
 	std::nth_element(o, o + kCostFrames / 2, o + kCostFrames);
+	std::nth_element(m, m + kCostFrames / 2, m + kCostFrames);
 	const double mc = c[kCostFrames / 2], mo = o[kCostFrames / 2];
-	if (mc > 6.0 && mc > 0.4 * mo) {
+	if (route_too_costly(mc, mo, m[kCostFrames / 2])) {
 		route_too_slow_ = true;
 		slow_cost_ms_ = mc;
 		slow_own_ms_ = mo;
 		stage_.reset();
-		diag_logf(DiagLevel::Warn, "framegen", L"frame generation: each generated frame costs the game's thread "
-			L"%.1f ms on this graphics route, against %.1f ms of the game's own work; it would cut the real frame "
-			L"rate by more than it adds, so it is off for this window", mc, mo);
+		diag_logf(DiagLevel::Warn, "framegen", L"frame generation: making the frames of a real one costs the game's "
+			L"thread %.1f ms on this graphics route, against %.1f ms of the game's own work, for %u shown; it would cut "
+			L"the real frame rate by more than it adds, so it is off for this window", mc, mo, m[kCostFrames / 2]);
 	}
 }
 
@@ -878,16 +1187,38 @@ void FrameGeneration::log_window(double now)
 	if (game_sync != present_sync::kUnknown)
 		std::swprintf(sync, 64, L"%u%ls", game_sync, display_paced_ && game_sync != 1 ? L", given 1 while generating" : L"");
 	diag_logf(DiagLevel::Info, "framegen", L"frame generation: last %.1f s, %u real frames %.2f ms apart (p90 %.2f), "
-		L"%u generated presented, %u failed, %u re-entries; %ls; on the "
+		L"%u generated presented (%ux asked, %u made the last frame), %u failed, %u re-entries; %ls; on the "
 		L"presenting thread, median/p90 ms: round %.2f/%.2f (begin %.2f/%.2f, record %.2f/%.2f, end %.2f/%.2f), waits "
 		L"with the extra present %.2f/%.2f; %hs, GPU %.2f ms (%hs); display %.2f Hz (spread %.3f); the game's sync "
-		L"interval %ls",
-		(now - window_start_) / 1000.0, w.frames, rm, rp, w.generated, w.failed, w.reentries, pacing, om, op, bm, bp,
-		cm, cp, em, ep, wm, wp, pacer_state_label(pacer_.state()), gpu_ms_,
+		L"interval %ls; the game's own time a frame while frames are made %.1f ms (median)",
+		(now - window_start_) / 1000.0, w.frames, rm, rp, w.generated, round_steps_, round_made_, w.failed, w.reentries,
+		pacing, om, op, bm, bp,
+		cm, cp, em, ep, wm, wp, pacer_.as_fast_as_screen() ? "nothing made, the game as fast as the screen"
+			: pacer_state_label(pacer_.state()), gpu_ms_,
 		presenter_.route().empty() ? "no extra present yet" : presenter_.route().c_str(),
-		clock_.measured_period_ms() > 0.0 ? 1000.0 / clock_.measured_period_ms() : 0.0, clock_.spread(), sync);
+		clock_.measured_period_ms() > 0.0 ? 1000.0 / clock_.measured_period_ms() : 0.0, clock_.spread(), sync,
+		pacer_.own_ms());
+	const uint64_t fills = stage_.own_fills();
+	const uint64_t new_fills = fills >= logged_fills_ ? fills - logged_fills_ : fills;
+	if (new_fills > 0)
+		diag_logf(DiagLevel::Info, "framegen", L"frame generation: %llu of the %u generated frames presented were made by "
+			L"AeonSR's generator, %hs having made none for them (loading, or a frame it failed)",
+			static_cast<unsigned long long>(new_fills), w.generated, frame_generator_label(stage_.filled_for()));
+	logged_fills_ = fills;
+	note_memory_fills();
 	window_ = Window{};
 	window_start_ = now;
+}
+
+void FrameGeneration::note_memory_fills()
+{
+	const uint64_t m = stage_.memory_fills();
+	const uint64_t fresh = m >= logged_memory_fills_ ? m - logged_memory_fills_ : m;
+	if (fresh > 0)
+		diag_logf(DiagLevel::Warn, "framegen", L"frame generation: for %llu pairs the textures for %hs's frames could "
+			L"not be made (out of video memory?): AeonSR's generator made them, at the multiplier asked",
+			static_cast<unsigned long long>(fresh), frame_generator_label(stage_.filled_for()));
+	logged_memory_fills_ = m;
 }
 
 FrameGenReadout FrameGeneration::readout() const
@@ -902,17 +1233,27 @@ FrameGenReadout FrameGeneration::readout() const
 	r.generator = stage_.active_generator();
 	r.generator_version = stage_.vendor_version();
 	r.through_game_present = overlay_refused_;
+	r.through_game_present = r.through_game_present || (game_present_route_ && !overlay_active_);
+	if (!overlay_active_) {
+		r.own_asked = own_asked_;
+		r.own_steps_max = own_steps_max_;
+		r.own_steps = round_steps_;
+		r.own_auto = own_asked_ == 0;
+	}
 	const DisplayGrid display = clock_.grid();
 	const bool paced = display_paced_ && display.valid && display.period_ms > 0.0;
 	r.refresh_hz = paced ? 1000.0 / display.period_ms : 0.0;
 	const uint32_t game_sync = sync_watched_ ? present_sync::game_sync_interval() : present_sync::kUnknown;
-	r.vsync_forced = paced && game_sync != present_sync::kUnknown && game_sync != 1;
+	r.vsync_forced = paced && game_sync != present_sync::kUnknown && game_sync != 1 && !pacer_.holding_off();
 	const double real = pacer_.real_interval_ms();
 	if (real > 0.0) {
 		r.real_fps = 1000.0 / real;
-		r.shown_fps = pacer_.state() == PacerState::Engaged ? 2.0 * r.real_fps : r.real_fps;
-		if (pacer_.state() == PacerState::Engaged)
-			r.added_latency_ms = paced ? display.period_ms : 0.5 * real;
+		const bool making = pacer_.state() == PacerState::Engaged && !pacer_.holding_off();
+		const double made = static_cast<double>(std::max(1u, round_made_));
+		r.shown_fps = making ? (made + 1.0) * r.real_fps : r.real_fps;
+		r.as_fast_as_screen = pacer_.as_fast_as_screen();
+		if (making)
+			r.added_latency_ms = paced ? made * display.period_ms : made / (made + 1.0) * real;
 	}
 	if (overlay_active_) {
 		const OverlayStats s = overlay_.stats();
@@ -930,12 +1271,21 @@ FrameGenReadout FrameGeneration::readout() const
 		r.screen_hz = s.compositor_paced && s.period_ms > 0.0 ? 1000.0 / s.period_ms
 			: grid.valid && grid.period_ms > 0.0 ? 1000.0 / grid.period_ms : 0.0;
 		r.even_cap_fps = even_cap_fps(s.real_per_s, r.screen_hz);
+		r.as_fast_as_screen = pacer_.as_fast_as_screen();
+		if (pacer_.holding_off()) {
+			r.shown_fps = r.real_fps;
+			r.added_latency_ms = 0.0;
+			r.own_steps = 1;
+		}
 		r.status = note_;
-		if (r.status.empty() && s.real_per_s <= 0.0)
+		if (r.status.empty() && (pacer_.holding_off() ? !pacer_.as_fast_as_screen() : s.real_per_s <= 0.0))
 			r.status = L"Starting.";
 		const std::wstring &fallback = stage_.fallback_note();
 		if (!fallback.empty())
 			r.status += (r.status.empty() ? L"" : L" ") + fallback + L".";
+		else if (stage_.last_filled())
+			r.status += (r.status.empty() ? L"" : L" ") + diag_widen(frame_generator_label(stage_.filled_for())) +
+				L" made no frame for this one (loading, or a frame it failed); AeonSR's generator makes them meanwhile.";
 		return r;
 	}
 	if (route_given_up_) {
@@ -952,7 +1302,10 @@ FrameGenReadout FrameGeneration::readout() const
 		r.status = L"Not in its own window: " + overlay_refusal_ + L".";
 	} else if (!stage_.fallback_note().empty()) {
 		r.status = stage_.fallback_note() + L".";
-	} else if (pacer_.state() == PacerState::Measuring) {
+	} else if (stage_.last_filled()) {
+		r.status = diag_widen(frame_generator_label(stage_.filled_for())) +
+			L" made no frame for this one (loading, or a frame it failed); AeonSR's generator makes them meanwhile.";
+	} else if (pacer_.state() == PacerState::Measuring || (pacer_.holding_off() && !pacer_.as_fast_as_screen())) {
 		r.status = L"Starting.";
 	} else if (r.vsync_forced) {
 		r.status = L"Vsync is on while generating.";

@@ -331,8 +331,8 @@ float MatchError(int2 pixel, float2 v)
 	}
 	RefinedOut[pixel] = bestError > kUnmatched ? nearestCamera : best;
 }
-)HLSL"
-R"HLSL([numthreads(8, 8, 1)] void LayersMain(uint3 id : SV_DispatchThreadID)
+
+[numthreads(8, 8, 1)] void LayersMain(uint3 id : SV_DispatchThreadID)
 {
 	if(any(id.xy >= tileCount))
 		return;
@@ -420,22 +420,37 @@ bool PixelUnchanged(int2 p)
 {
 	return all(FrameA.Load(int3(p, 0)).rgb == FrameB.Load(int3(p, 0)).rgb);
 }
+)HLSL"
+R"HLSL(static const uint kShared = 5;
+static const uint kSpan = kTile + 2;
+static const uint kCells = kSpan * kSpan;
+groupshared float sharedDiff[kShared * kCells];
+groupshared uint sharedChanged;
 
-[numthreads(8, 8, 1)] void InterpolateMain(uint3 id : SV_DispatchThreadID)
+float SharedPatchError(uint slot, int2 local)
 {
-	if(any(id.xy >= size))
-		return;
-	int2 pixel = int2(id.xy);
+	uint at = slot * kCells + uint(local.y + 1) * kSpan + uint(local.x + 1);
+	float centre = sharedDiff[at] * 2.0;
+	float topLeft = sharedDiff[at - kSpan - 1];
+	float topRight = sharedDiff[at - kSpan + 1];
+	float bottomLeft = sharedDiff[at + kSpan - 1];
+	float bottomRight = sharedDiff[at + kSpan + 1];
+	float halves = min(min(topLeft + bottomLeft, topRight + bottomRight), min(topLeft + topRight, bottomLeft + bottomRight));
+	return (centre + halves) * 0.25;
+}
+
+[numthreads(8, 8, 1)] void InterpolateMain(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID, uint index : SV_GroupIndex)
+{
+	bool inside = all(id.xy < size);
+	int2 pixel = min(int2(id.xy), int2(size) - 1);
+	int2 local = int2(localId.xy);
 	float2 q = float2(pixel) + 0.5;
 	float4 summary = Summary.Load(int3(0, 0, 0));
-	if(summary.z > kCutFraction)
-	{
-		Output[pixel] = Encoded(t < 0.5 ? FrameA.Load(int3(pixel, 0)).rgb : FrameB.Load(int3(pixel, 0)).rgb);
-		return;
-	}
+	bool cut = summary.z > kCutFraction;
 
 	float2 here = MotionAt(q);
-	if(PixelUnchanged(pixel))
+	bool still = false;
+	[branch] if(!cut && PixelUnchanged(pixel))
 	{
 		float3 colour = FrameA.Load(int3(pixel, 0)).rgb;
 		uint same = 0;
@@ -460,19 +475,62 @@ bool PixelUnchanged(int2 p)
 		bool exactTranslation = summary.w < kExactFit && dominantExplains;
 		bool staticField = same == 9 && (dot(here, here) < 0.0625 || (distinct + related == 0 && !exactTranslation));
 		bool staticOverlay = same >= 4 && distinct > related && !dominantExplains;
-		if(staticField || staticOverlay)
-		{
-			Output[pixel] = Encoded(colour);
-			return;
-		}
+		still = staticField || staticOverlay;
 	}
+	if(index == 0)
+		sharedChanged = 0;
+	GroupMemoryBarrierWithGroupSync();
+	if(inside && !cut && !still)
+		InterlockedOr(sharedChanged, 1u);
 
-	float4 layers = Layers.Load(int3(pixel / kTile, 0));
+	float4 layers = Layers.Load(int3(groupId.xy, 0));
 	float2 background = layers.xy;
 	float2 foreground = layers.zw;
-	float backgroundDepth = LayerDepth.Load(int3(pixel / kTile, 0));
-	bool layered = length(foreground - background) > 1.0;
 	float2 cameraMotion = GlobalFlow.Load(int3(0, 0, 0)) * float2(size);
+	float2 tileVectors[kShared] = { summary.xy, foreground, background, cameraMotion, float2(0, 0) };
+	uint slots[kShared];
+	uint unique = 0;
+	[unroll] for(uint u = 0; u < kShared; ++u)
+	{
+		slots[u] = u;
+		[unroll] for(uint w = 0; w < u; ++w)
+		{
+			if(slots[u] == u && all(tileVectors[w] == tileVectors[u]))
+				slots[u] = slots[w];
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	uint work = sharedChanged == 0 ? 0 : kShared * kCells;
+	int2 origin = int2(groupId.xy * kTile) - 1;
+	for(uint k = index; k < work; k += kTile * kTile)
+	{
+		uint s = k / kCells;
+		uint cell = k - s * kCells;
+		[branch] if(slots[s] == s)
+		{
+			float2 p = float2(origin + int2(cell % kSpan, cell / kSpan)) + 0.5;
+			float2 v = tileVectors[s];
+			sharedDiff[k] = ColourDistance(SampleA(p + t * v), SampleB(p - (1.0 - t) * v));
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if(!inside)
+		return;
+	if(cut)
+	{
+		Output[pixel] = Encoded(t < 0.5 ? FrameA.Load(int3(pixel, 0)).rgb : FrameB.Load(int3(pixel, 0)).rgb);
+		return;
+	}
+
+	if(still)
+	{
+		Output[pixel] = Encoded(FrameA.Load(int3(pixel, 0)).rgb);
+		return;
+	}
+
+	float backgroundDepth = LayerDepth.Load(int3(groupId.xy, 0));
+	bool layered = length(foreground - background) > 1.0;
 
 	float2 candidates[8];
 	candidates[0] = summary.xy;
@@ -483,6 +541,7 @@ bool PixelUnchanged(int2 p)
 	candidates[5] = background;
 	candidates[6] = cameraMotion;
 	candidates[7] = float2(0, 0);
+	static const uint kSlotOf[8] = { 0, 9, 9, 9, 1, 2, 3, 4 };
 
 	float bestCost = 1e9;
 	float2 best = here;
@@ -501,11 +560,15 @@ bool PixelUnchanged(int2 p)
 		if(i == 0)
 			consistencyCost *= saturate(summary.w / 0.01);
 		float photometric;
-		[branch] if(i == 0 && !layered)
+		if(i == 0 && !layered)
 		{
-			photometric = ColourDistance(SampleA(q + t * v), SampleB(q - (1.0 - t) * v));
+			photometric = sharedDiff[slots[0] * kCells + uint(local.y + 1) * kSpan + uint(local.x + 1)];
 			if(photometric >= kGoodEnough)
-				photometric = PatchError(q, v);
+				photometric = SharedPatchError(slots[0], local);
+		}
+		else if(kSlotOf[i] < kShared)
+		{
+			photometric = SharedPatchError(slots[kSlotOf[i]], local);
 		}
 		else
 		{
@@ -520,15 +583,15 @@ bool PixelUnchanged(int2 p)
 		}
 	}
 
+	float foregroundPatch = SharedPatchError(slots[1], local);
 	[branch] if(layered && length(best - background) < length(best - foreground))
 	{
 		float mismatch = length(MotionAt(q - (1.0 - t) * foreground) - foreground);
-		float foregroundPhotometric = PatchError(q, foreground);
-		float foregroundCost = foregroundPhotometric + kConsistencyWeight * saturate((mismatch - 0.25) / 2.0);
+		float foregroundCost = foregroundPatch + kConsistencyWeight * saturate((mismatch - 0.25) / 2.0);
 		if(foregroundCost < max(bestCost, kGoodEnough) + kForegroundPreference)
 		{
 			bestCost = foregroundCost;
-			bestPhotometric = foregroundPhotometric;
+			bestPhotometric = foregroundPatch;
 			best = foreground;
 		}
 	}
@@ -583,9 +646,9 @@ bool PixelUnchanged(int2 p)
 							   ColourDistance(SampleA(a), SampleB(origin)) < kCoverTolerance;
 			coverA = coverA || foregroundA;
 			coverB = coverB || foregroundB;
-			foregroundError = PatchError(q, foreground);
+			foregroundError = foregroundPatch;
 		}
-		float direct = PatchError(q, background);
+		float direct = SharedPatchError(slots[2], local);
 		float occlusion = coverA != coverB ? smoothstep(kLayerOnset, kLayerFull, min(direct, foregroundError)) : 0.0;
 		[branch] if(occlusion > 0.0)
 		{

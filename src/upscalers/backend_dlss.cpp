@@ -1,3 +1,4 @@
+#include "aeon_sr/core/runtime_load_scope.hpp"
 #include "aeon_sr/upscalers/backend_dlss.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
 
@@ -60,7 +61,14 @@ bool DlssD3D12Backend::run(
 		return false;
 	}
 	if (state == kFinished) {
+		const bool was_feature = building_feature_;
+		building_feature_ = false;
 		join_init();
+		if (was_feature) {
+			if (init_ok_)
+				feature_landed_ms_ = GetTickCount64();
+			feature_failed_ms_ = init_ok_ ? 0 : GetTickCount64();
+		}
 		if (!init_ok_) {
 			sync_status(*this, *rt);
 			return false;
@@ -85,16 +93,52 @@ bool DlssD3D12Backend::run(
 			sync_status(*this, *rt);
 			return false;
 		}
+		if (neural_building() || runtime_load_active()) {
+			status = UpscalerStatus::Loading;
+			return false;
+		}
 		ID3D12Device *const device = inputs.engine.device;
 		NgxRuntimeD3D12 *const session = rt;
 		status = UpscalerStatus::Loading;
 		init_ok_ = false;
 		init_state_.store(kRunning, std::memory_order_release);
 		init_thread_ = std::thread([this, session, device, w, h] {
+			const RuntimeLoadScope loading;
 			init_ok_ = session->init_device(device, w, h);
 			init_state_.store(kFinished, std::memory_order_release);
 		});
 		return false;
+	}
+
+	ID3D12Resource *const target = inputs.engine.output != nullptr ? inputs.engine.output : inputs.engine.color;
+	if (target != nullptr && !rt->crashed && inputs.engine.motion != nullptr && rt->queue != nullptr) {
+		const D3D12_RESOURCE_DESC desc = target->GetDesc();
+		const uint32_t w = static_cast<uint32_t>(desc.Width), h = desc.Height;
+		const uint64_t now = GetTickCount64();
+		if (!rt->feature_ready(w, h, desc.Format) && feature_failed_ms_ != 0 &&
+			now - feature_failed_ms_ < kFeatureRetryMs) {
+			sync_status(*this, *rt);
+			return false;
+		}
+		const bool settling = feature_landed_ms_ != 0 && now - feature_landed_ms_ < kFeatureSettleMs;
+		if (!rt->feature_ready(w, h, desc.Format) && (!settling || neural_building())) {
+			if (neural_building()) {
+				status = UpscalerStatus::Loading;
+				return false;
+			}
+			NgxRuntimeD3D12 *const session = rt;
+			const DXGI_FORMAT format = desc.Format;
+			status = UpscalerStatus::Loading;
+			init_ok_ = false;
+			building_feature_ = true;
+			init_state_.store(kRunning, std::memory_order_release);
+			init_thread_ = std::thread([this, session, w, h, format] {
+				SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+				init_ok_ = session->build_feature(w, h, format);
+				init_state_.store(kFinished, std::memory_order_release);
+			});
+			return false;
+		}
 	}
 
 	const bool wrote = rt->run(inputs.engine.cmd,

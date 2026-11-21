@@ -54,6 +54,9 @@ struct NgxRuntimeD3D12 : NgxSession {
 		D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_COMMON);
 
 	bool ensure_feature(ID3D12GraphicsCommandList *cmd, uint32_t w, uint32_t h, DXGI_FORMAT color_format);
+
+	bool feature_ready(uint32_t w, uint32_t h, DXGI_FORMAT target_format) const;
+	bool build_feature(uint32_t w, uint32_t h, DXGI_FORMAT target_format);
 	void destroy_feature();
 	void release_scratch();
 

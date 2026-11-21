@@ -6,6 +6,7 @@
 #include "aeon_sr/core/gpu_vendor.hpp"
 
 #include <d3d9.h>
+#include <algorithm>
 #include <dxgi1_6.h>
 
 namespace aeon_sr {
@@ -137,6 +138,128 @@ bool PendingDevices::take(const reshade::api::device *device)
 		}
 	}
 	return false;
+}
+
+namespace {
+
+bool window_shown(void *hwnd) noexcept
+{
+	return hwnd != nullptr && IsWindowVisible(static_cast<HWND>(hwnd)) != FALSE;
+}
+
+}
+
+FrameOwner::FrameOwner(WindowShown shown) noexcept : shown_(shown != nullptr ? shown : window_shown)
+{
+}
+
+bool FrameOwner::holds_a_window(const void *device) const noexcept
+{
+	for (const Chain &c : chains_)
+		if (c.device == device && shown_(c.hwnd))
+			return true;
+	return false;
+}
+
+FrameOwner::Turn FrameOwner::frame(const void *device, uint32_t thread) noexcept
+{
+	Turn t;
+	if (device == nullptr || thread == 0)
+		return t;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (holder_ != 0 && holder_ != thread)
+		return t;
+	if (owner_ == nullptr) {
+		owner_ = device;
+		t.became_owner = true;
+	} else if (owner_ != device) {
+		if (holder_ == thread || holds_a_window(owner_) || !holds_a_window(device))
+			return t;
+		t.taken_from = owner_;
+		t.became_owner = true;
+		dropping_ = owner_;
+		owner_ = device;
+	}
+	holder_ = thread;
+	++depth_;
+	t.run = true;
+	return t;
+}
+
+FrameOwner::Event FrameOwner::event(const void *device, uint32_t thread, bool claim) noexcept
+{
+	if (device == nullptr || thread == 0)
+		return Event::Other;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (device == dropping_ && holder_ != 0 && holder_ != thread)
+		return Event::Busy;
+	if (owner_ != nullptr && owner_ != device)
+		return Event::Other;
+	if (holder_ != 0 && holder_ != thread)
+		return Event::Busy;
+	if (owner_ == nullptr && claim)
+		owner_ = device;
+	holder_ = thread;
+	++depth_;
+	return Event::Yours;
+}
+
+void FrameOwner::leave(uint32_t thread) noexcept
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (holder_ != thread || depth_ == 0)
+		return;
+	if (--depth_ == 0) {
+		holder_ = 0;
+		dropping_ = nullptr;
+	}
+}
+
+void FrameOwner::chain(const void *device, uint64_t id, void *hwnd, bool made) noexcept
+{
+	if (device == nullptr)
+		return;
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (size_t i = 0; i < chains_.size(); ++i) {
+		if (chains_[i].device != device || chains_[i].id != id)
+			continue;
+		if (made)
+			chains_[i].hwnd = hwnd;
+		else
+			chains_.erase(chains_.begin() + static_cast<std::ptrdiff_t>(i));
+		return;
+	}
+	if (made)
+		chains_.push_back({ device, id, hwnd });
+}
+
+void FrameOwner::gone(const void *device) noexcept
+{
+	if (device == nullptr)
+		return;
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (owner_ == device)
+		owner_ = nullptr;
+	chains_.erase(std::remove_if(chains_.begin(), chains_.end(), [device](const Chain &c) { return c.device == device; }),
+		chains_.end());
+}
+
+const void *FrameOwner::owner() const noexcept
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return owner_;
+}
+
+bool FrameOwner::presents_for_work(const void *device) const noexcept
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return owner_ == nullptr || owner_ == device;
+}
+
+uint32_t FrameOwner::holder() const noexcept
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return holder_;
 }
 
 size_t PendingDevices::size()
@@ -409,6 +532,7 @@ void EngineDevice::shutdown()
 	list_open_ = false;
 	begin_stalls_ = 0;
 	begin_stall_ms_ = 0.0;
+	++stalls_epoch_;
 }
 
 ID3D11Device *EngineDevice::device11()
@@ -477,6 +601,23 @@ bool EngineDevice::drain()
 	if (!ok)
 		last_error = L"the game's queue stopped responding (a GPU wait timed out)";
 	return ok;
+}
+
+bool EngineDevice::video_memory(uint64_t *usage, uint64_t *budget) const noexcept
+{
+	if (adapter_ == nullptr || usage == nullptr || budget == nullptr)
+		return false;
+	IDXGIAdapter3 *a3 = nullptr;
+	if (FAILED(adapter_->QueryInterface(IID_PPV_ARGS(&a3))) || a3 == nullptr)
+		return false;
+	DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+	const bool ok = SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info));
+	a3->Release();
+	if (!ok)
+		return false;
+	*usage = info.CurrentUsage;
+	*budget = info.Budget;
+	return true;
 }
 
 ID3D12GraphicsCommandList *EngineDevice::begin_list()

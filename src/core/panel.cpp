@@ -521,6 +521,34 @@ void draw_quality_section(const PanelState &state, Settings &settings, PanelActi
 	hint(TR(rec_reset_history_tip));
 }
 
+void draw_neural_model_row(const PanelState &state, Settings &settings, PanelActions &actions, bool running)
+{
+	if (state.neural_models.size() <= 1)
+		return;
+	const uint32_t chosen = neural_model_choice(state.neural_models, settings.neural_model);
+	std::vector<std::string> names;
+	names.reserve(state.neural_models.size());
+	int idx = -1;
+	for (size_t i = 0; i < state.neural_models.size(); ++i) {
+		char name[64];
+		std::snprintf(name, sizeof(name), TR(nr_model_name), neural_model_letter(state.neural_models[i]));
+		names.emplace_back(name);
+		if (state.neural_models[i] == chosen)
+			idx = static_cast<int>(i);
+	}
+	std::vector<RowOption> opts;
+	for (size_t i = 0; i < names.size(); ++i) {
+		const uint32_t id = state.neural_models[i];
+		opts.push_back(RowOption{ names[i].c_str(),
+			id == 1u ? TR(nr_model_a_tip) : id == 2u ? TR(nr_model_b_tip) : nullptr, ui::Brand::Nvidia });
+	}
+	if (button_row_n(TR(nr_model), &idx, opts.data(), static_cast<int>(opts.size()), TR(nr_model_tip),
+			false, running) && idx >= 0 && static_cast<size_t>(idx) < state.neural_models.size()) {
+		settings.neural_model = state.neural_models[static_cast<size_t>(idx)];
+		actions.persist = true;
+	}
+}
+
 void draw_neural_section(const PanelState &state, Settings &settings, PanelActions &actions)
 {
 	ui::band_begin("##neural_band");
@@ -547,6 +575,8 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 		status_line(verdict, TR(nr_not_available_gpu), true);
 	else if (settings.neural_render)
 		status_line(verdict, word, !running);
+	if (!settings.neural_render && nvidia && !gpu_refused)
+		draw_neural_model_row(state, settings, actions, false);
 	ui::band_end(!settings.neural_render);
 	if (!settings.neural_render)
 		return;
@@ -555,6 +585,7 @@ void draw_neural_section(const PanelState &state, Settings &settings, PanelActio
 	ui::subsection(TR(sub_performance));
 	{
 		const ui::Dim dim(faded);
+		draw_neural_model_row(state, settings, actions, running);
 		const RowOption kScaleOptions[] = {
 			{ TR(nr_scale_full), TR(nr_scale_full_tip) },
 			{ "90%", "" },
@@ -778,11 +809,20 @@ void draw_framegen_section(const PanelState &state, Settings &settings, PanelAct
 		"the row must offer Auto and every multiplier up to kFrameGenerationMultiplierMax");
 	if (button_row_value(TR(fg_multiply), &settings.frame_generation_multiplier, kMultiplyOptions, kMultiplyValues,
 			TR(fg_multiply_tip),
-			running && !f.through_game_present))
+			running))
 		actions.persist = true;
-	if (running && f.through_game_present)
+	const RowOption kExcessOptions[] = {
+		{ TR(fg_excess_select), TR(fg_excess_select_tip) },
+		{ TR(fg_excess_drop), TR(fg_excess_drop_tip) },
+		{ TR(fg_excess_queue), TR(fg_excess_queue_tip) },
+	};
+	if (button_row_index<kFrameGenExcessCount>(TR(fg_excess), &settings.frame_generation_excess, kExcessOptions,
+			TR(fg_excess_tip), false, running && settings.frame_generation_multiplier >= 2))
+		actions.persist = true;
+	if (running && f.through_game_present && !f.as_fast_as_screen)
 		note("%s", TR(fg_through_present));
-	if (running && f.own_window && f.own_asked >= 2 && f.own_steps_max >= 1 && f.own_asked > f.own_steps_max)
+	if (running && (f.own_window || f.through_game_present) && f.own_asked >= 2 && f.own_steps_max >= 1 &&
+		f.own_asked > f.own_steps_max)
 		note(TR(fg_goes_up_to), frame_generator_label(f.generator), f.own_steps_max);
 
 	int limit = static_cast<int>(settings.frame_generation_limit);
@@ -814,7 +854,7 @@ void draw_framegen_section(const PanelState &state, Settings &settings, PanelAct
 				line(TR(fg_rates), f.real_fps, f.shown_fps);
 			std::string more;
 			char b[1024];
-			if (f.generating && f.own_window && f.own_steps == 1) {
+			if (f.generating && ((f.own_window && f.own_steps == 1) || (!f.own_window && f.as_fast_as_screen))) {
 				more += TR(fg_nothing_made);
 			} else if (f.generating) {
 				const std::string by = std::string(frame_generator_label(f.generator)) +
@@ -835,6 +875,8 @@ void draw_framegen_section(const PanelState &state, Settings &settings, PanelAct
 			if (f.own_window) {
 				more += "\n";
 				more += TR(fg_counter_note);
+				more += "\n";
+				more += TR(fg_counter_more);
 			}
 			if (!f.route.empty()) {
 				std::snprintf(b, sizeof b, TR(diag_technical), f.route.c_str());
@@ -1480,13 +1522,17 @@ void draw_taa_section(const PanelState &state, Settings &settings, PanelActions 
 		for (const std::string &pv : state.fsr_providers)
 			opts.push_back(RowOption{ pv.c_str(), nullptr, ui::Brand::Amd });
 		int idx = 0;
+		const bool lite_by_default = !state.fsr_lite_default_failed;
 		for (size_t i = 0; i < state.fsr_providers.size(); ++i) {
-			if (state.fsr_providers[i] == settings.fsr_provider)
+			if (state.fsr_providers[i] == settings.fsr_provider ||
+				(fsr_provider_is_lite(state.fsr_providers[i]) &&
+					fsr_provider_wants_lite(settings.fsr_provider, lite_by_default)))
 				idx = static_cast<int>(i) + 1;
 		}
 		if (button_row_n(TR(taa_fsr_version), &idx, opts.data(), static_cast<int>(opts.size()),
 				TR(taa_fsr_version_tip), false, upscaler_lit(state, settings))) {
-			settings.fsr_provider = idx == 0 ? std::string() : state.fsr_providers[static_cast<size_t>(idx) - 1];
+			settings.fsr_provider = idx == 0 ? std::string(kFsrProviderAuto)
+				: state.fsr_providers[static_cast<size_t>(idx) - 1];
 			actions.persist = true;
 			actions.reset = true;
 		}

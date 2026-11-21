@@ -5,6 +5,7 @@
 #endif
 
 #include "aeon_sr/core/diagnostics.hpp"
+#include "aeon_sr/interop/blit_d3d12.hpp"
 #include "aeon_sr/framegen/fg_gpu_priority.hpp"
 #include "aeon_sr/interop/remote_protocol.hpp"
 #include "aeon_sr/core/settings.hpp"
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <string>
+#include <thread>
 
 #ifndef AEONSR_VERSION_MAJOR
 #define AEONSR_VERSION_MAJOR 1
@@ -262,7 +264,9 @@ int run(const Args &args, const std::wstring &host_dir)
 	HostSession session;
 	if (args.gpu_priority_high)
 		raise_gpu_priority(session);
+	std::thread shader_warm([] { aeon_sr::blit12_warm_shaders(); });
 	const bool started = session.start(args.pid, block, host_dir);
+	shader_warm.join();
 	note_foreign_modules(L"with the engine up");
 	if (!started) {
 		block->host_ready = 0;

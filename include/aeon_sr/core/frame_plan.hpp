@@ -141,4 +141,7 @@ NeuralRenderParams plan_neural_params(const Settings &settings, const FrameSigna
 
 void plan_vsr_params(const Settings &settings, const FrameSignals &signals, UpscalerParams &params) noexcept;
 
+bool want_depth_from_motion(bool setting, BackendChoice backend, unsigned int upscale_mode,
+	bool game_scale) noexcept;
+
 }

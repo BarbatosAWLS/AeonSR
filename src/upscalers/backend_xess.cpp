@@ -1,3 +1,4 @@
+#include "aeon_sr/core/runtime_load_scope.hpp"
 #include "aeon_sr/upscalers/backend_xess.hpp"
 #include "aeon_sr/core/diagnostics.hpp"
 #include "aeon_sr/core/frame_inputs.hpp"
@@ -135,7 +136,11 @@ bool XessD3D12Backend::build(ID3D12Device *device, uint32_t w, uint32_t h, uint3
 
 	if (api_.module == nullptr) {
 		std::wstring err;
-		if (!xess_load(api_, dll_path_, err)) {
+		const bool loaded = [&] {
+			const RuntimeLoadScope loading;
+			return xess_load(api_, dll_path_, err);
+		}();
+		if (!loaded) {
 			worker_status_ = UpscalerStatus::InitFailed;
 			worker_error_ = err;
 			return false;
@@ -144,7 +149,10 @@ bool XessD3D12Backend::build(ID3D12Device *device, uint32_t w, uint32_t h, uint3
 
 	bool built_pipelines = false;
 	if (context_ == nullptr) {
-		const xess_result_t cr = api_.CreateContext(device, &context_);
+		const xess_result_t cr = [&] {
+			const RuntimeLoadScope loading;
+			return api_.CreateContext(device, &context_);
+		}();
 		if (cr != XESS_RESULT_SUCCESS || context_ == nullptr) {
 			wchar_t buf[128]{};
 			_snwprintf_s(buf, _TRUNCATE, L"xessD3D12CreateContext failed (%d)", static_cast<int>(cr));
@@ -328,6 +336,10 @@ bool XessD3D12Backend::run_native(
 
 	const bool ready = context_ != nullptr && device_ == d3d12 && prepared_ && prepared_w_ == w &&
 		prepared_h_ == h && prepared_quality_ == quality_mode_ && prepared_scale_ == render_scale_;
+	if (!ready && neural_building()) {
+		status = UpscalerStatus::Loading;
+		return false;
+	}
 	if (!ready) {
 		if (device_ != d3d12) {
 			destroy_context();
@@ -344,9 +356,13 @@ bool XessD3D12Backend::run_native(
 		init_state_.store(kRunning, std::memory_order_release);
 		const uint32_t quality = quality_mode_;
 		const float scale = render_scale_;
-		init_thread_ = std::thread([this, d3d12, w, h, quality, scale] {
+		const DXGI_FORMAT target_format = bb_desc.Format;
+		init_thread_ = std::thread([this, d3d12, w, h, quality, scale, target_format] {
 			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 			init_ok_ = build(d3d12, w, h, quality, scale);
+			first_run_pending_ = init_ok_;
+			if (init_ok_)
+				blit_.prepare(d3d12, { upscaler_scratch_format(target_format), target_format });
 			init_state_.store(kFinished, std::memory_order_release);
 		});
 		return false;
@@ -355,6 +371,10 @@ bool XessD3D12Backend::run_native(
 	if (explicit_width_ != 0 && explicit_height_ != 0) {
 		render_width_ = explicit_width_;
 		render_height_ = explicit_height_;
+	}
+	if (first_run_pending_ && neural_building()) {
+		status = UpscalerStatus::Loading;
+		return false;
 	}
 	if (!ensure_resources(w, h, bb_desc.Format))
 		return false;
@@ -432,6 +452,8 @@ bool XessD3D12Backend::run_native(
 		status = UpscalerStatus::Ready;
 		last_error.clear();
 	}
+	if (ok)
+		first_run_pending_ = false;
 	return ok && !crashed;
 }
 

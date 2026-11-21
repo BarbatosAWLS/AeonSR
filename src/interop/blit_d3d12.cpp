@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <thread>
 
 namespace aeon_sr {
 
@@ -150,6 +152,87 @@ void release_pso(BlitPipelineD3D12::PsoPair &pp)
 
 }
 
+namespace {
+
+constexpr const char *kBlitEntries[] = { "VSMain", "PSMain", "PSDebug", "PSNeuralProxy", "PSNeuralGuide",
+	"PSNeuralDelta", "PSNeuralRebuild", "PSNeuralSmooth", "PSNeuralSlope", "PSNeuralComposite" };
+constexpr size_t kBlitShaderCount = sizeof(kBlitEntries) / sizeof(kBlitEntries[0]);
+
+std::mutex g_blit_shaders_lock;
+ID3DBlob *g_blit_shaders[kBlitShaderCount] = {};
+
+bool shared_blit_shaders(ID3DBlob *(&out)[kBlitShaderCount])
+{
+	std::lock_guard<std::mutex> lock(g_blit_shaders_lock);
+	if (g_blit_shaders[kBlitShaderCount - 1] == nullptr) {
+		LARGE_INTEGER freq{}, begin{}, end{};
+		QueryPerformanceFrequency(&freq);
+		QueryPerformanceCounter(&begin);
+		ID3DBlob *made[kBlitShaderCount] = {};
+		ID3DBlob *errors[kBlitShaderCount] = {};
+		HRESULT results[kBlitShaderCount] = {};
+		const auto compile_from = [&](size_t first, size_t step) {
+			for (size_t i = first; i < kBlitShaderCount; i += step)
+				results[i] = D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, kBlitEntries[i],
+					i == 0 ? "vs_5_0" : "ps_5_0", 0, 0, &made[i], &errors[i]);
+		};
+		constexpr size_t kThreads = 4;
+		std::thread helpers[kThreads - 1];
+		for (size_t t = 1; t < kThreads; ++t) {
+			try {
+				helpers[t - 1] = std::thread(compile_from, t, kThreads);
+			} catch (...) {
+			}
+		}
+		compile_from(0, kThreads);
+		for (size_t t = 1; t < kThreads; ++t) {
+			if (helpers[t - 1].joinable())
+				helpers[t - 1].join();
+			else
+				compile_from(t, kThreads);
+		}
+		bool all = true;
+		for (size_t i = 0; i < kBlitShaderCount; ++i) {
+			if (FAILED(results[i]) || made[i] == nullptr) {
+				all = false;
+				diag_logf(DiagLevel::Error, "shader", L"d3d12 blit shader %hs failed to compile%hs%hs", kBlitEntries[i],
+					errors[i] != nullptr ? ": " : "",
+					errors[i] != nullptr ? static_cast<const char *>(errors[i]->GetBufferPointer()) : "");
+			}
+			if (errors[i] != nullptr)
+				errors[i]->Release();
+		}
+		if (!all) {
+			for (ID3DBlob *b : made)
+				if (b != nullptr)
+					b->Release();
+			return false;
+		}
+		for (size_t i = 0; i < kBlitShaderCount; ++i)
+			g_blit_shaders[i] = made[i];
+		QueryPerformanceCounter(&end);
+		diag_logf(DiagLevel::Info, "shader", L"d3d12 blit: %zu shaders compiled in %.0f ms, once for every upscaler",
+			kBlitShaderCount, freq.QuadPart != 0
+				? 1000.0 * static_cast<double>(end.QuadPart - begin.QuadPart) / static_cast<double>(freq.QuadPart)
+				: 0.0);
+	}
+	for (size_t i = 0; i < kBlitShaderCount; ++i) {
+		out[i] = g_blit_shaders[i];
+		out[i]->AddRef();
+	}
+	return true;
+}
+
+}
+
+void blit12_warm_shaders()
+{
+	ID3DBlob *shaders[kBlitShaderCount] = {};
+	if (shared_blit_shaders(shaders))
+		for (ID3DBlob *b : shaders)
+			b->Release();
+}
+
 bool BlitPipelineD3D12::ensure(ID3D12Device *device)
 {
 	if (blit_ready)
@@ -157,70 +240,13 @@ bool BlitPipelineD3D12::ensure(ID3D12Device *device)
 	if (device == nullptr)
 		return false;
 
-	ID3DBlob *vs = nullptr, *psb = nullptr, *psd = nullptr, *err = nullptr;
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &err))) {
-		if (err) { diag_error("shader", L"d3d12 blit VS compile failed"); err->Release(); }
+	ID3DBlob *shaders[kBlitShaderCount] = {};
+	if (!shared_blit_shaders(shaders))
 		return false;
-	}
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err))) {
-		vs->Release();
-		if (err) { diag_error("shader", L"d3d12 blit PS compile failed"); err->Release(); }
-		return false;
-	}
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSDebug", "ps_5_0", 0, 0, &psd, &err))) {
-		vs->Release(); psb->Release();
-		if (err) { diag_error("shader", L"d3d12 debug PS compile failed"); err->Release(); }
-		return false;
-	}
-
-	ID3DBlob *psp = nullptr, *psg = nullptr, *psn = nullptr;
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralProxy", "ps_5_0", 0, 0, &psp, &err))) {
-		vs->Release(); psb->Release(); psd->Release();
-		if (err) { diag_error("shader", L"d3d12 neural proxy PS compile failed"); err->Release(); }
-		return false;
-	}
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralGuide", "ps_5_0", 0, 0, &psg, &err))) {
-		vs->Release(); psb->Release(); psd->Release(); psp->Release();
-		if (err) { diag_error("shader", L"d3d12 neural guide PS compile failed"); err->Release(); }
-		return false;
-	}
-	ID3DBlob *psdl = nullptr;
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralDelta", "ps_5_0", 0, 0, &psdl, &err))) {
-		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
-		if (err) { diag_error("shader", L"d3d12 neural delta PS compile failed"); err->Release(); }
-		return false;
-	}
-	ID3DBlob *psrb = nullptr;
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralRebuild", "ps_5_0", 0, 0, &psrb, &err))) {
-		psdl->Release();
-		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
-		if (err) { diag_error("shader", L"d3d12 neural rebuild PS compile failed"); err->Release(); }
-		return false;
-	}
-	ID3DBlob *pssm = nullptr;
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralSmooth", "ps_5_0", 0, 0, &pssm, &err))) {
-		psdl->Release(); psrb->Release();
-		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
-		if (err) { diag_error("shader", L"d3d12 neural smooth PS compile failed"); err->Release(); }
-		return false;
-	}
-	ID3DBlob *pssl = nullptr;
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralSlope", "ps_5_0", 0, 0, &pssl, &err))) {
-		psdl->Release(); psrb->Release(); pssm->Release();
-		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
-		if (err) { diag_error("shader", L"d3d12 neural slope PS compile failed"); err->Release(); }
-		return false;
-	}
-	if (FAILED(D3DCompile(kBlitHlsl, strlen(kBlitHlsl), "aeon_blit12", nullptr, nullptr, "PSNeuralComposite", "ps_5_0", 0, 0, &psn, &err))) {
-		psdl->Release(); psrb->Release(); pssm->Release(); pssl->Release();
-		vs->Release(); psb->Release(); psd->Release(); psp->Release(); psg->Release();
-		if (err) { diag_error("shader", L"d3d12 neural composite PS compile failed"); err->Release(); }
-		return false;
-	}
-	vs_blob = vs; ps_blit_blob = psb; ps_debug_blob = psd;
-	ps_proxy_blob = psp; ps_guide_blob = psg; ps_delta_blob = psdl;
-	ps_rebuild_blob = psrb; ps_smooth_blob = pssm; ps_neural_blob = psn;
-	ps_slope_blob = pssl;
+	vs_blob = shaders[0]; ps_blit_blob = shaders[1]; ps_debug_blob = shaders[2];
+	ps_proxy_blob = shaders[3]; ps_guide_blob = shaders[4]; ps_delta_blob = shaders[5];
+	ps_rebuild_blob = shaders[6]; ps_smooth_blob = shaders[7]; ps_slope_blob = shaders[8];
+	ps_neural_blob = shaders[9];
 
 	D3D12_DESCRIPTOR_RANGE range{};
 	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -295,12 +321,9 @@ void BlitPipelineD3D12::release()
 	blit_ready = false;
 }
 
-BlitPipelineD3D12::PsoPair *BlitPipelineD3D12::prepare_draw(ID3D12Device *device,
-	ID3D12GraphicsCommandList *cmd, ID3D12Resource *t0, ID3D12Resource *t1, ID3D12Resource *t2, ID3D12Resource *t3,
-	ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h)
+BlitPipelineD3D12::PsoPair *BlitPipelineD3D12::pso_pair(ID3D12Device *device, DXGI_FORMAT rtv_fmt)
 {
-	const DXGI_FORMAT rtv_fmt = view_format_for(dst_format);
-
+	(void)device;
 	PsoPair *pair = nullptr;
 	for (PsoPair &pp : pso_cache) {
 		if (pp.rtv == rtv_fmt) { pair = &pp; break; }
@@ -308,26 +331,61 @@ BlitPipelineD3D12::PsoPair *BlitPipelineD3D12::prepare_draw(ID3D12Device *device
 	}
 	if (pair == nullptr)
 		return nullptr;
-	if (pair->rtv != rtv_fmt) {
-		auto make = [&](void *ps, ID3D12PipelineState **out) {
-			D3D12_GRAPHICS_PIPELINE_STATE_DESC d = base_pso_desc(root_sig,
-				static_cast<ID3DBlob *>(vs_blob), static_cast<ID3DBlob *>(ps), rtv_fmt);
-			return SUCCEEDED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(out)));
-		};
-		if (!make(ps_blit_blob, &pair->blit) ||
-			!make(ps_debug_blob, &pair->debug) ||
-			!make(ps_proxy_blob, &pair->proxy) ||
-			!make(ps_guide_blob, &pair->guide) ||
-			!make(ps_delta_blob, &pair->delta) ||
-			!make(ps_rebuild_blob, &pair->rebuild) ||
-			!make(ps_smooth_blob, &pair->smooth) ||
-			!make(ps_slope_blob, &pair->slope) ||
-			!make(ps_neural_blob, &pair->neural)) {
-			release_pso(*pair);
-			return nullptr;
+	pair->rtv = rtv_fmt;
+	return pair;
+}
+
+ID3D12PipelineState *BlitPipelineD3D12::pso_of(ID3D12Device *device, PsoPair &pair,
+	ID3D12PipelineState *PsoPair::*slot, void *ps_blob)
+{
+	ID3D12PipelineState *&pso = pair.*slot;
+	if (pso == nullptr && ps_blob != nullptr) {
+		const D3D12_GRAPHICS_PIPELINE_STATE_DESC d = base_pso_desc(root_sig,
+			static_cast<ID3DBlob *>(vs_blob), static_cast<ID3DBlob *>(ps_blob), pair.rtv);
+		if (FAILED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+			pso = nullptr;
+			bool any = false;
+			for (ID3D12PipelineState *p : { pair.blit, pair.debug, pair.proxy, pair.guide, pair.delta,
+					pair.rebuild, pair.smooth, pair.slope, pair.neural, pair.debug_view })
+				any = any || p != nullptr;
+			if (!any)
+				pair.rtv = DXGI_FORMAT_UNKNOWN;
 		}
-		pair->rtv = rtv_fmt;
 	}
+	return pso;
+}
+
+bool BlitPipelineD3D12::prepare(ID3D12Device *device, std::initializer_list<DXGI_FORMAT> targets)
+{
+	if (!ensure(device))
+		return false;
+	for (const DXGI_FORMAT f : targets) {
+		if (f == DXGI_FORMAT_UNKNOWN)
+			continue;
+		PsoPair *const pair = pso_pair(device, view_format_for(f));
+		if (pair == nullptr ||
+			pso_of(device, *pair, &PsoPair::blit, ps_blit_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::debug, ps_debug_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::proxy, ps_proxy_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::guide, ps_guide_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::delta, ps_delta_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::rebuild, ps_rebuild_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::smooth, ps_smooth_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::slope, ps_slope_blob) == nullptr ||
+			pso_of(device, *pair, &PsoPair::neural, ps_neural_blob) == nullptr)
+			return false;
+	}
+	return true;
+}
+
+BlitPipelineD3D12::PsoPair *BlitPipelineD3D12::prepare_draw(ID3D12Device *device,
+	ID3D12GraphicsCommandList *cmd, ID3D12Resource *t0, ID3D12Resource *t1, ID3D12Resource *t2, ID3D12Resource *t3,
+	ID3D12Resource *dst, DXGI_FORMAT dst_format, uint32_t dst_w, uint32_t dst_h)
+{
+	const DXGI_FORMAT rtv_fmt = view_format_for(dst_format);
+	PsoPair *const pair = pso_pair(device, rtv_fmt);
+	if (pair == nullptr)
+		return nullptr;
 
 	ring_index = (ring_index + 1) % kD3D12RingSlots;
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = srv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -378,6 +436,13 @@ bool BlitPipelineD3D12::draw_fullscreen(ID3D12Device *device, ID3D12GraphicsComm
 	if (!ensure(device) || cmd == nullptr || effect == nullptr || dst == nullptr)
 		return false;
 
+	{
+		PsoPair *const target = pso_pair(device, view_format_for(dst_format));
+		if (target == nullptr || (debug_mode != 0
+				? pso_of(device, *target, &PsoPair::debug, ps_debug_blob)
+				: pso_of(device, *target, &PsoPair::blit, ps_blit_blob)) == nullptr)
+			return false;
+	}
 	PsoPair *const pair = prepare_draw(device, cmd, effect, nullptr, nullptr, nullptr, dst, dst_format, dst_w, dst_h);
 	if (pair == nullptr)
 		return false;
@@ -462,6 +527,22 @@ bool BlitPipelineD3D12::draw_neural(ID3D12Device *device, ID3D12GraphicsCommandL
 	if (!ensure(device) || cmd == nullptr || src == nullptr || dst == nullptr)
 		return false;
 
+	ID3D12PipelineState *PsoPair::*slot = &PsoPair::neural;
+	void *blob = ps_neural_blob;
+	switch (pass) {
+	case NeuralPass::Proxy: slot = &PsoPair::proxy; blob = ps_proxy_blob; break;
+	case NeuralPass::Guide: slot = &PsoPair::guide; blob = ps_guide_blob; break;
+	case NeuralPass::Delta: slot = &PsoPair::delta; blob = ps_delta_blob; break;
+	case NeuralPass::Rebuild: slot = &PsoPair::rebuild; blob = ps_rebuild_blob; break;
+	case NeuralPass::Smooth: slot = &PsoPair::smooth; blob = ps_smooth_blob; break;
+	case NeuralPass::Slope: slot = &PsoPair::slope; blob = ps_slope_blob; break;
+	case NeuralPass::Composite: break;
+	}
+	{
+		PsoPair *const target = pso_pair(device, view_format_for(dst_format));
+		if (target == nullptr || pso_of(device, *target, slot, blob) == nullptr)
+			return false;
+	}
 	PsoPair *const pair = prepare_draw(device, cmd, src, orig, proxy, aux, dst, dst_format, dst_w, dst_h);
 	if (pair == nullptr)
 		return false;
@@ -471,17 +552,7 @@ bool BlitPipelineD3D12::draw_neural(ID3D12Device *device, ID3D12GraphicsCommandL
 		"NeuralDrawConstants must stay the DWORDs the root signature reserves");
 	cmd->SetGraphicsRoot32BitConstants(0, kBlitConstantCount, zero, 0);
 	cmd->SetGraphicsRoot32BitConstants(2, kNeuralConstantCount, &c, 0);
-	ID3D12PipelineState *pso = pair->neural;
-	switch (pass) {
-	case NeuralPass::Proxy: pso = pair->proxy; break;
-	case NeuralPass::Guide: pso = pair->guide; break;
-	case NeuralPass::Delta: pso = pair->delta; break;
-	case NeuralPass::Rebuild: pso = pair->rebuild; break;
-	case NeuralPass::Smooth: pso = pair->smooth; break;
-	case NeuralPass::Slope: pso = pair->slope; break;
-	case NeuralPass::Composite: break;
-	}
-	cmd->SetPipelineState(pso);
+	cmd->SetPipelineState(pair->*slot);
 	cmd->DrawInstanced(3, 1, 0, 0);
 	return true;
 }

@@ -35,6 +35,7 @@ struct FrameGenReadout {
 	uint32_t own_steps_max = 0;
 	uint32_t own_asked = 0;
 	double screen_hz = 0.0;
+	bool as_fast_as_screen = false;
 	bool through_game_present = false;
 	uint64_t generated = 0;
 	std::string route;
@@ -44,6 +45,7 @@ struct FrameGenReadout {
 
 class FrameGeneration {
 public:
+	void follow_fullscreen(reshade::api::effect_runtime *runtime, bool keep);
 	~FrameGeneration();
 
 	void on_present(reshade::api::effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
@@ -60,6 +62,11 @@ public:
 	bool own_window_active() const noexcept { return overlay_active_; }
 	static void note_vulkan_present_mode(uint32_t mode) noexcept;
 	FrameGenReadout readout() const;
+	struct LastCall {
+		uint8_t route = 0;
+		float round_ms = -1.0f, wait_ms = -1.0f;
+	};
+	LastCall last_call() const noexcept { return last_call_; }
 
 private:
 	bool round(reshade::api::effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
@@ -67,7 +74,7 @@ private:
 	bool round_own_window(reshade::api::effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
 		double presented_ms, const Settings &settings);
 	bool own_window_ready(reshade::api::effect_runtime *runtime, EngineDevice &engine, std::wstring *why,
-		bool *permanent);
+		bool *permanent, bool leave_exclusive);
 	void on_present_own_window(reshade::api::effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
 		double entry, double limit_ms, const Settings &settings);
 	bool ensure_timer(ID3D12Device *device);
@@ -86,11 +93,32 @@ private:
 	DisplayClock clock_;
 	FramePresenter presenter_;
 	std::wstring note_;
+	std::wstring last_failure_;
+	LastCall last_call_;
+	bool aside_ = false;
+	void note_as_fast();
+	bool logged_fast_ = false, logged_given_up_ = false, logged_trying_ = false, logged_holding_ = false;
+	double overlay_refused_at_ = 0.0;
+	bool refused_covered_ = false;
+	static constexpr double kCoveredRetryMs = 30000.0;
+	FrameMarker marker_;
 	uint64_t generated_ = 0;
 	bool route_given_up_ = false;
 	bool sync_watched_ = false;
 	bool sync_watch_failed_ = false;
 	bool blt_present_ = false;
+	uint32_t round_made_ = 0, round_steps_ = 2;
+	uint32_t round_pick_[kPacerMaxMade] = { 1, 2, 3, 4, 5 };
+	StepFit fit_;
+	static constexpr uint64_t kQueueAhead = 2;
+	static constexpr double kQueueWaitMs = 250.0;
+	bool refused_exclusive_ = false;
+	double cover_checked_at_ = 0.0;
+	static constexpr uint32_t kShortRoundsToCap = 30;
+	uint32_t present_cap_ = kPacerMaxMade;
+	uint32_t short_rounds_ = 0;
+	bool step_round(reshade::api::effect_runtime *runtime, FrameBridge &bridge, EngineDevice &engine,
+		const Settings &settings, uint32_t k);
 	OverlayPresenter overlay_;
 	bool overlay_refused_ = false;
 	std::wstring overlay_refusal_;
@@ -98,16 +126,24 @@ private:
 	uint32_t own_steps_ = 0;
 	uint32_t own_vendor_steps_ = 0;
 	OverlayStats own_logged_;
+	uint64_t logged_fills_ = 0;
+	uint64_t logged_memory_fills_ = 0;
+	bool game_present_route_ = false;
+	void note_memory_fills();
+	FrameGenerator filled_for_ = FrameGenerator::AeonSR;
 	uint32_t own_steps_max_ = 0;
 	uint32_t own_asked_ = 0;
+	uint32_t own_select_steps_ = 0;
 	bool display_paced_ = false;
+	double fit_period_ms_ = 0.0;
 	static constexpr uint32_t kCostFrames = 60;
 	double cost_ring_[kCostFrames] = {};
 	double own_ring_[kCostFrames] = {};
+	uint32_t made_ring_[kCostFrames] = {};
 	uint32_t cost_n_ = 0, cost_at_ = 0;
 	double slow_cost_ms_ = 0.0, slow_own_ms_ = 0.0;
 	bool route_too_slow_ = false;
-	void check_route_cost(double cost, double own);
+	void check_route_cost(double cost, double own, uint32_t made);
 	void *timer_handle_ = nullptr;
 
 	static constexpr uint32_t kTimerRing = 4;
@@ -127,6 +163,7 @@ private:
 
 	struct Window {
 		uint32_t frames = 0, generated = 0, failed = 0, reentries = 0;
+		uint32_t filled = 0;
 		double uneven_sum = 0.0;
 		uint32_t pairs = 0;
 		std::vector<double> real, round, begin, record, end, waits;

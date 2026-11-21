@@ -72,6 +72,7 @@ struct PanelState {
 
 	std::wstring fsr_provider_version;
 	std::vector<std::string> fsr_providers;
+	bool fsr_lite_default_failed = false;
 
 	bool ngx_dll_present = false;
 	bool ngx_initialized = false;
@@ -101,6 +102,7 @@ struct PanelState {
 	bool neural_allgpu_build_targets = false;
 	std::wstring neural_runtime_file;
 	std::string neural_runtime_version;
+	std::vector<uint32_t> neural_models;
 	bool neural_runtime_certificate = false;
 	std::string neural_runtime_sha256;
 	std::string neural_runtime_cards;
